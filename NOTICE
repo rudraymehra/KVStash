@@ -1,0 +1,10 @@
+kvblockd
+Copyright 2026 kvstash
+
+This product includes software developed as part of the kvblockd project
+(https://github.com/kvstash/kvblockd).
+
+Portions of the DRAM arena allocator are derived from concepts in
+OffsetAllocator by Sebastian Aaltonen (https://github.com/sebbbi/OffsetAllocator),
+licensed under the MIT License. (Attribution stub — updated when the
+allocator lands in Week 3.)

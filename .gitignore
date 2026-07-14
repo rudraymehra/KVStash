@@ -1,0 +1,17 @@
+# ── PRIVATE RESEARCH VAULT — never commit ─────────────────────────
+# All competitive research, strategy, business plans, drafts, and course material.
+research/
+
+# OS noise
+.DS_Store
+
+# Build artifacts
+bin/
+dist/
+*.prof
+*.test
+testdata/corpus-large/
+
+# Local env
+.env
+soak/

@@ -1,0 +1,27 @@
+version: "2"
+linters:
+  default: standard
+  enable:
+    - gosec
+    - bodyclose
+    - errorlint
+    - exhaustive
+    - misspell
+    - prealloc
+    - unconvert
+    - unparam
+    - wastedassign
+    - gocritic
+  settings:
+    gosec:
+      excludes:
+        - G103 # unsafe is load-bearing in the dram arena — reviewed per-PR instead
+    staticcheck:
+      checks: ["all"]
+  exclusions:
+    presets:
+      - std-error-handling
+formatters:
+  enable:
+    - gofumpt
+    - goimports
