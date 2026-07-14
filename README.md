@@ -8,8 +8,8 @@ LLM inference engines throw away gigabytes of perfectly reusable KV-cache every 
 
 ## Why this exists (the 30-second version)
 
-- A cache hit is publicly priced at 2–20% of a cache miss by every major LLM API — the recompute waste is that large.
-- Every serious KV-cache store today requires RDMA fabrics, storage appliances, or a managed cloud. ~80% of GPU fleets run on plain Ethernet and have no product.
+- Major LLM APIs price cached input tokens at steep discounts (as low as ~2% of the full price, per DeepSeek's published pricing as of mid-2026) — the recompute waste is that large.
+- Most serious KV-cache stores today assume RDMA fabrics, storage appliances, or a managed cloud — while a large share of GPU fleets run on plain Ethernet with no equivalent option.
 - The proven design (immutable prefix-hash blocks, two-phase commit, lease/pin, batched MB-scale I/O) doesn't actually require any of that hardware. This is that design, implemented for everyone else.
 
 ## License

@@ -13,9 +13,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
+          cache: false
       - name: go vet
         run: go vet ./...
       - name: golangci-lint
@@ -38,9 +41,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
+          cache: false
       - name: build
         run: go build ./...
       - name: test (race)

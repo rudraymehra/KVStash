@@ -19,7 +19,7 @@ race:
 
 lint:
 	$(GO) vet $(PKGS)
-	@command -v golangci-lint >/dev/null 2>&1 && golangci-lint run || echo "golangci-lint not installed (CI runs it); skipping"
+	@if command -v golangci-lint >/dev/null 2>&1; then golangci-lint run; else echo "golangci-lint not installed (CI runs it); skipping"; fi
 
 fuzz:
 	@echo "fuzz: no fuzz targets yet (arrives Week 2 with internal/protocol)"
