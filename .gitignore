@@ -15,3 +15,6 @@ testdata/corpus-large/
 # Local env
 .env
 soak/
+
+# Claude session rules — private, never push
+CLAUDE.md
