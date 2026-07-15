@@ -65,12 +65,15 @@ func TestClientServerLoopback(t *testing.T) {
 	if cliFrames.Load() == 0 {
 		t.Fatal("client sent no frames")
 	}
-	// The server may not have drained the final in-flight frame when the client
-	// closed, so allow the server count to be <= client (never more).
+	// When the client stops, each of the N connections may have one frame still
+	// in flight (or partially written at the deadline) that the server hasn't
+	// drained. So the server count is <= client, and the gap is at most one
+	// frame per stream. Anything beyond that is a real drain/count bug.
 	if srvBytes.Load() > cliBytes.Load() {
 		t.Fatalf("server received %d > client sent %d", srvBytes.Load(), cliBytes.Load())
 	}
-	if cliBytes.Load()-srvBytes.Load() > int64(cfg.frameBytes+headerSize) {
-		t.Fatalf("server/client byte gap %d exceeds one frame", cliBytes.Load()-srvBytes.Load())
+	maxGap := int64(cfg.streams) * int64(cfg.frameBytes+headerSize)
+	if gap := cliBytes.Load() - srvBytes.Load(); gap > maxGap {
+		t.Fatalf("server/client byte gap %d exceeds %d (one in-flight frame per stream)", gap, maxGap)
 	}
 }
