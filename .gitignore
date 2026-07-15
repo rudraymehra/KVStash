@@ -18,3 +18,9 @@ soak/
 
 # Claude session rules — private, never push
 CLAUDE.md
+
+# Compiled command binaries accidentally built into the tree
+/xferspike
+/kvblockd
+/kvbctl
+cmd/xferspike/xferspike

@@ -1,42 +1,13 @@
 package main
 
 import (
-	"encoding/binary"
-	"errors"
 	"io"
 	"net"
 	"testing"
 )
 
-const magic uint32 = 0x4B564231
-const headerSize = 16
-
-type frameHeader struct {
-	magic  uint32
-	seq    uint64
-	length uint32
-}
-
-func encodeHeader(h frameHeader) []byte {
-	buf := make([]byte, headerSize)
-	binary.LittleEndian.PutUint32(buf[0:4], h.magic)
-	binary.LittleEndian.PutUint64(buf[4:12], h.seq)
-	binary.LittleEndian.PutUint32(buf[12:16], h.length)
-	return buf
-}
-
-var errBadMagic = errors.New("bad magic: stream out of sync")
-
-func decodeHeader(buf []byte) (frameHeader, error) {
-	var h frameHeader
-	h.magic = binary.LittleEndian.Uint32(buf[0:4])
-	h.seq = binary.LittleEndian.Uint64(buf[4:12])
-	h.length = binary.LittleEndian.Uint32(buf[12:16])
-	if h.magic != magic {
-		return h, errBadMagic
-	}
-	return h, nil
-}
+// The frame format (magic, headerSize, frameHeader, encodeHeader, decodeHeader)
+// lives in frame.go — this drill was its ancestor and now shares that code.
 
 func startEchoServer(tb testing.TB) net.Listener {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
