@@ -31,7 +31,7 @@ func pwriteFull(fd int, buf []byte, off int64) (int, error) {
 // runUring — DEFERRED per the pre-registered A3 decision rule.
 //
 // Attempted with github.com/pawelgaczynski/giouring (the SPEC-1 pick): its
-// go:linkname into syscall.munmap is rejected by Go 1.26's linkname rules
+// linkname directive into syscall.munmap is rejected by Go 1.26's rules
 // ("invalid reference to syscall.munmap" at link time), and the library has
 // been untouched since 2023. Rather than vendor-patching a dead dependency for
 // a throwaway rig, we take the plan's written fallback: the threadpool engine
