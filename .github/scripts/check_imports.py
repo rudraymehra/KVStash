@@ -36,10 +36,18 @@ def check_lmcache() -> int:
         return 1
 
     fails = []
-    required_abstract = {"exists", "exists_sync", "get", "put", "list", "close"}
+    # Breakage signal = a required method DISAPPEARED (rename/delete). We gate on
+    # existence, not on whether it stays @abstractmethod — upstream giving one a
+    # concrete default is normal evolution (method still there, adapter still
+    # overrides it), so that's a WARN, not a false-RED on a scheduled run.
+    required = ["exists", "exists_sync", "get", "put", "list", "close"]
+    miss_required = _missing(RemoteConnector, required)
+    if miss_required:
+        fails.append(f"RemoteConnector missing required methods {miss_required}")
     have_abstract = set(getattr(RemoteConnector, "__abstractmethods__", frozenset()))
-    if not required_abstract <= have_abstract:
-        fails.append(f"RemoteConnector.__abstractmethods__ missing {sorted(required_abstract - have_abstract)}")
+    no_longer_abstract = [m for m in required if m not in have_abstract]
+    if no_longer_abstract:
+        print(f"WARN: lmcache methods no longer abstract (concrete default added): {no_longer_abstract}")
 
     present = ["batched_contains", "batched_async_contains", "batched_get_non_blocking",
               "support_batched_async_contains", "support_batched_get_non_blocking"]

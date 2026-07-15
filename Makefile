@@ -1,4 +1,4 @@
-# kvblockd — Week-1 Makefile (fuzz/bench become real in Week 2+)
+# kvblockd — Week-1 Makefile (fuzz becomes real in Week 2+)
 
 GO      ?= go
 PKGS    := ./...
@@ -25,7 +25,7 @@ fuzz:
 	@echo "fuzz: no fuzz targets yet (arrives Week 2 with internal/protocol)"
 
 bench:
-	@echo "bench: no benchmarks yet (arrives Week 2)"
+	$(GO) test -run='^$$' -bench=. -benchmem $(PKGS)
 
 clean:
 	rm -rf $(BIN_DIR) dist

@@ -13,8 +13,12 @@ Sources (verified 2026-07):
                      same-AZ private IP $0/GB; cross-AZ $0.01/GB each way; public/EIP $0.01/GB
 """
 
-MB = 1 << 20
-GB = 1 << 30
+# Byte SIZES are shown in binary MiB (the convention for KV cache sizes).
+# BANDWIDTH and TRANSFER $ use DECIMAL GB — networks (iperf3, spike.go's
+# gbytes_per_s) and AWS transfer pricing are all decimal — so break-even GB/s
+# lines up 1:1 with the measured rig numbers instead of a hidden ~7% skew.
+MiB = 1 << 20
+GBd = 1_000_000_000
 
 
 class Model:
@@ -36,7 +40,7 @@ class Model:
 
     def kv_production_gbps(self):
         # bytes/token * tokens/s = the GB/s the GPU emits during prefill.
-        return self.bytes_per_token() * self.prefill_tok_s / GB
+        return self.bytes_per_token() * self.prefill_tok_s / GBd
 
 
 # GQA/MLA byte counts are the HONEST ones. The MHA row is the widely-miscited
@@ -72,18 +76,18 @@ def main():
     hr("1. KV cache bytes per token  (kv_mult * layers * kv_heads * head_dim * dtype)")
     for m in MODELS:
         bpt = m.bytes_per_token()
-        print(f"  {m.name:32s} {bpt:>10,d} B  = {bpt/MB:6.3f} MB/token"
+        print(f"  {m.name:32s} {bpt:>10,d} B  = {bpt/MiB:6.3f} MiB/token"
               + (f"   [{m.note}]" if m.note else ""))
 
     hr("2. Break-even bandwidth  B* = bytes_per_token * prefill_rate")
     print("  (the rate the GPU PRODUCES KV; move finished bytes faster than this => loading wins.")
     print("   N cancels, so this is context-length-independent for O(n) prefill.)")
     for m in MODELS:
-        b = m.kv_production_gbps()  # GiB/s (GB=1<<30)
+        b = m.kv_production_gbps()  # decimal GB/s (matches iperf3 / spike.go)
         gbit = m.bytes_per_token() * m.prefill_tok_s / 1e9 * 8  # decimal Gbit/s
-        print(f"  {m.name:32s} R={m.prefill_tok_s:>6,d} tok/s  ->  B* = {b:5.2f} GiB/s  ({gbit:5.1f} Gbit/s)")
-    print("\n  Sanity: GQA models break even at ~0.5-1.85 GiB/s (8B is high at 1.83 due to its fast")
-    print("  15k tok/s prefill); the MHA-miscount inflates to ~2.5 GiB/s,")
+        print(f"  {m.name:32s} R={m.prefill_tok_s:>6,d} tok/s  ->  B* = {b:5.2f} GB/s  ({gbit:5.1f} Gbit/s)")
+    print("\n  Sanity: GQA/MLA models break even at ~0.5-2.0 GB/s (8B highest at 1.97 due to its")
+    print("  fast 15k tok/s prefill); the MHA-miscount inflates to ~2.6 GB/s,")
     print("  which is exactly why Cake/Tensormesh quote a ~2 GB/s SLO. Our 10+ GB/s target clears")
     print("  even the inflated bar with huge margin. (Long context: prefill is O(n^2), so effective R")
     print("  falls and B* drops further => loading wins even more, per LMCache's 256K crossover.)")
@@ -95,8 +99,8 @@ def main():
     for m in MODELS:
         recompute = REUSED_TOKENS / m.prefill_tok_s * GPU_USD_PER_SEC
         bytes_moved = m.bytes_per_token() * REUSED_TOKENS
-        same_az = bytes_moved / GB * XFER_SAME_AZ
-        cross_az = bytes_moved / GB * XFER_CROSS_AZ
+        same_az = bytes_moved / GBd * XFER_SAME_AZ
+        cross_az = bytes_moved / GBd * XFER_CROSS_AZ
         print(f"  {m.name:32s} {recompute:>11.5f} {same_az:>9.5f} {cross_az:>9.5f}")
 
     hr("4. Amortized savings per request across hit rates")
@@ -114,7 +118,7 @@ def main():
     print("  private IP (a public/Elastic IP silently triggers $0.01/GB even within one AZ).")
     for m in MODELS[:2]:
         recompute = REUSED_TOKENS / m.prefill_tok_s * GPU_USD_PER_SEC
-        cross_az = m.bytes_per_token() * REUSED_TOKENS / GB * XFER_CROSS_AZ
+        cross_az = m.bytes_per_token() * REUSED_TOKENS / GBd * XFER_CROSS_AZ
         verdict = "cross-AZ still cheaper than recompute" if cross_az < recompute else "cross-AZ COSTS MORE than recompute"
         print(f"  {m.name:32s} recompute ${recompute:.5f} vs cross-AZ ${cross_az:.5f}  -> {verdict}")
 
@@ -127,13 +131,17 @@ def main():
     max_breakeven = max(m.kv_production_gbps() for m in gqa_mla)
     m8 = MODELS[0]
     recompute = REUSED_TOKENS / m8.prefill_tok_s * GPU_USD_PER_SEC
-    same_az_fetch = XFER_SAME_AZ * (m8.bytes_per_token() * REUSED_TOKENS / GB)
+    same_az_fetch = XFER_SAME_AZ * (m8.bytes_per_token() * REUSED_TOKENS / GBd)
+    # Bandwidth is the LIVE gate (it can fail if the measured cloud GB/s ever
+    # lands below break-even). Same-AZ transfer is $0 by construction, so the
+    # cost arm is a guard, not the discriminator — the real cost risk is cross-AZ
+    # (section 5), which the deployment guide forbids.
     bw_ok = DELIVERABLE_GBPS > max_breakeven
     cost_ok = same_az_fetch < recompute
     ok = bw_ok and cost_ok
-    print(f"  bandwidth check: deliverable {DELIVERABLE_GBPS:.1f} GiB/s > max break-even {max_breakeven:.2f} GiB/s -> {bw_ok}")
-    print(f"  cost check:      same-AZ fetch ${same_az_fetch:.5f} < recompute ${recompute:.5f} -> {cost_ok}")
-    print(f"  A7 {'PASS' if ok else 'FAIL'} (both must hold; verdict is computed, not assumed)")
+    print(f"  bandwidth check (live gate): deliverable {DELIVERABLE_GBPS:.1f} GB/s > max break-even {max_breakeven:.2f} GB/s -> {bw_ok}")
+    print(f"  cost check (guard):          same-AZ fetch ${same_az_fetch:.5f} (=$0 by construction) < recompute ${recompute:.5f} -> {cost_ok}")
+    print(f"  A7 {'PASS' if ok else 'FAIL'}")
     print("  Caveats: (1) same-AZ private IP only; (2) GQA/MLA byte counts, never the MHA 2.5MB;")
     print("           (3) <40% hit rate may not clear amortized infra cost;")
     print("           (4) DELIVERABLE_GBPS is the target/loopback figure — replace with measured cloud GB/s.")

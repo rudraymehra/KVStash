@@ -1,7 +1,8 @@
 name: interface-tripwire
 
 # A6 kill-gate: detect when a vLLM / LMCache release renames the connector
-# methods kvblockd's adapters depend on. Weekly + manual.
+# methods kvblockd's adapters depend on. Weekly + manual. The matrix lists below
+# are the SINGLE source of truth for pinned versions (no separate versions.env).
 on:
   schedule:
     - cron: "0 5 * * 1" # Mondays 05:00 UTC

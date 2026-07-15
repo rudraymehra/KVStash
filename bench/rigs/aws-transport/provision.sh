@@ -12,6 +12,10 @@ KEY="${KEY:-kvbench}"          # EC2 key pair name (create once: aws ec2 create-
 STATE="$(dirname "$0")/.rig-state"
 TAG='ResourceType=instance,Tags=[{Key=kvbench,Value=transport}]'
 
+# If anything below fails mid-launch, an instance may already be billing.
+# It is tagged kvbench=transport, so teardown.sh finds and kills it.
+trap 'echo "[provision] FAILED mid-run — run teardown.sh NOW to kill any tagged instance" >&2' ERR
+
 echo "[provision] region=$REGION type=$ITYPE"
 
 # Amazon Linux 2023 x86_64 AMI (SSM public parameter — always current).
