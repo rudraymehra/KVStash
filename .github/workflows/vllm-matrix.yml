@@ -1,0 +1,61 @@
+name: interface-tripwire
+
+# A6 kill-gate: detect when a vLLM / LMCache release renames the connector
+# methods kvblockd's adapters depend on. Weekly + manual.
+on:
+  schedule:
+    - cron: "0 5 * * 1" # Mondays 05:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# On drift, the check step exits 1 and the job goes RED — visible on the Actions
+# tab, and GitHub emails the repo owner on a failed scheduled run. Auto-filing a
+# labeled issue was intentionally dropped: it fired on install flakes too (not
+# just drift) and needed a pre-created label. Revisit if we want richer alerts.
+
+jobs:
+  lmcache-abi:
+    # The reliable job: LMCache is lighter than vLLM. This is the must-green gate.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["0.5.1", "0.5.0", "0.4.7"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install CPU torch + lmcache
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Keep the CPU torch wheel preferred so lmcache's resolve doesn't pull CUDA torch.
+          PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu pip install "lmcache==${{ matrix.version }}"
+      - name: check interface
+        run: python .github/scripts/check_imports.py --target lmcache
+
+  vllm-abi:
+    # Best-effort: vLLM CPU install is heavy (~5-15 min) and old versions may not
+    # have CPU wheels. fail-fast off so one bad version doesn't hide the rest.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["0.25.1", "0.24.0", "0.23.0", "0.22.1"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install CPU torch + vllm
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu pip install "vllm==${{ matrix.version }}"
+      - name: check interface
+        run: python .github/scripts/check_imports.py --target vllm

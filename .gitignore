@@ -24,3 +24,7 @@ CLAUDE.md
 /kvblockd
 /kvbctl
 cmd/xferspike/xferspike
+
+# Python
+__pycache__/
+*.pyc
