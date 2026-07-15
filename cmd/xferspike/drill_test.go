@@ -61,19 +61,20 @@ func runEcho(b *testing.B, useWritev bool) {
 	}
 	defer conn.Close()
 
-	payload := make([]byte, 1<<20)
+	const drillPayload = 1 << 20 // 1 MiB; a typed constant so uint32() below is overflow-free
+	payload := make([]byte, drillPayload)
 	frame := make([]byte, headerSize+len(payload))
 	respHdr := make([]byte, headerSize)
-	respBody := make([]byte, 1<<20)
+	respBody := make([]byte, drillPayload)
 
-	b.SetBytes(1 << 20)
+	b.SetBytes(drillPayload)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		hdr := encodeHeader(frameHeader{
 			magic:  magic,
 			seq:    uint64(i),
-			length: uint32(len(payload)),
+			length: uint32(drillPayload),
 		})
 		if useWritev {
 			bufs := net.Buffers{hdr, payload}

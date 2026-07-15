@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -166,6 +167,9 @@ func runClient(cfg config) error {
 	if cfg.frameBytes > cfg.maxFrame {
 		return fmt.Errorf("frame-bytes %d exceeds max-frame %d; a server with the default max would drop the connection", cfg.frameBytes, cfg.maxFrame)
 	}
+	if cfg.frameBytes > math.MaxUint32 {
+		return fmt.Errorf("frame-bytes %d exceeds the %d wire limit", cfg.frameBytes, math.MaxUint32)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
 	defer cancel()
@@ -241,6 +245,7 @@ func blast(ctx context.Context, cfg config, bytesTotal, frames *atomic.Int64) er
 	var seq uint64
 
 	for ctx.Err() == nil {
+		//nolint:gosec // G115: cfg.frameBytes is validated <= MaxUint32 in runClient
 		putHeader(hdr, frameHeader{magic: magic, seq: seq, length: uint32(cfg.frameBytes)})
 		if hasDeadline {
 			if err := conn.SetWriteDeadline(deadline); err != nil {
