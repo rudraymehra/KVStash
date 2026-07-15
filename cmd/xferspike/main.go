@@ -2,12 +2,13 @@
 // fixed-size frames over N parallel TCP connections and reports aggregate
 // throughput (GB/s), frame rate, and CPU cores consumed as one JSON line — the
 // evidence behind the A1 kill-gate (>=12 GB/s loopback, >=85% of the iperf3
-// ceiling on the cloud pair). It is a throwaway rig kept forever for
-// reproducibility; it is NOT the product.
+// ceiling on the cloud pair). The --mode=soak variant additionally backs the A2
+// kill-gate: it serves blobs from an off-heap mmap arena and reports GC-pause
+// percentiles, proving a large cache doesn't cause GC stalls. It is a throwaway
+// rig kept forever for reproducibility; it is NOT the product.
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -15,15 +16,17 @@ import (
 )
 
 type config struct {
-	mode       string
-	addr       string
-	streams    int
-	frameBytes int
-	duration   time.Duration
-	sndBuf     int
-	rcvBuf     int
-	noDelay    bool
-	maxFrame   int
+	mode        string
+	addr        string
+	streams     int
+	frameBytes  int
+	duration    time.Duration
+	sndBuf      int
+	rcvBuf      int
+	noDelay     bool
+	maxFrame    int
+	arenaBytes  int
+	soakStreams int
 }
 
 func main() {
@@ -37,6 +40,8 @@ func main() {
 	flag.IntVar(&cfg.rcvBuf, "rcvbuf", 0, "SO_RCVBUF bytes, 0 = OS default")
 	flag.BoolVar(&cfg.noDelay, "nodelay", true, "set TCP_NODELAY")
 	flag.IntVar(&cfg.maxFrame, "max-frame", 64<<20, "server: reject frames larger than this (anti-OOM)")
+	flag.IntVar(&cfg.arenaBytes, "arena-bytes", 4<<30, "soak: off-heap arena size in bytes")
+	flag.IntVar(&cfg.soakStreams, "soak-streams", 8, "soak: concurrent client goroutines")
 	flag.Parse()
 
 	var err error
@@ -46,9 +51,9 @@ func main() {
 	case "client":
 		err = runClient(cfg)
 	case "soak":
-		err = errors.New("soak mode is not implemented yet (Week 1 Day 3)")
+		err = runSoak(cfg)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: xferspike --mode=server|client [flags]")
+		fmt.Fprintln(os.Stderr, "usage: xferspike --mode=server|client|soak [flags]")
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
