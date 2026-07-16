@@ -8,15 +8,31 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/zeebo/xxh3"
 )
 
 var update = flag.Bool("update", false, "rewrite golden vectors under testdata/frames")
 
-// goldenFrames builds the PROTOCOL.md §11 worked-example-A frames byte-for-byte
-// from the spec's prose. These are the conformance vectors: the Python client
-// (and any third-party implementation) must reproduce these exact bytes.
-// Example B's vectors land with the descriptor codec (they need xxh3_64
-// payload checksums, a dependency this package does not have yet).
+// exampleBPayload returns the deterministic payload convention for the §12
+// golden vector: block K0 = 1,048,576 bytes of 0xAA, K1 = 2,621,440 bytes of
+// 0xBB (matching their key fill bytes). The spec quotes the resulting xxh3_64
+// values; any conforming implementation reproduces them from this convention.
+func exampleBPayload(fill byte, n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = fill
+	}
+	return b
+}
+
+// goldenFrames builds the PROTOCOL.md §11–12 worked-example frames
+// byte-for-byte from the spec's prose. These are the conformance vectors: the
+// Python client (and any third-party implementation) must reproduce these
+// exact bytes. Example B's vector covers the frame header + the response
+// header region (preamble, first_index/total_keys, descriptors with real
+// xxh3_64 values); the multi-megabyte payload bytes follow the documented
+// deterministic convention and are not committed.
 func goldenFrames() map[string][]byte {
 	// Request: BATCH_EXISTS of 3 keys in namespace 7, request_id 0x1001.
 	reqHdr := Header{
@@ -53,9 +69,32 @@ func goldenFrames() map[string][]byte {
 	resp[81] = byte(StatusOK)
 	resp[82] = byte(StatusNotFound) // then 5 pad bytes = 0
 
+	// Example B response: BATCH_GET of 3 keys — 2 hits (1 MiB + 2.5 MiB), 1
+	// miss, one frame, request_id 0x1002, 1 MiB credit grant piggybacked.
+	k0 := exampleBPayload(0xAA, 1<<20)
+	k1 := exampleBPayload(0xBB, 2560<<10)
+	descs := []Desc{
+		{Status: StatusOK, Len: uint32(len(k0)), XXH3: xxh3.Hash(k0)}, //nolint:gosec // G115: fixed 1 MiB test constant
+		{Status: StatusOK, Len: uint32(len(k1)), XXH3: xxh3.Hash(k1)}, //nolint:gosec // G115: fixed 2.5 MiB test constant
+		{Status: StatusNotFound},
+	}
+	region := AppendGetRespHeader(nil, StatusOK, 0, 3, descs)
+	bHdr := Header{
+		Opcode:      OpBatchGet,
+		Flags:       FlagResp, // no F_MORE: single final frame
+		NamespaceID: 7,
+		Credit:      0x00100000,
+		RequestID:   0x1002,
+		PayloadLen:  uint32(len(region) + len(k0) + len(k1)), //nolint:gosec // G115: 3,670,080 — the spec's own example size
+	}
+	bFrame := make([]byte, HeaderSize+len(region))
+	bHdr.MarshalTo(bFrame)
+	copy(bFrame[HeaderSize:], region)
+
 	return map[string][]byte{
-		"example-a-request.hex":  req,
-		"example-a-response.hex": resp,
+		"example-a-request.hex":         req,
+		"example-a-response.hex":        resp,
+		"example-b-response-header.hex": bFrame,
 	}
 }
 
@@ -92,15 +131,31 @@ func TestGoldenVectors(t *testing.T) {
 	}
 }
 
-// TestGoldenCRCsMatchSpec prints the real header CRCs for PROTOCOL.md §11 so
-// the doc's byte listings can carry true values (checked here, quoted there).
+// TestGoldenCRCsMatchSpec ASSERTS the values PROTOCOL.md §11–12 quote, so the
+// doc, the codec, and the committed vectors are pinned to each other. (An
+// earlier version only logged these — a calibration drill demonstrated that a
+// log-only "check" is exactly how a regenerated-around-a-bug golden slips by.)
 func TestGoldenCRCsMatchSpec(t *testing.T) {
 	frames := goldenFrames()
-	req := frames["example-a-request.hex"]
-	resp := frames["example-a-response.hex"]
-	reqCRC := binary.LittleEndian.Uint32(req[crcOffset:])
-	respCRC := binary.LittleEndian.Uint32(resp[crcOffset:])
-	// The values PROTOCOL.md §11 quotes, pinned so the doc can't drift.
-	t.Logf("example A request  header crc32c bytes (LE): % x (u32 %#08x)", req[crcOffset:HeaderSize], reqCRC)
-	t.Logf("example A response header crc32c bytes (LE): % x (u32 %#08x)", resp[crcOffset:HeaderSize], respCRC)
+	want := []struct {
+		name string
+		crc  uint32 // as quoted in the spec's byte listings
+	}{
+		{"example-a-request.hex", 0x5F2EA7FF},
+		{"example-a-response.hex", 0xD6932E23},
+		{"example-b-response-header.hex", 0xC54F9DB9},
+	}
+	for _, w := range want {
+		got := binary.LittleEndian.Uint32(frames[w.name][crcOffset:])
+		if got != w.crc {
+			t.Errorf("%s: header crc32c %#08X, PROTOCOL.md quotes %#08X — doc and code have diverged", w.name, got, w.crc)
+		}
+	}
+	// The §12 descriptor checksums, quoted in the spec's byte listing.
+	b := frames["example-b-response-header.hex"]
+	d0 := GetDesc(b[HeaderSize+16:])
+	d1 := GetDesc(b[HeaderSize+32:])
+	if d0.XXH3 != 0xC47DEB608981FC4F || d1.XXH3 != 0xD69E1622BA66C45D {
+		t.Errorf("example B descriptor xxh3_64 diverged from the spec: %#016X, %#016X", d0.XXH3, d1.XXH3)
+	}
 }

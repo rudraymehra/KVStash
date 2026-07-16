@@ -460,16 +460,20 @@ layers to load vs recompute.
 **Request:** identical shape to example A but opcode `03`, request_id 0x1002;
 168 bytes total.
 
-**Response — one frame (fits under 256 MiB): 64B header + 3,670,080B payload:**
+**Response — one frame (fits under 256 MiB): 64B header + 3,670,080B payload.**
+Golden-vector payload convention: K0 = 1,048,576 bytes of `0xAA`, K1 =
+2,621,440 bytes of `0xBB` (matching their key fill bytes); credit grant
+0x00100000 piggybacked. Vector: `testdata/frames/example-b-response-header.hex`
+(frame header + response header region; payloads follow the convention).
 ```
 header: opcode 03, flags 0x0001 (F_RESP, no F_MORE → final), request_id 0x1002,
-        payload_len = 0x00380040 (3,670,080), credit grant piggybacked,
-        crc32c [GOLDEN — lands with the descriptor codec]
+        payload_len = 0x00380040 (3,670,080), credit 00 00 10 00,
+        crc32c = b9 9d 4f c5 (0xC54F9DB9) [GOLDEN]
 --- payload ---
 +0      00 00 00 00  03 00 00 00                           preamble: status=OK, count=3 descriptors
 +8      00 00 00 00  03 00 00 00                           first_index=0, total_keys=3
-+16     00 00 00 00 | 00 00 10 00 | ?? ×8                  desc0: OK, len=1,048,576,  xxh3_64 [GOLDEN — with descriptor codec]
-+32     00 00 00 00 | 00 00 28 00 | ?? ×8                  desc1: OK, len=2,621,440,  xxh3_64 [GOLDEN — with descriptor codec]
++16     00 00 00 00 | 00 00 10 00 | 4f fc 81 89 60 eb 7d c4   desc0: OK, len=1,048,576,  xxh3_64=0xC47DEB608981FC4F [GOLDEN]
++32     00 00 00 00 | 00 00 28 00 | 5d c4 66 ba 22 16 9e d6   desc1: OK, len=2,621,440,  xxh3_64=0xD69E1622BA66C45D [GOLDEN]
 +48     10 00 00 00 | 00 00 00 00 | 00 ×8                  desc2: NOT_FOUND, len=0, xxh3_64=0
 +64     <1,048,576 bytes of K0>                            payloads: OK blocks only, key order
 +1048640 <2,621,440 bytes of K1>
@@ -525,10 +529,10 @@ on each side.
 - Repo layout: `internal/protocol` (header codec, descriptor codec, status
   tables — pure, fuzzable), `internal/transport` (conn loop, credit ledger,
   lanes), `internal/server` (dispatch, PUT state machine + 30 s reaper).
-- Conformance artifacts: example A's golden byte vectors (real CRCs) live at
-  `internal/protocol/testdata/frames/example-a-{request,response}.hex`, pinned
-  by `TestGoldenVectors` and regenerable with `-update`; `FuzzParseHeader`
-  carries the truncated/bit-flipped seed corpus. Example B's vectors land with
-  the descriptor codec (they need real xxh3_64 payload checksums), as does a
-  model-based test asserting the §5 invariant "BEGIN, COMMIT, and ABORT each
-  get exactly one response".
+- Conformance artifacts: golden byte vectors (real CRCs and xxh3_64 values)
+  live at `internal/protocol/testdata/frames/` — example A request/response
+  and the example B response header region — pinned by `TestGoldenVectors` +
+  `TestGoldenCRCsMatchSpec` and regenerable with `-update`; `FuzzParseHeader`
+  and `FuzzParseBatch` carry the seed corpora. Still pending: a model-based
+  test asserting the §5 invariant "BEGIN, COMMIT, and ABORT each get exactly
+  one response" (lands with the server's stream table).
