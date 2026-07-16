@@ -1,0 +1,46 @@
+name: fuzz
+
+on:
+  schedule:
+    - cron: "0 2 * * 0" # Sunday 02:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  long-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 480
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - "FuzzParseHeader ./internal/protocol"
+          - "FuzzParseBatch ./internal/protocol"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: fuzz 3h
+        run: |
+          set -o pipefail
+          read -r FUNC PKG <<< "${{ matrix.target }}"
+          go test -fuzz="^${FUNC}$" -fuzztime=3h "$PKG" || echo "CRASH=1" >> "$GITHUB_ENV"
+      - name: upload corpus and crashers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-${{ strategy.job-index }}
+          path: "**/testdata/fuzz/**"
+          if-no-files-found: ignore
+      - name: open crash issue
+        if: env.CRASH == '1'
+        run: gh issue create --repo "$GITHUB_REPOSITORY" --title "Weekly fuzz crash: ${{ matrix.target }}" --body "A fuzz target crashed. See the corpus artifact on run ${{ github.run_id }}."
+        env:
+          GH_TOKEN: ${{ github.token }}
