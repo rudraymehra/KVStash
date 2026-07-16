@@ -229,21 +229,19 @@ streams×{cold,hot} because loopback throughput *falls* with stream count
 (a1-log finding 2) — single-number quotes hide the shape.
 
 **Final decomposition (out-of-process daemon + `bench/kvbench/getbench`, the
-production shape — same session, interleaved with the raw ceiling):**
-
-| config | GB/s | % of raw ceiling |
-|---|---:|---:|
-| kvblockd, verification off | **11.27** | **102%** |
-| kvblockd, full xxh3 verification (default) | 9.75 | 88% |
-| raw socket, no protocol/auth/checksum (`rawget`) | 11.04 | 100% |
-
-The protocol stack (framing, auth, credit, descriptors, dispatch) is now
-*faster than a plain raw-socket implementation* of the same workload; the
-entire remaining delta is integrity verification — real work with a real
-dial (`client.Options.SkipVerify`, default off, for consumers that re-verify
-downstream). Cross-kernel check: inside a Linux 6.10 VM (Docker) the same
-ratio holds — kvblockd 7.68 vs raw 8.36 cold 4-stream = 92% (absolute numbers
-carry VM overhead; the ratio is the claim).
+production shape). The claim is a RATIO measured interleaved, not an absolute:**
+laptop absolutes swing ±20% run-to-run under sustained load (the raw ceiling
+itself ranged 8.8–10.8 GB/s in one batch), so any single GB/s figure is a
+lucky run. Interleaved kvblockd-verify-off ÷ raw-socket ceiling over 6 pairs:
+**0.88 / 0.91 / 0.95 / 1.00 / 1.02 / 1.04, median ~0.97** — i.e. the full
+protocol stack runs at ~parity with a plain raw socket doing the same work,
+robustly, even as absolutes drift. verify-off absolute this batch ~7.7–10.6;
+verify-on (default) 12-run median ~6.9 (min 3.7). The verify delta is xxh3
+integrity — real work, dialable via `client.Options.SkipVerify`. Cross-kernel:
+Linux 6.10 VM held the same ~0.9 ratio (VM overhead in absolutes; ratio is the
+claim). **An earlier revision of this section quoted 11.27/9.75 GB/s as the
+headline — those were favorable single runs and overstated the absolute; the
+ratio is the honest, reproducible claim.**
 
 **Pipelining (measured, recorded for the network rig):** an in-order
 depth×streams matrix (`BenchmarkBatchGetPipelined`, bench-only raw client —

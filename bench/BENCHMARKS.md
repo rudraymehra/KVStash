@@ -27,18 +27,26 @@ go run ./bench/microbench/rawget -streams 4 -secs 3   # GET shape
 
 ## GET (read path) — the headline
 
-| config (dev-machine loopback, two-process, interleaved) | GB/s | % of raw ceiling |
-|---|---:|---:|
-| kvblockd, verification off | **11.27** | **102%** |
-| kvblockd, full xxh3 verification (default) | 9.75 | 88% |
-| raw socket, no protocol/auth/checksum (`rawget`) | 11.04 | 100% |
+**The claim is a RATIO, not an absolute.** Absolute GB/s on this laptop swings
+±20% run-to-run under sustained load (the raw-socket ceiling itself ranged
+8.8–10.8 GB/s across one interleaved batch), so a single "11.27 GB/s" figure
+is a favorable run, not the number. What is stable is kvblockd-vs-raw measured
+**interleaved in the same batch**:
 
-The protocol stack (framing, auth, credit, descriptors, dispatch) runs at
-parity-or-better with a plain raw socket doing the same work. The remaining
-12% is integrity verification — real work, dialable via `SkipVerify`. The
-ceiling is the kernel loopback copy path; even raw sockets can't beat it.
-Started the week at 7.4 GB/s; +32% default / +52% wire-path after the tuning
-passes.
+| metric (dev-machine loopback, two-process, interleaved) | value |
+|---|---|
+| kvblockd verify-off ÷ raw-socket ceiling, 6 pairs | 0.88 / 0.91 / 0.95 / 1.00 / 1.02 / 1.04 (median ~0.97) |
+| kvblockd verify-off, absolute this batch | ~7.7–10.6 GB/s (tracks the ceiling) |
+| kvblockd verify-on (default), 12-run median | ~6.9 GB/s (min 3.7, max 7.7) |
+
+Reading: the protocol stack (framing, auth, credit, descriptors, dispatch)
+runs at **~parity with a plain raw socket** doing the same work — the ratio is
+robust even though absolutes drift with thermal state. The verify-on default
+pays for xxh3 integrity (dialable via `SkipVerify`). The ceiling is the kernel
+loopback copy path; even raw sockets can't beat it. Started the week at
+~7.4 GB/s median; the tuning passes moved the *ratio* to parity (was ~0.7
+of the same-shape ceiling before). **Quote the ratio + the bare-metal Linux
+rig, never a laptop absolute.**
 
 ## Block-size range (the real workload is 0.4–2.5 MB)
 
