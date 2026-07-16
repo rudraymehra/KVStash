@@ -300,6 +300,17 @@ against SEPARATE daemon instances — reusing one daemon hits write-once
 immutable-conflict and credits new-size bytes against stale data (produced a
 physically-impossible 49 GB/s reading; discarded, not reported).
 
+**Second-kernel confirmation (Linux 6.10 / Docker linuxkit, 8 cores).** These
+carry virtualization overhead and are NOT the quotable figure (bare-metal
+Linux is the Week-3 rig) — the value is that the SHAPE reproduces on a second
+kernel: codecs zero-alloc (Marshal 19.6 ns, Parse 22.5 ns); GET cold peaks at
+4 streams (5.48 GB/s) and declines at 16 (2.93) — the a1-log inverted-stream
+curve, independent of macOS; PUT 2.2–3.5 GB/s (same ~2× read/write ratio);
+EXISTS 9.9–20 µs. One divergence worth noting for the network rig: EXISTS
+pipelining depth-16 gains only ~1.4× here vs ~5× on macOS, because per-RTT
+latency is lower to begin with — the pipelining lever's payoff scales with the
+RTT it hides, so the AWS pair (real RTT) is where it will matter most.
+
 **Negative result — inline vs sidecar verification (don't regress this).** A
 prototype hashing each block inline right after its read (hoping to hit it
 cache-hot and skip a second DRAM pass) measured 6.9 GB/s vs the sidecar's
