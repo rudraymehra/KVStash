@@ -17,6 +17,12 @@ import (
 // transport concern). body ownership transfers to the handler per the
 // BufferSource protocol; the handler must Return it, directly or via a
 // WriteFrames release, and must Grant the frame's payload bytes once drained.
+//
+// WriteFrames MUST be called from this handler goroutine (or before Close).
+// That single-producer discipline is what lets the post-close final drain
+// guarantee every release fires exactly once; an async worker that calls
+// WriteFrames from another goroutine is a server-layer design that must add
+// its own synchronization (tracked for the server week).
 type FrameHandler interface {
 	HandleFrame(c *Conn, h protocol.Header, body []byte)
 }
@@ -24,9 +30,11 @@ type FrameHandler interface {
 // ErrConnClosed is returned by WriteFrames after Close/Abort.
 var ErrConnClosed = errors.New("transport: connection closed")
 
-// maxFlushFrames bounds one writev flush: each frame contributes one header
-// iovec plus its payload iovecs, so 512 frames stays comfortably under the
-// kernel's IOV_MAX (1024) even with multi-slice payloads.
+// maxFlushFrames bounds one writev flush by FRAME count. Total iovecs (1
+// header + N payload slices per frame) can exceed the kernel's IOV_MAX (1024);
+// Go's net.Buffers.WriteTo chunks the vector at IOV_MAX and loops, so a large
+// flush becomes several writev syscalls rather than an error — we bound frames,
+// not iovecs, and let the runtime handle the syscall chunking.
 const maxFlushFrames = 512
 
 // writeReq is one queued response frame. release fires after the kernel has
@@ -38,6 +46,8 @@ type writeReq struct {
 	bufs    net.Buffers
 	release func()
 }
+
+func (r writeReq) payloadLen() uint64 { return uint64(r.hdr.PayloadLen) }
 
 // Conn is one accepted connection: a read loop feeding the handler and a
 // write loop coalescing responses into large writev flushes.
@@ -55,7 +65,7 @@ type Conn struct {
 	closeOnce sync.Once
 	done      chan struct{}
 
-	discardBuf []byte // per-conn scratch for skipping unwanted payloads
+	discardBuf []byte // per-conn reusable 64 KiB skip buffer, read-goroutine-only
 }
 
 // startConn wires the loops around an accepted (already tuned) net.Conn.
@@ -77,7 +87,16 @@ func startConn(nc net.Conn, bs BufferSource, h FrameHandler, cfg Config) *Conn {
 	wg.Add(2)
 	go func() { defer wg.Done(); c.readLoop() }()
 	go func() { defer wg.Done(); c.writeLoop() }()
-	go func() { wg.Wait(); close(c.done) }()
+	go func() {
+		wg.Wait()
+		// Both loops have exited. The read goroutine is the sole producer of
+		// release-bearing writeReqs (handlers call WriteFrames on it), so once
+		// it is gone no more can be enqueued: this final drain fires every
+		// release exactly once, closing the writer-death strand window.
+		c.finalDrain()
+		conserveCheck(&c.credit) // no-op unless built with -tags kvbdebug
+		close(c.done)
+	}()
 	return c
 }
 
@@ -93,20 +112,25 @@ func (c *Conn) SetLimits(l protocol.Limits) {
 // (handlers call this once they have consumed a frame's bytes).
 func (c *Conn) GrantCredit(n uint32) { c.credit.Grant(n) }
 
+// RemoteAddr is the peer address (for HELLO auth logging and abuse accounting).
+func (c *Conn) RemoteAddr() net.Addr { return c.nc.RemoteAddr() }
+
 // WriteFrames queues one response frame: hdr plus the payload slices, emitted
 // together in one writev (with other queued frames when the writer is
 // backlogged). hdr.PayloadLen is computed here from bufs; hdr.Credit is
-// overwritten by the writer with any pending grant. release (may be nil)
-// fires after the kernel accepted the bytes — hold arena refcounts until then.
+// overwritten by the writer with any pending grant. release (may be nil) fires
+// after the kernel accepted the bytes — hold arena refcounts until then. If the
+// connection is closed, release fires immediately and ErrConnClosed is
+// returned. Call from the handler goroutine (see FrameHandler).
 func (c *Conn) WriteFrames(hdr protocol.Header, bufs net.Buffers, release func()) error {
 	var total uint64
 	for _, b := range bufs {
 		total += uint64(len(b))
 	}
-	hdr.PayloadLen = uint32(total) //nolint:gosec // G115: callers respect the negotiated max_frame_len (u32); a server-side overflow here would be a server bug, caught by the deterministic PayloadLen mismatch on the client
-	// Check closed FIRST: after Close the writer may already have drained its
-	// queue for the last time, so winning the send race would strand the
-	// request (and its release) in a channel nobody reads.
+	hdr.PayloadLen = uint32(total) //nolint:gosec // G115: callers respect the negotiated max_frame_len (u32); a server-side overflow would be a server bug the client catches via the deterministic PayloadLen mismatch
+	// Fast path: if the connection is already closed, never enqueue — the
+	// writer and the post-wg.Wait finalDrain may already have run, so a send
+	// here would strand the request. Fire the release and report closed.
 	select {
 	case <-c.closed:
 		if release != nil {
@@ -129,7 +153,7 @@ func (c *Conn) WriteFrames(hdr protocol.Header, bufs net.Buffers, release func()
 // Abort sends a best-effort §9 protocol-fatal report frame (opcode 0,
 // F_RESP|F_FATAL, request_id 0, preamble payload) and closes the connection.
 // Receivers MUST NOT rely on the report arriving — and neither do we: if the
-// write queue is full, we just close.
+// write queue is full, we just close. The report body carries no release.
 func (c *Conn) Abort(status protocol.Status) {
 	body := protocol.AppendErrorResp(make([]byte, 0, protocol.PreambleSize), status)
 	hdr := protocol.Header{
@@ -144,9 +168,9 @@ func (c *Conn) Abort(status protocol.Status) {
 	_ = c.Close()
 }
 
-// Close tears the connection down: both loops exit (in-flight I/O is
-// unblocked via an immediate deadline), the writer flushes what it can and
-// closes the socket. Safe to call multiple times, from any goroutine.
+// Close tears the connection down: it closes c.closed and pokes an immediate
+// I/O deadline so both loops unblock and exit; the socket is closed by the
+// writer on its way out. Safe to call multiple times, from any goroutine.
 func (c *Conn) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closed)
@@ -155,12 +179,13 @@ func (c *Conn) Close() error {
 	return nil
 }
 
-// Done is closed when both loops have exited and the socket is closed.
+// Done is closed when both loops have exited, the socket is closed, and every
+// release has fired.
 func (c *Conn) Done() <-chan struct{} { return c.done }
 
 // respondError enqueues a transport-owned canned error response — used for
 // frames that structurally cannot reach a handler (oversize, credit breach),
-// where not answering would leave the client waiting forever.
+// where not answering would leave the client waiting forever. No release.
 func (c *Conn) respondError(h protocol.Header, status protocol.Status) {
 	body := protocol.AppendErrorResp(make([]byte, 0, protocol.PreambleSize), status)
 	hdr := protocol.Header{
@@ -176,15 +201,23 @@ func (c *Conn) respondError(h protocol.Header, status protocol.Status) {
 	}
 }
 
-// discard reads and drops exactly n payload bytes — the skip path for frames
-// we refuse. It never Lends a buffer, so a hostile length can never size an
-// allocation (the drain() discipline from the transport rig).
+// discard reads and drops exactly n payload bytes under a body-read deadline —
+// the skip path for frames we refuse. It never Lends a buffer, so a hostile
+// length can never size an allocation (the drain() discipline from the rig).
 func (c *Conn) discard(n uint32) error {
+	if c.cfg.BodyReadTimeout > 0 {
+		_ = c.nc.SetReadDeadline(time.Now().Add(c.cfg.BodyReadTimeout))
+	}
+	// The wrapper hides io.Discard's ReaderFrom so CopyBuffer actually uses the
+	// pooled discardBuf (bounding memory) instead of io.Discard's own path.
 	_, err := io.CopyBuffer(struct{ io.Writer }{io.Discard}, io.LimitReader(c.nc, int64(n)), c.discardBuf)
 	return err
 }
 
-// readLoop: ReadFull(64B) → ParseHeader(negotiated cap) → route.
+// readLoop: ReadFull(64B) → ParseHeader(negotiated cap) → route. Routing order
+// is load-bearing: NOP (control, never debits, never answered) is handled
+// before the over-cap and credit-enforcement paths so a nonconforming
+// keepalive can never draw a response or burn a strike (PROTOCOL.md §3/§8).
 func (c *Conn) readLoop() {
 	defer c.Close()
 	hdrBuf := make([]byte, protocol.HeaderSize)
@@ -197,67 +230,80 @@ func (c *Conn) readLoop() {
 		}
 
 		h, err := protocol.ParseHeader(hdrBuf, c.maxPayload.Load())
-		switch {
-		case errors.Is(err, protocol.ErrPayloadTooLarge):
-			// The populated-header path the codec was designed for: the CRC
-			// authenticated PayloadLen, so skip exactly that many bytes,
-			// answer ERR_TOO_LARGE echoing the request, and re-grant the
-			// bytes (§8 amended rule 4: skipped bytes are still re-granted).
-			c.credit.Consume(h.PayloadLen)
-			if derr := c.discard(h.PayloadLen); derr != nil {
-				return
-			}
-			c.credit.Grant(h.PayloadLen)
-			c.respondError(h, protocol.StatusErrTooLarge)
-			continue
-		case err != nil:
+		overCap := errors.Is(err, protocol.ErrPayloadTooLarge)
+		if err != nil && !overCap {
 			// Fatal by classification (magic/version/CRC): report, close, no
 			// resynchronization attempt, ever (PROTOCOL.md §1).
 			c.Abort(protocol.StatusFatalProtocol)
 			return
 		}
 
-		switch v := c.credit.Consume(h.PayloadLen); v {
-		case ViolationBusy, ViolationFatal:
-			if derr := c.discard(h.PayloadLen); derr != nil {
+		// NOP is a control frame (§3): tolerate any (even over-cap) payload by
+		// skipping it, never debit the window, never answer.
+		if h.Opcode == protocol.OpNop {
+			if c.discard(h.PayloadLen) != nil {
 				return
 			}
+			continue
+		}
+
+		if overCap {
+			// Populated-header path: the CRC authenticated PayloadLen, so skip
+			// exactly that many bytes, answer ERR_TOO_LARGE echoing the
+			// request, and re-grant (§8 amended rule 4). Account, not Consume:
+			// an over-cap frame is a size error, not a window violation, so it
+			// must not touch the strike counter.
+			c.credit.Account(h.PayloadLen)
+			derr := c.discard(h.PayloadLen)
+			c.credit.Grant(h.PayloadLen) // conserve even on a dying connection
+			if derr != nil {
+				return
+			}
+			c.respondError(h, protocol.StatusErrTooLarge)
+			continue
+		}
+
+		switch c.credit.Consume(h.PayloadLen) {
+		case ViolationBusy:
+			derr := c.discard(h.PayloadLen)
 			c.credit.Grant(h.PayloadLen)
-			if v == ViolationFatal {
-				c.Abort(protocol.StatusErrBusy)
+			if derr != nil {
 				return
 			}
 			c.respondError(h, protocol.StatusErrBusy)
 			continue
+		case ViolationFatal:
+			_ = c.discard(h.PayloadLen)
+			c.credit.Grant(h.PayloadLen)
+			c.Abort(protocol.StatusErrBusy)
+			return
 		case ViolationNone:
 		}
 
-		if h.Opcode == protocol.OpNop {
-			// Keepalive / client-side credit noise: tolerate any payload by
-			// skipping it (§3), grant the bytes back, never respond.
-			if derr := c.discard(h.PayloadLen); derr != nil {
-				return
-			}
-			c.credit.Grant(h.PayloadLen)
-			continue
-		}
-
 		body := c.bs.Lend(int(h.PayloadLen))
+		if c.cfg.BodyReadTimeout > 0 {
+			_ = c.nc.SetReadDeadline(time.Now().Add(c.cfg.BodyReadTimeout))
+		}
 		if _, err := io.ReadFull(c.nc, body); err != nil {
+			// Truncated frame: the handler will never run to Grant, so grant
+			// here to keep the ledger conserved (the connection is dying).
 			c.bs.Return(body)
+			c.credit.Grant(h.PayloadLen)
 			return
 		}
-		// Ownership of body transfers to the handler here (Return + Grant are
-		// its responsibility, directly or via a WriteFrames release).
+		// Ownership of body transfers to the handler (Return + Grant are its
+		// responsibility, directly or via a WriteFrames release).
 		c.handler.HandleFrame(c, h, body)
 	}
 }
 
 // writeLoop: block for the first request, then drain the queue non-blocking
-// into one coalesced writev flush. Coalescing NEVER waits for more frames —
-// a lone sub-millisecond EXISTS reply flushes immediately; 16 MiB batches
-// emerge only when the queue is genuinely backlogged, which is exactly when
-// throughput matters.
+// into one coalesced writev flush. Coalescing NEVER waits for more frames — a
+// lone sub-millisecond EXISTS reply flushes immediately; ≥16 MiB batches
+// emerge only when the queue is genuinely backlogged. On any flush failure the
+// loop closes the whole Conn (not just the socket) so a handler blocked in
+// WriteFrames sees c.closed and its release fires; the post-wg.Wait drain mops
+// up anything already queued.
 func (c *Conn) writeLoop() {
 	hdrArena := make([]byte, protocol.HeaderSize*maxFlushFrames)
 	reqs := make([]writeReq, 0, maxFlushFrames)
@@ -271,44 +317,46 @@ func (c *Conn) writeLoop() {
 		case first := <-c.wq:
 			reqs = append(reqs[:0], first)
 			total := first.payloadLen()
-			for total < uint64(c.cfg.CoalesceBytes) && len(reqs) < maxFlushFrames { //nolint:gosec // G115: CoalesceBytes is a validated config constant (16 MiB)
+			for total < uint64(c.cfg.CoalesceBytes) && len(reqs) < maxFlushFrames { //nolint:gosec // G115: CoalesceBytes is a config constant (16 MiB)
 				select {
 				case r := <-c.wq:
 					reqs = append(reqs, r)
 					total += r.payloadLen()
 				default:
-					total = uint64(c.cfg.CoalesceBytes) //nolint:gosec // G115: as above; queue momentarily empty: flush now
+					total = uint64(c.cfg.CoalesceBytes) //nolint:gosec // G115: as above; queue momentarily empty → flush now, never wait
 				}
 			}
-			if !c.flush(hdrArena, reqs, &iovs) {
-				c.drainReleases()
-				_ = c.nc.Close()
+			if !c.flush(hdrArena, reqs, &iovs, c.cfg.WriteStallTimeout) {
+				_ = c.Close()
 				return
 			}
 
 		case <-grantTick.C:
-			// §8 rule 4: unsolicited NOP/CREDIT when there are pending grants
-			// and nothing else to ride on.
+			// §8 rule 4: unsolicited NOP/CREDIT when grants are pending and
+			// there is nothing else to ride on.
 			if c.credit.PendingGrant() {
 				reqs = append(reqs[:0], writeReq{hdr: protocol.Header{Opcode: protocol.OpNop}})
-				if !c.flush(hdrArena, reqs, &iovs) {
-					c.drainReleases()
-					_ = c.nc.Close()
+				if !c.flush(hdrArena, reqs, &iovs, c.cfg.WriteStallTimeout) {
+					_ = c.Close()
 					return
 				}
 			}
 
 		case <-c.closed:
-			// Best-effort final flush of whatever is already queued (the
-			// Abort report frame rides this path), then close the socket.
-			_ = c.nc.SetWriteDeadline(time.Now().Add(time.Second))
+			// Bounded best-effort final flush of what is already queued (the
+			// Abort report frame rides this path). One short deadline for the
+			// WHOLE drain — flush must not re-arm it — and we stop at the first
+			// failure; the post-wg.Wait drain fires the rest of the releases.
+			deadline := time.Now().Add(time.Second)
 			for {
 				select {
 				case r := <-c.wq:
 					reqs = append(reqs[:0], r)
-					_ = c.flush(hdrArena, reqs, &iovs)
+					if !c.flushBy(hdrArena, reqs, &iovs, deadline) {
+						_ = c.nc.Close()
+						return
+					}
 				default:
-					c.drainReleases()
 					_ = c.nc.Close()
 					return
 				}
@@ -317,15 +365,22 @@ func (c *Conn) writeLoop() {
 	}
 }
 
-func (r writeReq) payloadLen() uint64 { return uint64(r.hdr.PayloadLen) }
+// flush emits one writev for the batch with a deadline of now+timeout.
+func (c *Conn) flush(hdrArena []byte, reqs []writeReq, iovs *net.Buffers, timeout time.Duration) bool {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	return c.flushBy(hdrArena, reqs, iovs, deadline)
+}
 
-// flush emits one writev for the batch: iovecs alternate marshalled headers
-// (from the per-flush arena) and payload slices. The first header of the
-// flush carries any pending credit grant. Releases fire after WriteTo
-// returns, success or error (§12: buffers are held until the kernel accepted
-// the bytes). Returns false when the connection is dead.
-func (c *Conn) flush(hdrArena []byte, reqs []writeReq, iovs *net.Buffers) bool {
-	*iovs = (*iovs)[:0]
+// flushBy emits one writev for the batch against an absolute deadline (zero =
+// none). iovecs alternate marshalled headers (from the per-flush arena) and
+// payload slices; the first header carries any pending credit grant. Releases
+// fire after WriteTo returns, success or error (§12). Returns false on write
+// failure.
+func (c *Conn) flushBy(hdrArena []byte, reqs []writeReq, iovs *net.Buffers, deadline time.Time) bool {
+	buf := (*iovs)[:0]
 	for i := range reqs {
 		if i == 0 {
 			reqs[i].hdr.Credit = c.credit.TakeGrant()
@@ -334,20 +389,22 @@ func (c *Conn) flush(hdrArena []byte, reqs []writeReq, iovs *net.Buffers) bool {
 		}
 		slot := hdrArena[i*protocol.HeaderSize : (i+1)*protocol.HeaderSize]
 		reqs[i].hdr.MarshalTo(slot)
-		*iovs = append(*iovs, slot)
-		*iovs = append(*iovs, reqs[i].bufs...)
+		buf = append(buf, slot)
+		buf = append(buf, reqs[i].bufs...)
 	}
+	*iovs = buf // keep the grown backing array for reuse next flush
 
-	if c.cfg.WriteStallTimeout > 0 {
-		_ = c.nc.SetWriteDeadline(time.Now().Add(c.cfg.WriteStallTimeout))
+	if !deadline.IsZero() {
+		_ = c.nc.SetWriteDeadline(deadline)
 	}
-	// net.Buffers.WriteTo performs short-write resumption internally (it
-	// advances the vector across partial writev progress). A deadline error
-	// here means a peer that made less than one flush of progress in
-	// 2×stream_timeout — §8 rule 5's zero-drain closure, a failure by
-	// definition (unlike the benchmark rig, where the deadline was the
-	// clean end of the run).
-	_, err := iovs.WriteTo(c.nc)
+	// WriteTo advances its receiver as it consumes iovecs, so hand it a COPY of
+	// the slice header — otherwise *iovs would be left pointing at the end of
+	// the backing array and the next flush's append would reallocate the whole
+	// (up to 1024-entry) vector on the hot path. net.Buffers.WriteTo also does
+	// short-write resumption internally; a deadline error means the peer made
+	// less than one flush of progress in the window (§8 rule 5, a failure).
+	toWrite := buf
+	_, err := (&toWrite).WriteTo(c.nc)
 
 	for i := range reqs {
 		if reqs[i].release != nil {
@@ -357,9 +414,9 @@ func (c *Conn) flush(hdrArena []byte, reqs []writeReq, iovs *net.Buffers) bool {
 	return err == nil
 }
 
-// drainReleases fires the release of everything still queued at teardown so
-// arena refcounts never leak on the error path.
-func (c *Conn) drainReleases() {
+// finalDrain fires the release of everything still queued once both loops have
+// exited — the authoritative, race-free release point (no producer remains).
+func (c *Conn) finalDrain() {
 	for {
 		select {
 		case r := <-c.wq:

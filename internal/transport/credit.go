@@ -54,7 +54,8 @@ func (w *CreditWindow) SetWindow(window, maxFrame uint32) {
 // Consume debits one request frame's payload bytes and rules on the window.
 // The enforcement threshold is window + maxFrame: §8 rule 3 sanctions sending
 // one final frame from a small-positive window, so overshoot by at most one
-// frame IS the legal limit, and crossing it is rule 5's violation.
+// frame IS the legal limit, and crossing it is rule 5's violation. Use this
+// ONLY for real request frames that carry the window-enforcement semantics.
 func (w *CreditWindow) Consume(n uint32) Violation {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -68,6 +69,19 @@ func (w *CreditWindow) Consume(n uint32) Violation {
 		return ViolationBusy
 	}
 	return ViolationFatal
+}
+
+// Account debits n bytes for conservation WITHOUT running window enforcement —
+// the strikes-free path for frames the client debited but the server refuses
+// on non-window grounds (over-cap → ERR_TOO_LARGE). Coupling these to Consume
+// would let a lawfully-skippable over-cap frame silently burn the §8 rule-5
+// first strike, so a later genuine breach jumps straight to F_FATAL. Pair with
+// Grant, same as Consume.
+func (w *CreditWindow) Account(n uint32) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.outstanding += uint64(n)
+	w.consumed += uint64(n)
 }
 
 // Grant returns n consumed bytes to the client's window: they become pending

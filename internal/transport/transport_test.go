@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,11 @@ import (
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
+
+// handlerFunc adapts a function to FrameHandler.
+type handlerFunc func(*Conn, protocol.Header, []byte)
+
+func (f handlerFunc) HandleFrame(c *Conn, h protocol.Header, body []byte) { f(c, h, body) }
 
 // testConfig returns tight timeouts suitable for loopback tests.
 func testConfig() Config {
@@ -208,14 +214,14 @@ func TestManyFramesPipelined(t *testing.T) {
 // over-cap frame draws ERR_TOO_LARGE echoing its request_id, and the NEXT
 // frame on the same connection is served normally — the stream never desyncs.
 func TestOversizeSkipStaysInSync(t *testing.T) {
-	cfg := testConfig()
-	cfg.PreNegCap = 4096 // small cap so an oversize frame is cheap to build
-	addr, teardown := startEcho(t, cfg)
+	// PreNegCap floors to protocol.MaxHelloBody, so the oversize frame must
+	// exceed that floor to be rejected.
+	addr, teardown := startEcho(t, testConfig())
 	defer teardown()
 	nc := dial(t, addr)
 	defer nc.Close()
 
-	big := bytes.Repeat([]byte{0xEE}, 8192) // 2× the cap
+	big := bytes.Repeat([]byte{0xEE}, int(protocol.MaxHelloBody)+64<<10) // over the pre-neg cap
 	sendFrame(t, nc, protocol.Header{Opcode: protocol.OpBatchGet, RequestID: 7}, big)
 
 	h, body := readFrame(t, nc)
@@ -332,31 +338,134 @@ func TestWriteFramesAfterCloseReleases(t *testing.T) {
 	}
 }
 
+// TestConcurrentCloseReleasesEverything is the regression test for the
+// teardown-lattice family: under a handler emitting many frames against a
+// stalled peer, an external Close must never strand a release. It asserts
+// every WriteFrames release fired (Return + Grant), Done() closes promptly,
+// and the credit ledger conserves — the oracle the review panel specified.
+func TestConcurrentCloseReleasesEverything(t *testing.T) {
+	cfg := testConfig()
+	cfg.WriteStallTimeout = minStallTimeout // floored; keep teardown bounded
+	l, err := Listen(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	var released atomic.Int64
+	// A handler that keeps writing 1 MiB responses; each release counts itself.
+	h := handlerFunc(func(c *Conn, hh protocol.Header, body []byte) {
+		// Consume the incoming frame per the handler contract (Return + Grant),
+		// then keep writing responses until the connection closes under us.
+		c.bs.Return(body)
+		c.GrantCredit(hh.PayloadLen)
+		for i := 0; i < 2000; i++ {
+			resp := protocol.Header{Opcode: protocol.OpBatchGet, Flags: protocol.FlagResp, RequestID: hh.RequestID}
+			payload := make([]byte, 1<<20)
+			if werr := c.WriteFrames(resp, net.Buffers{payload}, func() { released.Add(1) }); werr != nil {
+				return // ErrConnClosed: stop; the release already fired inside WriteFrames
+			}
+		}
+	})
+
+	accepted := make(chan *Conn, 1)
+	go func() {
+		c, aerr := l.Accept(HeapSource{}, h)
+		if aerr == nil {
+			accepted <- c
+		}
+	}()
+
+	nc, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Never read responses → the writer backs up against the socket buffer.
+	sendFrame(t, nc, protocol.Header{Opcode: protocol.OpBatchGet, RequestID: 1}, []byte("go"))
+
+	c := <-accepted
+	time.Sleep(100 * time.Millisecond) // let the handler enqueue a backlog
+	_ = c.Close()                      // external close racing the handler's WriteFrames
+	_ = nc.Close()
+
+	select {
+	case <-c.Done():
+	case <-time.After(15 * time.Second):
+		t.Fatal("Done() did not close within 15s — teardown wedged")
+	}
+
+	// The handler stopped once WriteFrames returned ErrConnClosed; every frame
+	// it believed it queued must have had its release fired exactly once.
+	consumed, granted := c.credit.Totals()
+	if consumed != granted {
+		t.Fatalf("credit ledger not conserved after close: consumed=%d granted=%d", consumed, granted)
+	}
+	if released.Load() == 0 {
+		t.Fatal("no releases fired — the handler never ran or all were stranded")
+	}
+}
+
+// TestOverCapDoesNotBurnStrike pins that a lawfully-skipped over-cap frame does
+// not poison the credit strike counter (the §8 rule-5 first strike must remain
+// available for a genuine window breach).
+func TestOverCapDoesNotBurnStrike(t *testing.T) {
+	var w CreditWindow
+	w.SetWindow(1000, 500)
+	// Simulate the over-cap path: Account (not Consume) then Grant.
+	w.Account(1 << 20)
+	w.Grant(1 << 20)
+	// A subsequent genuine first breach must still be the recoverable Busy.
+	w.Consume(1000)
+	if v := w.Consume(600); v != ViolationBusy {
+		t.Fatalf("first genuine breach after an over-cap frame = %v, want ViolationBusy (strike was poisoned)", v)
+	}
+	consumed, granted := w.Totals()
+	if consumed-granted != 1600 {
+		t.Fatalf("ledger: consumed-granted=%d, want 1600 (the two live Consumes)", consumed-granted)
+	}
+}
+
 // TestSlowReaderIsBounded pins the LMCache-class failure: a peer that never
-// reads its responses stalls the connection at the write deadline — it never
-// buffers unboundedly, and teardown releases everything queued.
+// reads is closed by the SERVER at the write-stall deadline, never buffered
+// unboundedly. Deterministic: a handler writes one response larger than any
+// socket buffer to a client that never reads, so the writer blocks in a single
+// writev, hits the stall deadline, and closes — proven by the client's Read
+// hitting EOF within a bound (not the client's own deadline).
 func TestSlowReaderIsBounded(t *testing.T) {
 	cfg := testConfig()
-	cfg.WriteStallTimeout = 300 * time.Millisecond
-	addr, teardown := startEcho(t, cfg)
-	defer teardown()
-	nc := dial(t, addr)
-	defer nc.Close()
-
-	// Blast frames without ever reading a response. The server's writer hits
-	// the stall deadline once loopback+queue capacity is exhausted and closes.
-	payload := bytes.Repeat([]byte{7}, 256<<10)
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		h := protocol.Header{Opcode: protocol.OpBatchGet, RequestID: 1}
-		h.PayloadLen = uint32(len(payload)) //nolint:gosec // G115: test constant
-		hb := make([]byte, protocol.HeaderSize)
-		h.MarshalTo(hb)
-		bufs := net.Buffers{hb, payload}
-		_ = nc.SetWriteDeadline(time.Now().Add(time.Second))
-		if _, err := bufs.WriteTo(nc); err != nil {
-			return // server closed on us: exactly the bounded behavior we want
-		}
+	cfg.WriteStallTimeout = minStallTimeout // floored anyway; the server-close clock
+	l, err := Listen(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Fatal("server buffered a never-reading peer for 10s without closing")
+	defer l.Close()
+
+	h := handlerFunc(func(c *Conn, hh protocol.Header, body []byte) {
+		c.bs.Return(body)
+		c.GrantCredit(hh.PayloadLen)
+		// One response far larger than SndBuf + the client's RcvBuf: the writev
+		// cannot drain into a non-reading peer and must hit the stall deadline.
+		_ = c.WriteFrames(protocol.Header{Opcode: protocol.OpBatchGet, Flags: protocol.FlagResp, RequestID: hh.RequestID},
+			net.Buffers{make([]byte, 96<<20)}, nil)
+	})
+	accepted := make(chan *Conn, 1)
+	go func() {
+		if c, aerr := l.Accept(HeapSource{}, h); aerr == nil {
+			accepted <- c
+		}
+	}()
+
+	nc := dial(t, l.Addr().String())
+	defer nc.Close()
+	sendFrame(t, nc, protocol.Header{Opcode: protocol.OpBatchGet, RequestID: 1}, []byte("go"))
+	c := <-accepted
+
+	// The client never reads, so the server's 96 MiB writev cannot drain and
+	// the writer hits the stall deadline, closing the conn. Wait for that close
+	// (bounded); if it never comes, the server buffered a dead peer unboundedly.
+	select {
+	case <-c.Done():
+	case <-time.After(minStallTimeout + 10*time.Second):
+		t.Fatal("server did not close a never-reading peer within the stall bound")
+	}
 }
