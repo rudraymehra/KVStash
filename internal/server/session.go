@@ -24,8 +24,9 @@ type session struct {
 	limits protocol.Limits
 	feats  uint64
 
-	keyScratch [][32]byte // reused across batch decodes on the read goroutine
-	lendBuf    []byte     // reusable Lend extent (see Lend for the safety invariant)
+	keyScratch  [][32]byte      // reused across batch decodes on the read goroutine
+	descScratch []protocol.Desc // reused across GET frames (consumed synchronously into the header region)
+	lendBuf     []byte          // reusable Lend extent (see Lend for the safety invariant)
 
 	streamMu    sync.Mutex
 	streams     map[uint64]*putStream // by request_id

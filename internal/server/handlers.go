@@ -114,7 +114,11 @@ func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []by
 	maxFrame := int(s.limits.MaxFrameLen)
 	total := len(keys)
 	for i := 0; i < total; {
-		descs := make([]protocol.Desc, 0, total-i)
+		// descScratch is reused across frames and requests: AppendGetRespHeader
+		// (below) serializes it into the region bytes synchronously, so it is
+		// dead before bufs/region are handed to the async writer — safe to
+		// recycle, unlike region/bufs themselves.
+		descs := s.descScratch[:0]
 		bufs := net.Buffers{nil} // iov[0] placeholder for the header region
 		payloadBytes := 0
 		j := i
@@ -143,6 +147,7 @@ func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []by
 		}
 		region := protocol.AppendGetRespHeader(make([]byte, 0, protocol.GetRespHeaderSize(len(descs))),
 			protocol.StatusOK, uint32(i), uint32(total), descs) //nolint:gosec // G115: indices capped by max_batch_keys
+		s.descScratch = descs[:0] // keep the grown backing array for the next frame
 		bufs[0] = region
 		flags := protocol.FlagResp
 		if j < total {
