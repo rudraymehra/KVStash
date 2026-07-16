@@ -120,22 +120,30 @@ func (cn *conn) readGetInto(keys [][32]byte, into [][]byte) ([]protocol.Status, 
 		if err != nil {
 			return fail(err)
 		}
-		pre, err := cn.readN(protocol.PreambleSize)
+		// A non-OK batch response is exactly the 8-byte preamble (§3); the
+		// header's payload_len says which shape arrived, so an OK frame's
+		// preamble+index (16 B) is read in one syscall.
+		if h.PayloadLen == protocol.PreambleSize {
+			pre, err := cn.readN(protocol.PreambleSize)
+			if err != nil {
+				return fail(err)
+			}
+			return fail(&StatusError{Op: protocol.OpBatchGet, Status: protocol.Status(pre[0])})
+		}
+		pre, err := cn.readN(protocol.PreambleSize + 8)
 		if err != nil {
 			return fail(err)
 		}
 		status := protocol.Status(pre[0])
 		count := binary.LittleEndian.Uint32(pre[4:])
 		if status != protocol.StatusOK && status != protocol.StatusOKExists {
-			// Preamble-only error response; the frame is fully consumed.
-			return fail(&StatusError{Op: protocol.OpBatchGet, Status: status})
+			// Defensive: a non-OK status must be preamble-only (§3); a larger
+			// body is a protocol violation with unread bytes on the wire, so
+			// return a non-StatusError to make release() evict the connection.
+			return fail(fmt.Errorf("client: non-OK GET status %s with %d-byte body (protocol violation)", status, h.PayloadLen))
 		}
-		idx, err := cn.readN(8) // first_index u32 | total_keys u32
-		if err != nil {
-			return fail(err)
-		}
-		firstIndex := binary.LittleEndian.Uint32(idx[0:])
-		totalKeys := binary.LittleEndian.Uint32(idx[4:])
+		firstIndex := binary.LittleEndian.Uint32(pre[8:])
+		totalKeys := binary.LittleEndian.Uint32(pre[12:])
 		if int(totalKeys) != len(keys) || int(firstIndex)+int(count) > len(keys) {
 			return fail(fmt.Errorf("client: GET frame [%d,+%d) inconsistent with %d requested keys", firstIndex, count, len(keys)))
 		}

@@ -154,6 +154,7 @@ type conn struct {
 	feats  uint64
 	nextID uint64
 	hdr    [protocol.HeaderSize]byte // reusable header scratch
+	rbuf   []byte                    // reusable readN scratch (single-caller conn)
 }
 
 func dialConn(ctx context.Context, addr string, o Options) (*conn, error) {
@@ -279,9 +280,14 @@ func (cn *conn) readFrame() ([]byte, error) {
 	return body, nil
 }
 
-// readN reads exactly n bytes into a fresh buffer.
+// readN reads exactly n bytes into the conn's reusable scratch. The returned
+// slice is valid until the next readN on this conn — callers copy out what
+// outlives the call (a conn has exactly one caller at a time).
 func (cn *conn) readN(n int) ([]byte, error) {
-	b := make([]byte, n)
+	if cap(cn.rbuf) < n {
+		cn.rbuf = make([]byte, n)
+	}
+	b := cn.rbuf[:n]
 	_, err := io.ReadFull(cn.nc, b)
 	return b, err
 }
