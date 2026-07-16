@@ -309,12 +309,15 @@ pipelining depth-16 gains only ~1.4× here vs ~5× on macOS, because per-RTT
 latency is lower to begin with — the pipelining lever's payoff scales with the
 RTT it hides, so the AWS pair (real RTT) is where it will matter most.
 
-**Negative result — inline vs sidecar verification (don't regress this).** A
-prototype hashing each block inline right after its read (hoping to hit it
-cache-hot and skip a second DRAM pass) measured 6.9 GB/s vs the sidecar's
-9.75 — serializing the hash into the read loop stalls the socket more than the
-second DRAM read costs. xxh3 alone is 19.2 GB/s single-core, so verification is
-never CPU-bound; the sidecar's read/hash overlap is the right design. Reverted.
+**Inline vs sidecar verification (sidecar kept, margin is small).** Measured
+head-to-head INTERLEAVED (same daemon, same thermal state, 5 pairs): sidecar
+~8.4 vs inline ~8.2 GB/s — sidecar wins 3/5 and is marginally ahead, but they
+are near-equal, well within run-to-run noise. (An earlier note here claimed
+6.9 vs 9.75; that was a thermal confound — the two variants were measured at
+different times/thermal states, not interleaved. Corrected.) xxh3 is 19.2 GB/s
+single-core so verification is never CPU-bound either way; the sidecar's
+read/hash overlap is kept as the marginally-better and clearer design, not a
+decisive win. Both are memory-bandwidth bound (the second pass over the block).
 
 **Standing Week-3+ items:** re-run gate + `rawget` baseline on the bare-metal
 Linux rig (the quotable environment; Mac loopback is a sanity check per

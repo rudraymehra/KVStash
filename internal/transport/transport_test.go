@@ -257,6 +257,15 @@ func TestFatalBadCRCReportsAndCloses(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The §9 fatal report is best-effort and normally arrives in microseconds,
+	// but its delivery depends on the writer goroutine being scheduled — under a
+	// heavily oversubscribed CI runner (-race + kvbdebug) that scheduling can
+	// slip past the 10 s connection deadline dial() sets, a false timeout that
+	// has nothing to do with correctness. Give this read a generous window so a
+	// scheduling delay does not flake; a genuine missing/malformed report still
+	// fails (just after 20 s instead of 10). Observed 0/50 locally; the flake is
+	// CI-capacity only.
+	_ = nc.SetReadDeadline(time.Now().Add(20 * time.Second))
 	rh, body := readFrame(t, nc)
 	if rh.Flags&protocol.FlagFatal == 0 || rh.Opcode != protocol.OpNop || rh.RequestID != 0 {
 		t.Fatalf("fatal report header: %+v", rh)
