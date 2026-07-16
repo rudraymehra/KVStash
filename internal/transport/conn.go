@@ -403,8 +403,7 @@ func (c *Conn) flushBy(hdrArena []byte, reqs []writeReq, iovs *net.Buffers, dead
 	// (up to 1024-entry) vector on the hot path. net.Buffers.WriteTo also does
 	// short-write resumption internally; a deadline error means the peer made
 	// less than one flush of progress in the window (§8 rule 5, a failure).
-	toWrite := buf
-	_, err := (&toWrite).WriteTo(c.nc)
+	err := c.writeVector(buf)
 
 	for i := range reqs {
 		if reqs[i].release != nil {
@@ -412,6 +411,35 @@ func (c *Conn) flushBy(hdrArena []byte, reqs []writeReq, iovs *net.Buffers, dead
 		}
 	}
 	return err == nil
+}
+
+// writeVector writes the assembled iovec vector. With WriteChunkBytes set, the
+// vector is sliced into consecutive syscall windows: a window accumulates whole
+// iovecs until it reaches the chunk target, so a 64 B header always travels
+// with the payload it precedes (never a lone tiny write). Frame boundaries and
+// wire order are untouched — this only bounds how many bytes one writev copies
+// into the kernel at a time, which is what keeps the loopback producer/consumer
+// copy pipeline overlapped (A1: 14.1 GB/s at ~1 MiB windows vs 6.9 at 16 MiB).
+func (c *Conn) writeVector(buf net.Buffers) error {
+	chunk := c.cfg.WriteChunkBytes
+	if chunk <= 0 {
+		toWrite := buf
+		_, err := (&toWrite).WriteTo(c.nc)
+		return err
+	}
+	for start := 0; start < len(buf); {
+		end, n := start, 0
+		for end < len(buf) && n < chunk {
+			n += len(buf[end])
+			end++
+		}
+		w := buf[start:end]
+		if _, err := (&w).WriteTo(c.nc); err != nil {
+			return err
+		}
+		start = end
+	}
+	return nil
 }
 
 // finalDrain fires the release of everything still queued once both loops have

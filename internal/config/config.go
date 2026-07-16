@@ -55,6 +55,11 @@ type Config struct {
 	// silently clamps on untuned hosts (the transport logs the effective size).
 	SockSndBuf int `yaml:"sock_sndbuf"`
 	SockRcvBuf int `yaml:"sock_rcvbuf"`
+
+	// WriteChunkBytes caps how many payload bytes one writev syscall covers
+	// within a coalesced flush (0 = unchunked). ~1 MiB keeps the kernel
+	// copy pipeline overlapped with the receiver; see transport.Config.
+	WriteChunkBytes int `yaml:"write_chunk_bytes"`
 }
 
 // Overrides are the command-line flags an operator actually needs at launch;
@@ -83,6 +88,7 @@ func Default() Config {
 		LeaseMaxMS:      protocol.MaxLeaseMS,
 		SockSndBuf:      16 << 20,
 		SockRcvBuf:      16 << 20,
+		WriteChunkBytes: 1 << 20,
 	}
 }
 
@@ -197,6 +203,7 @@ func (c Config) Validate() error {
 		"lease_max_ms %d: exceeds the protocol clamp %d", c.LeaseMaxMS, protocol.MaxLeaseMS)
 	check(c.SockSndBuf >= 0, "sock_sndbuf %d: must be >= 0 (0 = OS default)", c.SockSndBuf)
 	check(c.SockRcvBuf >= 0, "sock_rcvbuf %d: must be >= 0 (0 = OS default)", c.SockRcvBuf)
+	check(c.WriteChunkBytes >= 0, "write_chunk_bytes %d: must be >= 0 (0 = unchunked)", c.WriteChunkBytes)
 
 	return errors.Join(errs...)
 }

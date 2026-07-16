@@ -38,6 +38,16 @@ type Config struct {
 	// backlogged (16 MiB — the coalescing knee; never delays a lone frame).
 	CoalesceBytes int
 
+	// WriteChunkBytes caps how many payload bytes a single writev SYSCALL
+	// covers within a flush (0 = unchunked). Coalescing still batches frames
+	// per flush; this only slices the flush's iovec vector into ≥1 MiB-class
+	// syscall windows. Rationale: the A1 loopback sweep measured 14.1 GB/s at
+	// 1 MiB-per-writev vs 6.9 GB/s at 16 MiB-per-writev on the same stream —
+	// giant single copies stall the kernel pipe; ~1 MiB windows keep the
+	// producer/consumer copy pipeline overlapped, and are still far past the
+	// syscall-amortization knee on a real NIC (docs/notes/a1-log.md).
+	WriteChunkBytes int
+
 	// WriteStallTimeout is the per-flush write deadline: 2×stream_timeout
 	// (§8 rule 5's zero-drain closure). Use StallTimeout(). A zero or too-small
 	// value would let a dead peer wedge the reader/writer cycle, so startConn
@@ -77,6 +87,7 @@ func DefaultConfig(addr string, streamTimeoutMS uint32) Config {
 		NoDelay:           true,
 		PreNegCap:         preNeg,
 		CoalesceBytes:     16 << 20,
+		WriteChunkBytes:   1 << 20,
 		WriteStallTimeout: StallTimeout(streamTimeoutMS),
 		BodyReadTimeout:   time.Duration(streamTimeoutMS) * time.Millisecond,
 		IdleReadTimeout:   5 * time.Minute,

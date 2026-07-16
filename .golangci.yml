@@ -13,6 +13,10 @@ linters:
     - wastedassign
     - gocritic
   settings:
+    exhaustive:
+      # A default case handles the remaining enum values deliberately (e.g.
+      # unknown opcodes → ERR_UNSUPPORTED); treat it as exhaustive.
+      default-signifies-exhaustive: true
     gocritic:
       enable-all: false
       enabled-checks:
