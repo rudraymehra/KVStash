@@ -1,0 +1,28 @@
+# kvblockd example configuration.
+# Every value shown here is the built-in default: an empty file (or no
+# --config at all) yields exactly this configuration. Byte sizes are plain
+# integers; the arithmetic lives in the comments.
+
+listen_addr: ":9440"          # data plane (KVB1 frames)
+admin_addr: "127.0.0.1:9441"  # accepted, not yet served by this build
+metrics_addr: "127.0.0.1:9442" # accepted, not yet served by this build
+
+max_conns: 1024               # global accept cap (cheap DoS floor)
+
+# PROTOCOL.md §4 ceilings this server offers at HELLO. Validation enforces the
+# spec floors (128 keys / 16 MiB frame / 4 MiB blob / 16 MiB credit).
+max_batch_keys: 512
+max_frame_len: 268435456      # 256 MiB
+max_blob_len: 33554432        # 32 MiB
+initial_credit: 134217728     # 128 MiB
+
+stream_timeout_ms: 30000      # PUT_STREAM inactivity reaper; floor 5000 (§5)
+lease_default_ms: 5000        # read lease auto-granted by BATCH_GET
+lease_max_ms: 60000           # LEASE grants clamp here
+
+namespaces_path: ""           # namespaces/tokens YAML (required once auth lands)
+
+# Per-connection socket buffer requests. 16 MiB saturated 50 GbE on the
+# benchmark rig; untuned hosts silently clamp (the daemon logs effective sizes).
+sock_sndbuf: 16777216         # 16 MiB
+sock_rcvbuf: 16777216         # 16 MiB
