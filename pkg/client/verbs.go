@@ -302,6 +302,8 @@ func (c *Client) Delete(ctx context.Context, keys [][32]byte, force bool) (perKe
 	if err != nil {
 		return nil, err
 	}
+	// DELETE's batch status is OK only (§3.7/§9); OK_EXISTS is a PUT/EXISTS
+	// status, so accepting it here would mask a nonconforming server.
 	if p.Status != protocol.StatusOK {
 		return nil, &StatusError{Op: protocol.OpDelete, Status: p.Status}
 	}

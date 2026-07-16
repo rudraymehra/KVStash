@@ -291,12 +291,27 @@ func (cn *conn) readFrame() ([]byte, error) {
 	return cn.readN(int(h.PayloadLen))
 }
 
-// readN reads exactly n bytes into the conn's reusable scratch. The returned
-// slice is valid until the next readN on this conn — callers copy out what
-// outlives the call (a conn has exactly one caller at a time).
+// maxReadReuse bounds the scratch readN retains across calls. Metadata
+// responses (preamble, descriptors, EXISTS bitmap, HELLO, Stats) are all well
+// under this; GET block payloads bypass readN entirely (read straight into the
+// caller's into[slot]). A larger response — e.g. a malicious server inflating a
+// metadata frame's payload_len up to the negotiated cap — is read into a
+// transient buffer that GC reclaims, so it can never pin the scratch at up to
+// max_frame_len for the pooled connection's whole life.
+const maxReadReuse = 1 << 20
+
+// readN reads exactly n bytes. For n <= maxReadReuse it uses the conn's
+// reusable scratch (valid only until the next readN — callers copy out what
+// outlives the call); larger reads use a transient buffer. A conn has exactly
+// one caller at a time, so the scratch needs no locking.
 func (cn *conn) readN(n int) ([]byte, error) {
+	if n > maxReadReuse {
+		b := make([]byte, n)
+		_, err := io.ReadFull(cn.nc, b)
+		return b, err
+	}
 	if cap(cn.rbuf) < n {
-		cn.rbuf = make([]byte, n)
+		cn.rbuf = make([]byte, maxReadReuse)
 	}
 	b := cn.rbuf[:n]
 	_, err := io.ReadFull(cn.nc, b)

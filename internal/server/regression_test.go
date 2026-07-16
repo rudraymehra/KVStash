@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -400,5 +401,89 @@ func TestMixedConcurrentWorkload(t *testing.T) {
 		if st[j] != protocol.StatusOK || !bytes.Equal(into[j], bytes.Repeat([]byte{byte(j)}, 4096)) {
 			t.Fatalf("seeded block %d damaged by concurrent load", j)
 		}
+	}
+}
+
+// TestPutInterleavedStreamsDigest pins per-stream digest isolation: two PUT
+// streams on one connection, their CHUNKs interleaved, must each verify
+// against their OWN running xxh3 — a shared or crossed digest would fail one
+// or both COMMITs. Guards the incremental-digest change.
+func TestPutInterleavedStreamsDigest(t *testing.T) {
+	addr, cleanup := startServer(t)
+	defer cleanup()
+	nc := rawConn(t, addr)
+	defer nc.Close()
+	helloRaw(t, nc)
+
+	kA, kB := key(0x91), key(0x92)
+	aParts := [][]byte{bytes.Repeat([]byte{0x11}, 512), bytes.Repeat([]byte{0x22}, 512)}
+	bParts := [][]byte{bytes.Repeat([]byte{0x33}, 512), bytes.Repeat([]byte{0x44}, 512)}
+	aWhole := append(append([]byte{}, aParts[0]...), aParts[1]...)
+	bWhole := append(append([]byte{}, bParts[0]...), bParts[1]...)
+
+	beginA := protocol.AppendPutBegin(nil, protocol.PutBeginBody{TotalLen: uint32(len(aWhole))}) //nolint:gosec // G115: test
+	beginB := protocol.AppendPutBegin(nil, protocol.PutBeginBody{TotalLen: uint32(len(bWhole))}) //nolint:gosec // G115: test
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutBegin), kA, 91, beginA)
+	if st := readStatus(t, nc); st != protocol.StatusOK {
+		t.Fatalf("begin A: %s", st)
+	}
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutBegin), kB, 92, beginB)
+	if st := readStatus(t, nc); st != protocol.StatusOK {
+		t.Fatalf("begin B: %s", st)
+	}
+	// Interleave the chunks: A0, B0, A1, B1.
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutChunk), kA, 91, aParts[0])
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutChunk), kB, 92, bParts[0])
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutChunk), kA, 91, aParts[1])
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutChunk), kB, 92, bParts[1])
+	// Commit each against its OWN whole-block digest.
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutCommit), kA, 91, protocol.AppendPutCommit(nil, xxh3Hash(aWhole)))
+	if st := readStatus(t, nc); st != protocol.StatusOK {
+		t.Fatalf("commit A (interleaved digest): got %s, want OK", st)
+	}
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutCommit), kB, 92, protocol.AppendPutCommit(nil, xxh3Hash(bWhole)))
+	if st := readStatus(t, nc); st != protocol.StatusOK {
+		t.Fatalf("commit B (interleaved digest): got %s, want OK", st)
+	}
+}
+
+// TestClientScratchAliasingSurvivesLargeGet pins the copy-out contract: after
+// Stats and BatchExists (whose results are copied out of the conn's reusable
+// read scratch), a large BatchGet on the SAME pooled connection must not
+// corrupt those earlier results. Removing any copy-out would fail this.
+func TestClientScratchAliasingSurvivesLargeGet(t *testing.T) {
+	addr, cleanup := startServer(t)
+	defer cleanup()
+	c := dialClient(t, addr, 1) // ONE conn → every call reuses the same scratch
+	defer c.Close()
+	ctx := context.Background()
+
+	k := key(0x01)
+	if err := c.Put(ctx, k, bytes.Repeat([]byte{0x7E}, 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := c.Stats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	docCopy := append([]byte{}, doc...)
+	nConsec, _, err := c.BatchExists(ctx, [][32]byte{k})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A ≥1 MiB GET on the same conn churns the read scratch heavily.
+	into := make([][]byte, 1)
+	if _, err := c.BatchGet(ctx, [][32]byte{k}, into); err != nil {
+		t.Fatal(err)
+	}
+	// Earlier results must be intact (they were copied out, not aliased).
+	if !bytes.Equal(doc, docCopy) {
+		t.Fatal("Stats doc corrupted by a later GET on the same conn (missing copy-out)")
+	}
+	if nConsec != 1 {
+		t.Fatalf("EXISTS result corrupted: n_consecutive=%d", nConsec)
+	}
+	if !strings.Contains(string(doc), `"store"`) {
+		t.Fatalf("Stats doc not valid after churn: %s", doc)
 	}
 }

@@ -82,8 +82,11 @@ func BenchmarkPut_1MB(b *testing.B) {
 }
 
 // BenchmarkExists_32Keys is the metadata round-trip benchmark: the scheduler's
-// load-vs-recompute probe (§3.2) is latency-bound, not bandwidth-bound —
-// ns/op here IS the probe RTT.
+// load-vs-recompute probe (§3.2) is latency-bound, not bandwidth-bound. For the
+// streams=1 cell ns/op IS the probe RTT (all RunParallel workers serialize on
+// one pooled connection). The streams=4 cell is amortized per-op time under
+// 4-way concurrency, not a single RTT — see BenchmarkExistsPipelined for the
+// depth-vs-throughput view.
 func BenchmarkExists_32Keys(b *testing.B) {
 	for _, streams := range []int{1, 4} {
 		b.Run(fmt.Sprintf("streams=%d", streams), func(b *testing.B) {
