@@ -5,4 +5,4 @@ Format: Keep a Changelog (https://keepachangelog.com), SemVer after v0.1.0.
 
 ## [Unreleased]
 ### Added
-- Repository scaffold: module, license, CI, directory structure (Week 1).
+- Repository scaffold: module, license, CI, directory structure.

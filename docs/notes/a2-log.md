@@ -1,7 +1,7 @@
 # A2 soak log — off-heap arena / GC-pause proof
 
 **Kill-gate A2:** GC p99 pause < 5 ms with off-heap arenas under load. <br>
-**Status:** Mac mechanism-proof done (Day 3). The 24 h *verdict of record* is Day 4 on the standing Linux box (with huge pages + GOGC/GOMEMLIMIT tuning). These Mac numbers prove the mechanism, not the gate.
+**Status:** Mac mechanism-proof done. The 24 h *verdict of record* runs on the standing Linux box (with huge pages + GOGC/GOMEMLIMIT tuning). These Mac numbers prove the mechanism, not the gate.
 
 ## Mechanism (why this works)
 KV blobs live in a `unix.Mmap` anonymous region obtained straight from the kernel, bypassing the Go allocator — so they never appear in `HeapAlloc` and the GC never scans them. Only a tiny index (`[]blobRef`) is heap-resident. The serving path writes `header + arena-subslice` via `net.Buffers` (writev), so blob bytes are never copied onto the Go heap even when served.
@@ -27,7 +27,7 @@ gc_pause_p999_ms         5.24288   → tail outlier at the 5 ms line; note hones
 - Metric used: `/sched/pauses/total/gc:seconds` (current; `/gc/pauses:seconds` is deprecated). Percentiles are the conservative upper bucket bound (never under-report).
 
 ## Next
-- Day 4: launch the 24 h soak on the standing Linux box (Hetzner/c7g) with `vm.nr_hugepages` set (expect `hugepages:true`), larger arena, GOGC/GOMEMLIMIT sweep → the A2 verdict of record in `docs/DESIGN.md`.
+- Next: launch the 24 h soak on a standing Linux box (Hetzner/c7g) with `vm.nr_hugepages` set (expect `hugepages:true`), larger arena, GOGC/GOMEMLIMIT sweep → the A2 verdict of record in `docs/DESIGN.md`.
 
 ## Review-ladder outcome (2026-07-15, 7-agent full ladder + CTO gate)
 
