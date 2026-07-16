@@ -396,21 +396,26 @@ func TestPutBodiesRoundTrip(t *testing.T) {
 func TestNegotiateLimits(t *testing.T) {
 	server := DefaultLimits()
 	cases := []struct {
-		batch, frame uint32
-		wantBatch    uint32
-		wantFrame    uint32
+		batch, frame                   uint32
+		wantBatch, wantFrame, wantBlob uint32
 	}{
-		{0, 0, DefaultMaxBatchKeys, DefaultMaxFrameLen},          // no opinion
-		{128, 16 << 20, 128, 16 << 20},                           // client lower wins
-		{1024, 1 << 30, DefaultMaxBatchKeys, DefaultMaxFrameLen}, // client higher loses
+		{0, 0, DefaultMaxBatchKeys, DefaultMaxFrameLen, DefaultMaxBlobLen},          // no opinion
+		{128, 16 << 20, 128, 16 << 20, 16 << 20},                                    // lower frame → blob clamped under it
+		{1024, 1 << 30, DefaultMaxBatchKeys, DefaultMaxFrameLen, DefaultMaxBlobLen}, // client higher loses; blob unchanged
 	}
 	for i, c := range cases {
 		got := NegotiateLimits(server, c.batch, c.frame)
 		if got.MaxBatchKeys != c.wantBatch || got.MaxFrameLen != c.wantFrame {
 			t.Fatalf("case %d: %+v", i, got)
 		}
-		if got.MaxBlobLen != server.MaxBlobLen || got.InitialCredit != server.InitialCredit {
-			t.Fatalf("case %d: server-dictated fields changed: %+v", i, got)
+		if got.MaxBlobLen != c.wantBlob {
+			t.Fatalf("case %d: MaxBlobLen = %d, want %d (blob must stay <= frame)", i, got.MaxBlobLen, c.wantBlob)
+		}
+		if got.MaxBlobLen > got.MaxFrameLen {
+			t.Fatalf("case %d: blob %d exceeds frame %d — unservable blocks", i, got.MaxBlobLen, got.MaxFrameLen)
+		}
+		if got.InitialCredit != server.InitialCredit {
+			t.Fatalf("case %d: credit (server-dictated) changed: %+v", i, got)
 		}
 	}
 }

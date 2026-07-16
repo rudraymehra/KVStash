@@ -58,8 +58,9 @@ func ErrorStatus(err error) Status {
 // included in payload_len, ignored on receive; already-aligned → no pad).
 func padTo8(n int) int { return (n + 7) &^ 7 }
 
-// appendPad8 zero-pads dst so that its length grows from unpadded to
-// padTo8(unpadded). append of zeros — the §0 pad byte value.
+// appendPad8 zero-pads dst so the BODY REGION (unpadded bytes, not dst's total
+// length — dst may carry a prefix) reaches the next 8-byte multiple. Pads with
+// zeros, the §0 pad byte value.
 func appendPad8(dst []byte, unpadded int) []byte {
 	for i := unpadded; i < padTo8(unpadded); i++ {
 		dst = append(dst, 0)
@@ -154,7 +155,10 @@ func AppendKeyList(dst []byte, aux uint32, keys [][32]byte) []byte {
 
 // AppendExistsResp appends the EXISTS response payload. perKey == nil means
 // FEAT_EXISTS_BITMAP was not negotiated: no status region, no pad. Otherwise
-// the per-key bytes are zero-padded to the next 8-byte multiple.
+// the per-key bytes are zero-padded to the next 8-byte multiple; the caller
+// MUST pass nKeys == len(perKey) in that case (the preamble count and the
+// bitmap length are the same n_keys — a mismatch would let the decoder read a
+// pad byte as a status).
 func AppendExistsResp(dst []byte, nKeys, nConsecutive uint32, perKey []Status) []byte {
 	dst = AppendPreamble(dst, StatusOK, nKeys)
 	dst = binary.LittleEndian.AppendUint32(dst, nConsecutive)
@@ -188,7 +192,8 @@ func DecodeExistsResp(body []byte, expectBitmap bool) (ExistsResp, error) {
 		return ExistsResp{}, err
 	}
 	if p.Status != StatusOK && p.Status != StatusOKExists {
-		if len(body) != PreambleSize {
+		// §3: a non-OK response is EXACTLY the preamble with count=0.
+		if len(body) != PreambleSize || p.Count != 0 {
 			return ExistsResp{}, ErrBodyLength
 		}
 		return ExistsResp{Preamble: p}, nil
@@ -231,7 +236,7 @@ func DecodeKeyStatusResp(body []byte) (Preamble, []byte, error) {
 		return Preamble{}, nil, err
 	}
 	if p.Status != StatusOK && p.Status != StatusOKExists {
-		if len(body) != PreambleSize {
+		if len(body) != PreambleSize || p.Count != 0 {
 			return Preamble{}, nil, ErrBodyLength
 		}
 		return p, nil, nil
@@ -318,7 +323,7 @@ func DecodeGetRespHeader(body []byte) (GetRespHeader, error) {
 		return GetRespHeader{}, err
 	}
 	if p.Status != StatusOK && p.Status != StatusOKExists {
-		if len(body) != PreambleSize {
+		if len(body) != PreambleSize || p.Count != 0 {
 			return GetRespHeader{}, ErrBodyLength
 		}
 		return GetRespHeader{Preamble: p}, nil
@@ -385,7 +390,9 @@ func IntersectFeatures(client, server uint64) uint64 {
 // carries only the client's max_batch_keys and max_frame_len proposals
 // (blob/credit are server-dictated); a client value of 0 means "no opinion".
 // Callers guarantee the server side already satisfies the §4 floors
-// (config.Validate's job), so the result is always legal.
+// (config.Validate's job). MaxBlobLen is clamped under the negotiated frame:
+// otherwise a client proposing a small frame could store a blob (chunked PUT,
+// each chunk ≤ frame) that no single GET response frame could ever return.
 func NegotiateLimits(server Limits, clientBatchKeys, clientFrameLen uint32) Limits {
 	l := server
 	if clientBatchKeys != 0 && clientBatchKeys < l.MaxBatchKeys {
@@ -393,6 +400,9 @@ func NegotiateLimits(server Limits, clientBatchKeys, clientFrameLen uint32) Limi
 	}
 	if clientFrameLen != 0 && clientFrameLen < l.MaxFrameLen {
 		l.MaxFrameLen = clientFrameLen
+	}
+	if l.MaxBlobLen > l.MaxFrameLen {
+		l.MaxBlobLen = l.MaxFrameLen
 	}
 	return l
 }
@@ -506,16 +516,16 @@ func AppendHelloResp(dst []byte, r HelloResp) []byte {
 }
 
 // DecodeHelloResp decodes the response body (client side; copies the name).
-// A non-OK preamble returns (zero HelloResp, the preamble's status mapped by
-// the caller) — signalled here by ErrBadBody-classified errors only for
-// structural problems; the caller inspects the returned status.
+// On a non-OK status it returns the preamble (for the caller to inspect
+// Status) with a zero HelloResp and nil error; ErrBadBody is returned only for
+// a structurally malformed body (wrong length, or a non-OK count != 0).
 func DecodeHelloResp(body []byte) (Preamble, HelloResp, error) {
 	p, err := DecodePreamble(body)
 	if err != nil {
 		return Preamble{}, HelloResp{}, err
 	}
 	if p.Status != StatusOK {
-		if len(body) != PreambleSize {
+		if len(body) != PreambleSize || p.Count != 0 {
 			return Preamble{}, HelloResp{}, ErrBodyLength
 		}
 		return p, HelloResp{}, nil
