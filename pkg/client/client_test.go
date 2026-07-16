@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,6 +120,40 @@ func TestGetNonOKReturnsPromptly(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("BatchGet hung on a non-OK response (read-ahead deadlock)")
+	}
+}
+
+// TestVerifyCatchesCorruption: a GET whose payload does not match its
+// descriptor xxh3 fails with a corruption error by default, and is passed
+// through when Options.SkipVerify is set (the caller owns re-verification).
+func TestVerifyCatchesCorruption(t *testing.T) {
+	respond := func(c net.Conn, h protocol.Header, _ []byte) bool {
+		payload := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+		descs := []protocol.Desc{{Status: protocol.StatusOK, Len: 8, XXH3: 0xBAD}} // wrong sum
+		body := protocol.AppendGetRespHeader(nil, protocol.StatusOK, 0, 1, descs)
+		body = append(body, payload...)
+		replyFrame(c, h, body)
+		return true
+	}
+
+	for _, skip := range []bool{false, true} {
+		fs := newFakeServer(t, respond)
+		c, err := Dial(context.Background(), fs.addr(), Options{Streams: 1, Namespace: "t", SkipVerify: skip})
+		if err != nil {
+			fs.close()
+			t.Fatal(err)
+		}
+		keys := [][32]byte{{9}}
+		into := make([][]byte, 1)
+		_, err = c.BatchGet(context.Background(), keys, into)
+		if skip && err != nil {
+			t.Fatalf("SkipVerify: unexpected error %v", err)
+		}
+		if !skip && (err == nil || !strings.Contains(err.Error(), "checksum")) {
+			t.Fatalf("verify on: want checksum mismatch, got %v", err)
+		}
+		c.Close()
+		fs.close()
 	}
 }
 

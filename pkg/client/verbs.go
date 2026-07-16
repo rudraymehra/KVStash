@@ -72,7 +72,7 @@ func (c *Client) BatchGet(ctx context.Context, keys [][32]byte, into [][]byte) (
 	if err = cn.writeFrame(protocol.OpBatchGet, 0, [32]byte{}, cn.id(), body); err != nil {
 		return nil, err
 	}
-	statuses, err = cn.readGetInto(keys, into)
+	statuses, err = cn.readGetInto(keys, into, !c.opts.SkipVerify)
 	return statuses, err
 }
 
@@ -86,7 +86,7 @@ func (c *Client) BatchGet(ctx context.Context, keys [][32]byte, into [][]byte) (
 // A non-StatusError return means the connection is desynchronized (bytes left
 // on the wire) and the caller MUST evict it; a *StatusError leaves the stream
 // in sync.
-func (cn *conn) readGetInto(keys [][32]byte, into [][]byte) ([]protocol.Status, error) {
+func (cn *conn) readGetInto(keys [][32]byte, into [][]byte, verify bool) ([]protocol.Status, error) {
 	statuses := make([]protocol.Status, len(keys))
 	got := 0
 	// Checksum verification runs on a sidecar goroutine so hashing block i
@@ -94,18 +94,27 @@ func (cn *conn) readGetInto(keys [][32]byte, into [][]byte) ([]protocol.Status, 
 	// halves effective GET throughput (the socket sits idle during every hash).
 	// The sidecar only reads into[slot] contents the reader has finished with
 	// and never touches conn state; verifyWait joins it before return.
-	verifyCh := make(chan verifyJob, 32)
+	var verifyCh chan verifyJob
 	verifyErr := make(chan error, 1)
-	go func() {
-		var err error
-		for j := range verifyCh {
-			if err == nil && xxh3.Hash(into[j.slot]) != j.sum {
-				err = fmt.Errorf("client: key %d checksum mismatch (corruption)", j.slot)
+	if verify {
+		verifyCh = make(chan verifyJob, 32)
+		go func() {
+			var err error
+			for j := range verifyCh {
+				if err == nil && xxh3.Hash(into[j.slot]) != j.sum {
+					err = fmt.Errorf("client: key %d checksum mismatch (corruption)", j.slot)
+				}
 			}
+			verifyErr <- err
+		}()
+	}
+	verifyWait := func() error {
+		if verifyCh == nil {
+			return nil
 		}
-		verifyErr <- err
-	}()
-	verifyWait := func() error { close(verifyCh); return <-verifyErr }
+		close(verifyCh)
+		return <-verifyErr
+	}
 	// fail joins the verifier (goroutine hygiene) before returning the read-path
 	// error. A checksum mismatch outranks it: a *StatusError would re-pool the
 	// connection as clean, and corruption must evict instead.
@@ -164,7 +173,9 @@ func (cn *conn) readGetInto(keys [][32]byte, into [][]byte) ([]protocol.Status, 
 			if _, err := io.ReadFull(cn.nc, into[slot]); err != nil {
 				return fail(err)
 			}
-			verifyCh <- verifyJob{slot: slot, sum: d.XXH3}
+			if verifyCh != nil {
+				verifyCh <- verifyJob{slot: slot, sum: d.XXH3}
+			}
 		}
 		got += int(count)
 		if h.Flags&protocol.FlagMore == 0 {

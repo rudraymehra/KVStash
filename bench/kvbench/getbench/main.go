@@ -27,12 +27,13 @@ func main() {
 	nBlocks := flag.Int("blocks", 32, "blocks per BATCH_GET")
 	blockKiB := flag.Int("block-kib", 1024, "block size KiB")
 	sockbuf := flag.Int("sockbuf", 0, "client socket buffer bytes (0=OS default)")
+	noverify := flag.Bool("noverify", false, "skip client-side xxh3 verification (isolates verification cost)")
 	flag.Parse()
 
 	ctx := context.Background()
 	c, err := client.Dial(ctx, *addr, client.Options{
 		Streams: *streams, Namespace: *ns, Token: *token,
-		SockSndBuf: *sockbuf, SockRcvBuf: *sockbuf,
+		SockSndBuf: *sockbuf, SockRcvBuf: *sockbuf, SkipVerify: *noverify,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -50,7 +51,8 @@ func main() {
 		}
 		if err := c.Put(ctx, keys[i], blob); err != nil {
 			fmt.Fprintf(os.Stderr, "put %d: %v\n", i, err)
-			os.Exit(1)
+			c.Close()
+			os.Exit(1) //nolint:gocritic // pool closed above; nothing else to release
 		}
 	}
 

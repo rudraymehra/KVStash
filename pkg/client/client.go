@@ -33,6 +33,12 @@ type Options struct {
 	// wire speed. The kernel may clamp the request (Linux: net.core.rmem_max).
 	SockSndBuf int
 	SockRcvBuf int
+
+	// SkipVerify disables the client-side xxh3 check of every GET payload
+	// against its descriptor checksum. Default false: verify. Only set this
+	// when the consumer re-verifies downstream anyway — TCP's checksum alone
+	// does not protect against server-side corruption.
+	SkipVerify bool
 }
 
 // Client is a pool of authenticated connections to one kvblockd endpoint.

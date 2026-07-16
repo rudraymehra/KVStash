@@ -228,11 +228,34 @@ loopback prefers OS defaults, real links want 16 MiB. The benchmark now sweeps
 streams×{cold,hot} because loopback throughput *falls* with stream count
 (a1-log finding 2) — single-number quotes hide the shape.
 
-**Standing Week-3 items:** re-run gate + `rawget` baseline on the Linux rig
-(the quotable environment; Mac loopback is a sanity check per a1-log);
-pipelining (FEAT_OOO client) to hide request turnaround; response-path alloc
-trim. The DRAM-tier week re-tests this exact benchmark against the same-shape
-ceiling; the goalpost does not move.
+**Final decomposition (out-of-process daemon + `bench/kvbench/getbench`, the
+production shape — same session, interleaved with the raw ceiling):**
+
+| config | GB/s | % of raw ceiling |
+|---|---:|---:|
+| kvblockd, verification off | **11.27** | **102%** |
+| kvblockd, full xxh3 verification (default) | 9.75 | 88% |
+| raw socket, no protocol/auth/checksum (`rawget`) | 11.04 | 100% |
+
+The protocol stack (framing, auth, credit, descriptors, dispatch) is now
+*faster than a plain raw-socket implementation* of the same workload; the
+entire remaining delta is integrity verification — real work with a real
+dial (`client.Options.SkipVerify`, default off, for consumers that re-verify
+downstream). Cross-kernel check: inside a Linux 6.10 VM (Docker) the same
+ratio holds — kvblockd 7.68 vs raw 8.36 cold 4-stream = 92% (absolute numbers
+carry VM overhead; the ratio is the claim).
+
+**Pipelining (measured, recorded for the network rig):** an in-order
+depth×streams matrix (`BenchmarkBatchGetPipelined`, bench-only raw client —
+per-connection response ordering needs no FEAT_OOO) is FLAT on loopback: the
+request-turnaround bubble is microseconds there. The lever's payoff is
+real-RTT networks; re-measure on the AWS pair.
+
+**Standing Week-3 items:** re-run gate + `rawget` baseline on the bare-metal
+Linux rig (the quotable environment; Mac loopback is a sanity check per
+a1-log); pipelined/OOO client demux for the network path. The DRAM-tier week
+re-tests this exact benchmark against the same-shape ceiling; the goalpost
+does not move.
 
 **Fuzz:** `FuzzParseHeader` + `FuzzParseBatch` clean (tens of millions of execs);
 formal 1h-per-target gate is the Day-7 item. **PUT_STREAM invariants**
