@@ -319,6 +319,29 @@ single-core so verification is never CPU-bound either way; the sidecar's
 read/hash overlap is kept as the marginally-better and clearer design, not a
 decisive win. Both are memory-bandwidth bound (the second pass over the block).
 
+**Verification & allocation — evidence-backed decisions (research pass 3,
+107 adversarially-verified agents; sources: fasthttp, golang/go#26663/#72036,
+RocksDB xxh3/crc32c bench, Go 1.26 Green Tea GC notes):**
+
+- **Keep xxh3 (C-35), don't switch to hardware CRC32C.** CRC32C is not reliably
+  faster — xxh3 measured 26.8 vs CRC32C 19.3 GB/s in RocksDB — and a 32-bit CRC
+  loses collision resistance that matters for content-addressed blocks. The
+  protocol lock is also the right engineering call, not just a constraint.
+- **Per-connection scratch is GC-safe under Green Tea.** Pointer-free `[]byte`
+  scratch (`lendBuf`, `descScratch`, client `rbuf`/`wbuf`) is allocated
+  `noscan` and never scanned for contents, so keeping large per-conn buffers
+  alive does not raise GC scan time proportionally — the recycling this pass
+  introduced is GC-friendly, confirmed.
+- **Per-request allocation elimination is GC-hygiene, not a throughput lever
+  here.** The residual allocs (net.Buffers iovec escape at the writev syscall
+  boundary #26663, `[]byte`→interface boxing #72036, per-request result slices)
+  are real and poolable, but the GET path is memory-bandwidth bound — cutting
+  them won't move loopback GB/s (independently confirmed: the second
+  verification pass over the block is the memory-bandwidth cost). Deferred as
+  low-value/higher-async-risk until profiling shows allocation rate (not
+  bandwidth) as the bind — most likely under high connection counts, a
+  Week-6 tenancy concern, not now.
+
 **Standing Week-3+ items:** re-run gate + `rawget` baseline on the bare-metal
 Linux rig (the quotable environment; Mac loopback is a sanity check per
 a1-log); pipelined/OOO client demux for the network path (loopback-flat,
