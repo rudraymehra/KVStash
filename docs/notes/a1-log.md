@@ -36,7 +36,7 @@ Data integrity confirmed every cell: server received-bytes == client sent-bytes 
 ## Rig findings to address (batched with the review-ladder verdict)
 
 - **F-a1-1 (resilience):** a single client stream's write error (e.g. transient ENOBUFS) returns from `runClient` and prints NO result line — losing the data from all other working streams. A measurement rig should tolerate a stream dropping and still report aggregate over survivors, and/or treat transient ENOBUFS as retry-with-backoff rather than fatal. (Confirm/priority via the ladder.)
-- **F-a1-2 (harness):** rapid sequential runs on loopback pile up TIME_WAIT sockets → ephemeral-port pressure. The sweep script needs `ulimit -n` raised + spacing between cells (already applied in the re-run). The real Day-4 rig uses long-lived connections on fresh instances, so this is a local-harness concern only.
+- **F-a1-2 (harness):** rapid sequential runs on loopback pile up TIME_WAIT sockets → ephemeral-port pressure. The sweep script needs `ulimit -n` raised + spacing between cells (already applied in the re-run). The real cloud rig uses long-lived connections on fresh instances, so this is a local-harness concern only.
 
 ## Next
 - Next: run `bench/rigs/aws-transport/` on 2× c6in.8xlarge, measure iperf3 ceiling first, grade ≥85% of it. That is the A1 verdict of record.
@@ -52,6 +52,6 @@ Fixed:
 - **[LOW] wire byte-order locked:** magic now big-endian so the wire reads "KVB1" in a hexdump; numeric fields stay little-endian. Cheap fixes: client rejects frame-bytes > max-frame with a clear message; server logs desync drops; bounded `wg.Wait()` on server shutdown; style nits (`errors.New`, `var buf []byte`, handled encode error).
 
 Deferred (not blocking A1; scheduled):
-- **[MED] socket buffers set post-handshake** — for the Day-4 cloud %iperf3 run, either set via `ListenConfig.Control`/`Dialer.Control` (setsockopt before connect) or rely on kernel autotune and treat `-sndbuf/-rcvbuf` as loopback-only. Decide in the aws-transport rig.
+- **[MED] socket buffers set post-handshake** — for the cloud %iperf3 run, either set via `ListenConfig.Control`/`Dialer.Control` (setsockopt before connect) or rely on kernel autotune and treat `-sndbuf/-rcvbuf` as loopback-only. Decide in the aws-transport rig.
 - **[LOW] server memory amplification** (alloc up to max-frame before body) — firewall the cloud bind to the client IP; acceptable for a rig.
 - **[LOW] bytes_total includes 16B header** (wire throughput, not goodput) — negligible at ≥1 MiB frames; report goodput separately if ever needed.

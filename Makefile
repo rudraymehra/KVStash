@@ -4,9 +4,9 @@ GO      ?= go
 PKGS    := ./...
 BIN_DIR := bin
 
-# Mutation gate: 0.90 floor on the pure codec package. Measured 0.9775
-# (174/178) — the only survivors are provably equivalent mutants (a copy()
-# capped by dst length, panic sentinels that still panic later, 1>>0 == 1<<0).
+# Mutation gate: 0.90 floor on the pure codec package (header + body codecs).
+# Latest ~0.93; surviving mutants are provably equivalent (copy() capped by dst
+# length, panic sentinels that still panic later, 1>>0 == 1<<0).
 MUTATE_PKG := ./internal/protocol/
 MUTATE_MIN := 0.9
 

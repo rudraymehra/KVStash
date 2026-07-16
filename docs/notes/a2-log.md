@@ -23,7 +23,7 @@ gc_pause_p999_ms         5.24288   → tail outlier at the 5 ms line; note hones
 
 ## Reading it
 - **The claim holds:** 1 GiB of blobs, heap stays ~61 MB, p99 pause 0.66 ms — Go's GC is a non-issue for a large cache *when the cache lives off-heap*. This is the "why Go for a 100 GB cache?" answer, with our own numbers.
-- **p999 = 5.24 ms** sits right at the gate line — driven by the deliberately aggressive `churn` goroutine on a laptop under `gctrace`. The Day-4 run (bigger arena, longer window, GOGC/GOMEMLIMIT tuned, no gctrace overhead) is where p99/p999 get their real verdict.
+- **p999 = 5.24 ms** sits right at the gate line — driven by the deliberately aggressive `churn` goroutine on a laptop under `gctrace`. The cloud run (bigger arena, longer window, GOGC/GOMEMLIMIT tuned, no gctrace overhead) is where p99/p999 get their real verdict.
 - Metric used: `/sched/pauses/total/gc:seconds` (current; `/gc/pauses:seconds` is deprecated). Percentiles are the conservative upper bucket bound (never under-report).
 
 ## Next

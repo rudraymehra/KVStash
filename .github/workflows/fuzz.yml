@@ -16,9 +16,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - "FuzzParseHeader ./internal/protocol"
-          - "FuzzParseBatch ./internal/protocol"
+        include:
+          - func: FuzzParseHeader
+            pkg: ./internal/protocol
+          - func: FuzzParseBatch
+            pkg: ./internal/protocol
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,17 +32,30 @@ jobs:
       - name: fuzz 3h
         run: |
           set -o pipefail
-          read -r FUNC PKG <<< "${{ matrix.target }}"
           go test -fuzz="^${FUNC}$" -fuzztime=3h "$PKG" || echo "CRASH=1" >> "$GITHUB_ENV"
+        env:
+          FUNC: ${{ matrix.func }}
+          PKG: ${{ matrix.pkg }}
       - name: upload corpus and crashers
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: corpus-${{ strategy.job-index }}
+          name: corpus-${{ matrix.func }}
           path: "**/testdata/fuzz/**"
           if-no-files-found: ignore
       - name: open crash issue
         if: env.CRASH == '1'
-        run: gh issue create --repo "$GITHUB_REPOSITORY" --title "Weekly fuzz crash: ${{ matrix.target }}" --body "A fuzz target crashed. See the corpus artifact on run ${{ github.run_id }}."
         env:
           GH_TOKEN: ${{ github.token }}
+          FUNC: ${{ matrix.func }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh issue create --repo "$REPO" \
+            --title "Weekly fuzz crash: $FUNC" \
+            --body "A fuzz target crashed. See the corpus artifact on run $RUN_ID."
+      - name: fail the job on crash
+        if: env.CRASH == '1'
+        run: |
+          echo "fuzz target ${{ matrix.func }} crashed — see the filed issue" >&2
+          exit 1

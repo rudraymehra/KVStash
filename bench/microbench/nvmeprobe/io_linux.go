@@ -36,7 +36,7 @@ func pwriteFull(fd int, buf []byte, off int64) (int, error) {
 // been untouched since 2023. Rather than vendor-patching a dead dependency for
 // a throwaway rig, we take the plan's written fallback: the threadpool engine
 // is the A3 candidate (>=6 GB/s/device = PASS), and an io_uring engine (raw
-// syscalls or a maintained binding) is the v1.1 spike alongside the Week-13
+// syscalls or a maintained binding) is the v1.1 spike alongside the later
 // io_uring deep dive. The product's NVMe tier keeps an IOBackend seam so both
 // engines remain pluggable.
 func runUring(probeConfig, int, int64) (int64, int64, int64, error) {

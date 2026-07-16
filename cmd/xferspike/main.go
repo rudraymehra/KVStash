@@ -1,4 +1,4 @@
-// Command xferspike is the Week-1 A1 transport measurement rig. It blasts
+// Command xferspike is the A1 transport measurement rig. It blasts
 // fixed-size frames over N parallel TCP connections and reports aggregate
 // throughput (GB/s), frame rate, and CPU cores consumed as one JSON line — the
 // evidence behind the A1 kill-gate (>=12 GB/s loopback, >=85% of the iperf3
