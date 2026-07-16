@@ -1,1 +1,1 @@
-# kvbench — storage-level trace-replay load generator (Week 7)
+# kvbench — storage-level trace-replay load generator

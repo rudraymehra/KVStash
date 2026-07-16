@@ -1,2 +1,2 @@
-// Package store orchestrates the DRAM/NVMe/S3 tiers (Week 3+).
+// Package store orchestrates the DRAM/NVMe/S3 tiers (stub — not yet implemented).
 package store

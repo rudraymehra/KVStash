@@ -1,1 +1,1 @@
-# traces — Bailian/Mooncake trace converters (Week 7)
+# traces — Bailian/Mooncake trace converters

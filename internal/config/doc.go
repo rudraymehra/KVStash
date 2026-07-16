@@ -1,2 +1,2 @@
-// Package config loads daemon configuration (Week 3).
+// Package config loads daemon configuration (stub — not yet implemented).
 package config

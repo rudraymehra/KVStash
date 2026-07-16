@@ -7,7 +7,7 @@ import (
 
 // The xferspike wire frame: a fixed 16-byte header followed by a payload of
 // header.length bytes. This is a deliberately minimal ancestor of the real
-// 64-byte kvblockd protocol header (see docs/PROTOCOL.md, Week 2) — enough to
+// 64-byte kvblockd protocol header (see docs/PROTOCOL.md) — enough to
 // measure raw transport throughput and nothing more.
 //
 // Byte order (locked here, ahead of PROTOCOL.md): the magic field is written
