@@ -251,6 +251,26 @@ per-connection response ordering needs no FEAT_OOO) is FLAT on loopback: the
 request-turnaround bubble is microseconds there. The lever's payoff is
 real-RTT networks; re-measure on the AWS pair.
 
+**PUT (ingest) path — `BenchmarkPut_1MB` / `BenchmarkPutPipelined_1MB`.**
+Multi-stream PUT is ~5.9 GB/s at 4 streams (the bench Deletes each key to stay
+bounded, so this UNDERSTATES pure PUT); the 1-RTT pipelined shape (BEGIN+CHUNK+
+COMMIT in one burst) is 277 µs/op single-stream vs 353 µs for the two-RTT
+product client (−20%), at 25 vs 32 allocs/op. The PUT/GET ratio is ~2×, better
+than every store studied (Redis's own SET/GET = 3.8× at 4 MB; the team
+deprioritized the write path outright). pprof of the pipelined PUT: **64%
+syscall, 18% goroutine-wakeup handoffs (pthread_cond), 10% kevent, memmove 1.9%,
+xxh3 1.6%** — i.e. syscall/handoff-bound, NOT copy-bound. The copy/digest work
+done this pass (ownership-transfer Put, first-chunk exact-cap staging,
+incremental digest) removed the memory traffic; what remains is the same
+kernel-syscall wall the GET path hit, plus the read-side two-syscall-per-frame
+cost (`io.ReadFull` header then body). A 2 MiB server rcvbuf buys PUT ~8%
+(8 MiB no more); the structural levers — `readv` to fuse the header/body reads
+(golang/go#17607) and a worker-pool handoff to cut the per-response cond
+signal (RocksDB's write-thread-adaptive-yield finding) — are deferred:
+`readv` steps outside `net`, worker handoff is a post-Week-2 server upgrade.
+Both are pre-registered for the network rigs, not chased on loopback where the
+syscall floor dominates.
+
 **Research-verified positioning (adversarially-verified deep-research pass,
 2026-07-16; sources: golang/go#13451/#17607/#21676, CloudWeGo docs, Cloudflare
 & Netflix engineering, netdev MSG_ZEROCOPY paper):**
