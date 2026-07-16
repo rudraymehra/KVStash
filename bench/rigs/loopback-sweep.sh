@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local loopback sweep for xferspike — a developer-machine sanity check, NOT the
-# A1 gate (that is bench/rigs/aws-transport on the c6in pair, Day 4).
+# A1 gate (that is bench/rigs/aws-transport on the c6in pair).
 #
 # Raises the fd limit and spaces runs so rapid sequential loopback runs don't
 # exhaust ephemeral ports / pile up TIME_WAIT sockets (finding F-a1-2). Emits CSV.

@@ -1,1 +1,1 @@
-# rigs — cloud provisioning runbooks (Week 1+)
+# rigs — cloud provisioning runbooks

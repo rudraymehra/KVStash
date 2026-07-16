@@ -5,7 +5,7 @@
 # Money-honesty: the "$0 residue" claim is only trustworthy if we check the
 # SAME region the instances were launched in. If .rig-state is missing we do
 # NOT know that region, so we sweep ALL regions for the tag and refuse to
-# assert clean on assumption. Day 4.
+# assert clean on assumption.
 set -euo pipefail
 STATE="$(dirname "$0")/.rig-state"
 PG="${PG:-kvbench-transport-pg}"

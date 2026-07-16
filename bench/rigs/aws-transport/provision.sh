@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rig T (A1): provision 2x c6in.8xlarge in a cluster placement group.
 # Spot with on-demand fallback. All resources tagged kvbench for teardown.
-# NOT run today — Day 4. Requires: aws cli configured, vCPU quota >= 64 (approved).
+# Requires: aws cli configured, vCPU quota >= 64 (approved).
 set -euo pipefail
 
 REGION="${REGION:-us-east-1}"

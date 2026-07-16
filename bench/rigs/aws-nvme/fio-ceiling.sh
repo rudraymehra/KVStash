@@ -3,7 +3,7 @@
 # nvmeprobe number is reported as % of this ceiling (same discipline as iperf3).
 set -euo pipefail
 STATE="$(dirname "$0")/.rig-state"; source "$STATE"
-SSH="ssh -o StrictHostKeyChecking=accept-new ec2-user"
+SSH="ssh -i $HOME/.ssh/kvbench.pem -o StrictHostKeyChecking=accept-new ec2-user"
 $SSH@"$N_PUB" 'sudo dnf install -y fio >/dev/null 2>&1 || true; fio --version'
 # i4i instance-store devices are usually nvme1n1/nvme2n1 (nvme0 is the EBS root)
 $SSH@"$N_PUB" 'lsblk -d -o NAME,SIZE,MODEL | grep -i nvme'
