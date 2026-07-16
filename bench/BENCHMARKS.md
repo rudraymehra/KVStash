@@ -53,6 +53,16 @@ rig, never a laptop absolute.**
 Flat 5–9 GB/s, no size cliff: 0.4 MiB ≈ 7.7–8.5 · 1 MiB ≈ 7.3–7.9 ·
 2.5 MiB ≈ 5.4–7.6 GB/s (the 2.5 MiB dip is the memory-bandwidth wall).
 
+## Mixed concurrent workload & F_MORE (no cliffs)
+
+- **Mixed GET+PUT+EXISTS** (concurrent, one store): GET holds ~8 GB/s under a
+  live writer + prober — the 256 sharded store RWMutexes show **no contention
+  collapse** vs the ~9 GB/s isolated number. Race-clean + corruption-free under
+  `-race` (`TestMixedConcurrentWorkload`).
+- **F_MORE split** (16 MiB frame cap forcing multi-frame responses) is
+  statistically identical to single-frame (9.0 vs 8.9 GB/s) — the split +
+  client reassembly path is throughput-transparent.
+
 ## PUT (write path)
 
 ~5.9 GB/s at 4 streams; 1-RTT pipelined 277 µs/op vs 353 µs two-RTT (−20%),
