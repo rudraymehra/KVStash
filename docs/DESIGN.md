@@ -251,11 +251,33 @@ per-connection response ordering needs no FEAT_OOO) is FLAT on loopback: the
 request-turnaround bubble is microseconds there. The lever's payoff is
 real-RTT networks; re-measure on the AWS pair.
 
-**Standing Week-3 items:** re-run gate + `rawget` baseline on the bare-metal
+**Research-verified positioning (adversarially-verified deep-research pass,
+2026-07-16; sources: golang/go#13451/#17607/#21676, CloudWeGo docs, Cloudflare
+& Netflix engineering, netdev MSG_ZEROCOPY paper):**
+
+- goroutine-per-conn + `net.Buffers` writev IS the right architecture at ≥1 MiB
+  messages — ByteDance's own docs steer >1 MB workloads to `go net`, not their
+  event loop. Event-loop frameworks solve C10K context-switch cost, not
+  large-message throughput.
+- The writev fast path exists only on a bare `*net.TCPConn` (golang/go#21676:
+  a non-embedding wrapper silently becomes one Write PER BUFFER — 32 syscalls
+  per response). The transport now logs a tripwire if the conn is ever wrapped.
+- MSG_ZEROCOPY has provably ZERO loopback benefit (kernel copies shared pages
+  on the loopback path), and 1 MiB sends are its max-benefit regime on real
+  NICs (79% of process cycles are the user→kernel copy; expect 5–15% end to
+  end). The `writeReq.release()` seam is exactly the errqueue-completion hook
+  it needs. Deferral to the 100 GbE rig stands, now evidence-backed.
+- At tens of GB/s the terminal wall is memory bandwidth (Netflix: 30 GB/s on
+  ~150 GB/s DRAM) — count DRAM passes per byte before buying faster NICs.
+
+**Standing Week-3+ items:** re-run gate + `rawget` baseline on the bare-metal
 Linux rig (the quotable environment; Mac loopback is a sanity check per
-a1-log); pipelined/OOO client demux for the network path. The DRAM-tier week
-re-tests this exact benchmark against the same-shape ceiling; the goalpost
-does not move.
+a1-log); pipelined/OOO client demux for the network path (loopback-flat,
+network-decisive); `readv` via `SyscallConn` on the PUT/request read path
+(golang/go#17607 — kills the second per-frame read syscall); Linux
+`tcp_rmem/wmem` sized to LAN BDP (~0.3–3 MB, not WAN-scale). The DRAM-tier
+week re-tests this exact benchmark against the same-shape ceiling; the
+goalpost does not move.
 
 **Fuzz:** `FuzzParseHeader` + `FuzzParseBatch` clean (tens of millions of execs);
 formal 1h-per-target gate is the Day-7 item. **PUT_STREAM invariants**

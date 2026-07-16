@@ -2,7 +2,9 @@ package transport
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -70,6 +72,15 @@ type Conn struct {
 
 // startConn wires the loops around an accepted (already tuned) net.Conn.
 func startConn(nc net.Conn, bs BufferSource, h FrameHandler, cfg Config) *Conn {
+	// Tripwire (golang/go#21676): net.Buffers.WriteTo takes the single-writev
+	// fast path only on a bare *net.TCPConn (or a wrapper that EMBEDS one). A
+	// wrapped conn silently degrades a 32-buffer flush into 32 Write syscalls.
+	// Nothing wraps the conn today; if a future refactor does, this log is the
+	// difference between a 5-minute diagnosis and a mystery throughput halving.
+	if _, ok := nc.(*net.TCPConn); !ok {
+		slog.Warn("transport: conn is not *net.TCPConn — net.Buffers writev fast path is OFF (golang/go#21676)",
+			"type", fmt.Sprintf("%T", nc))
+	}
 	c := &Conn{
 		nc:         nc,
 		bs:         bs,
