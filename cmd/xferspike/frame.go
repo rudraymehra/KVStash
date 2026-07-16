@@ -34,7 +34,7 @@ var errBadMagic = errors.New("bad magic: stream out of sync")
 // putHeader writes h into the first headerSize bytes of buf without allocating.
 // It panics if buf is too short — callers own a correctly sized buffer.
 func putHeader(buf []byte, h frameHeader) {
-	binary.BigEndian.PutUint32(buf[0:4], h.magic)
+	binary.BigEndian.PutUint32(buf[0:4], h.magic) //nolint:gocritic // ruleguard wireByteOrder: the rig's magic is deliberately BE so hexdumps read "KVB1" (locked in review); numeric fields below are LE
 	binary.LittleEndian.PutUint64(buf[4:12], h.seq)
 	binary.LittleEndian.PutUint32(buf[12:16], h.length)
 }
@@ -50,7 +50,7 @@ func encodeHeader(h frameHeader) []byte {
 // does not begin with the expected magic value.
 func decodeHeader(buf []byte) (frameHeader, error) {
 	var h frameHeader
-	h.magic = binary.BigEndian.Uint32(buf[0:4])
+	h.magic = binary.BigEndian.Uint32(buf[0:4]) //nolint:gocritic // ruleguard wireByteOrder: BE magic is the rig's locked convention (see const magic)
 	h.seq = binary.LittleEndian.Uint64(buf[4:12])
 	h.length = binary.LittleEndian.Uint32(buf[12:16])
 	if h.magic != magic {

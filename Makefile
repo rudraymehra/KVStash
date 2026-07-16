@@ -1,10 +1,16 @@
-# kvblockd — Week-1 Makefile (fuzz becomes real in Week 2+)
+# kvblockd
 
 GO      ?= go
 PKGS    := ./...
 BIN_DIR := bin
 
-.PHONY: all build test race lint fuzz bench clean
+# Mutation gate: 0.90 floor on the pure codec package. Measured 0.9775
+# (174/178) — the only survivors are provably equivalent mutants (a copy()
+# capped by dst length, panic sentinels that still panic later, 1>>0 == 1<<0).
+MUTATE_PKG := ./internal/protocol/
+MUTATE_MIN := 0.9
+
+.PHONY: all build test race lint fuzz mutate bench clean
 
 all: build
 
@@ -22,7 +28,12 @@ lint:
 	@if command -v golangci-lint >/dev/null 2>&1; then golangci-lint run; else echo "golangci-lint not installed (CI runs it); skipping"; fi
 
 fuzz:
-	@echo "fuzz: no fuzz targets yet (arrives Week 2 with internal/protocol)"
+	$(GO) test -fuzz=FuzzParseHeader -fuzztime=90s ./internal/protocol/
+
+mutate:
+	@command -v go-mutesting >/dev/null 2>&1 || { echo "installing go-mutesting..."; $(GO) install github.com/avito-tech/go-mutesting/cmd/go-mutesting@latest; }
+	@go-mutesting --exec-timeout 30 $(MUTATE_PKG) | tail -1 | tee /tmp/kvb-msi.txt
+	@awk -v min=$(MUTATE_MIN) '{ for (i=1;i<=NF;i++) if ($$i ~ /^[0-9]+\.[0-9]+$$/) { score=$$i; break } } END { if (score+0 < min+0) { printf "FAIL: mutation score %s < %s floor\n", score, min; exit 1 } else printf "OK: mutation score %s >= %s floor\n", score, min }' /tmp/kvb-msi.txt
 
 bench:
 	$(GO) test -run='^$$' -bench=. -benchmem $(PKGS)

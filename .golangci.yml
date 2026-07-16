@@ -13,6 +13,14 @@ linters:
     - wastedassign
     - gocritic
   settings:
+    gocritic:
+      enable-all: false
+      enabled-checks:
+        - ruleguard
+      settings:
+        ruleguard:
+          rules: ${base-path}/rules.go
+          failOn: all
     gosec:
       excludes:
         - G103 # unsafe is load-bearing in the dram arena — reviewed per-PR instead

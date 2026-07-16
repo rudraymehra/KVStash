@@ -2,6 +2,13 @@
 
 Every review-pipeline run logs one line. Pipeline spec maintained privately.
 
+Conventions (2026-07-16): the Findings column breaks confirmed findings down
+by stage (`SDE1:n SDE2:n SDE3:n SSE:n BRK:n`, suffixed B/H/M/L for severity) —
+a stage at zero confirmed findings across 5 consecutive FULL runs gets merged
+or cut. Calibration drills (seeded-defect recall runs on package copies; seeds
+never committed) log here with `CAL` in the Stages column and recall in the
+Verdict column.
+
 | Date | Change | Path | Stages | Findings | Verdict |
 |------|--------|------|--------|----------|---------|
 | 2026-07-14 | scaffold: repo bootstrap (f512c6f) | LIGHT | SDE-1 + CTO gate | 1 (cmd/ stubs missing main — fixed pre-merge) | PASS — evidence: go build/vet/gofmt clean, ignore rules verified, no product code in internal/ |

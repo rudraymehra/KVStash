@@ -81,6 +81,24 @@ func TestHeaderCRCCoversFirst60Bytes(t *testing.T) {
 	}
 }
 
+// TestHeaderCRCBoundary pins the exact length contract: 60 bytes is enough
+// (the CRC covers exactly bytes 0..59), 59 is not. Kills boundary mutants of
+// the length sentinel that a panic-only test cannot distinguish.
+func TestHeaderCRCBoundary(t *testing.T) {
+	exact := make([]byte, 60, 61) // cap 61: the append below must not reallocate away the test's point
+	for i := range exact {
+		exact[i] = byte(i)
+	}
+	want := crc32.Checksum(exact, castagnoli)
+	if got := HeaderCRC(exact); got != want {
+		t.Fatalf("HeaderCRC on an exactly-60-byte buffer = %#08x, want %#08x", got, want)
+	}
+	// One byte more must not change the result (byte 60 is outside the CRC).
+	if got := HeaderCRC(append(exact, 0xFF)); got != want {
+		t.Fatalf("HeaderCRC read past byte 59")
+	}
+}
+
 func TestHeaderCRCPanicsOnShortBuffer(t *testing.T) {
 	defer func() {
 		if recover() == nil {
@@ -343,6 +361,12 @@ func TestSubOpRoundTrip(t *testing.T) {
 	if got := SubOp(WithSubOp(0, 16)); got != 0 {
 		t.Errorf("WithSubOp(16) = sub-op %d, want documented truncation to 0", got)
 	}
+	// Absolute wire pin: the sub-op occupies flag bits 4-7 (PROTOCOL.md §2),
+	// so PUT COMMIT (sub-op 2) alone encodes as 0x0020. Round-trip tests are
+	// self-consistent under a shifted field; this is what actually pins it.
+	if got := WithSubOp(0, PutCommit); got != 0x0020 {
+		t.Errorf("WithSubOp(0, PutCommit) = %#04x, spec says 0x0020 (bits 4-7)", got)
+	}
 }
 
 // TestWireLayoutGolden pins each field to its byte offset with a hand-checked
@@ -356,6 +380,12 @@ func TestWireLayoutGolden(t *testing.T) {
 		Credit:      0x00100000,
 		RequestID:   0x1001,
 		PayloadLen:  104,
+	}
+	// A NONZERO key with distinct bytes: an all-zero key lets a key-offset
+	// off-by-one shift marshal and parse consistently and pass every
+	// round-trip test while breaking interop. Absolute offsets below kill it.
+	for i := range h.Key {
+		h.Key[i] = 0xA0 + byte(i)
 	}
 	buf := make([]byte, HeaderSize)
 	h.MarshalTo(buf)
@@ -380,9 +410,61 @@ func TestWireLayoutGolden(t *testing.T) {
 			t.Errorf("%s at offset %d: got % x, want % x", c.name, c.off, got, c.want)
 		}
 	}
-	for i := keyOffset; i < keyOffset+32; i++ {
-		if buf[i] != 0 {
-			t.Errorf("key byte %d not zero in batch-verb frame", i)
+	// Key bytes at ABSOLUTE spec offsets 24..55 (not keyOffset, deliberately —
+	// this is what pins the layout against a mutated offset constant).
+	for i := 0; i < 32; i++ {
+		if buf[24+i] != 0xA0+byte(i) {
+			t.Errorf("key byte at absolute offset %d: got %#02x, want %#02x", 24+i, buf[24+i], 0xA0+byte(i))
+		}
+	}
+}
+
+// TestLimitsFlagsFeatureBitsMatchSpec pins every remaining wire-visible
+// constant to PROTOCOL.md §2/§3.4-3.6/§4/§10 — the mutation run showed these
+// were the only unpinned constants left (a typo'd limit would silently change
+// negotiation behavior against conforming peers).
+func TestLimitsFlagsFeatureBitsMatchSpec(t *testing.T) {
+	pins := []struct {
+		name string
+		got  uint64
+		want uint64
+	}{
+		{"FlagResp", uint64(FlagResp), 0x0001},
+		{"FlagMore", uint64(FlagMore), 0x0002},
+		{"FlagFatal", uint64(FlagFatal), 0x0004},
+		{"FlagForce", uint64(FlagForce), 0x0008},
+		{"PutBegin", uint64(PutBegin), 0},
+		{"PutChunk", uint64(PutChunk), 1},
+		{"PutCommit", uint64(PutCommit), 2},
+		{"PutAbort", uint64(PutAbort), 3},
+		{"TouchRecency", uint64(TouchRecency), 0},
+		{"LeaseGrant", uint64(LeaseGrant), 1},
+		{"LeaseRelease", uint64(LeaseRelease), 2},
+		{"PinSoft", uint64(PinSoft), 0},
+		{"PinHard", uint64(PinHard), 1},
+		{"Unpin", uint64(Unpin), 2},
+		{"FeatOOO", FeatOOO, 1 << 0},
+		{"FeatExistsBitmap", FeatExistsBitmap, 1 << 1},
+		{"FeatPayloadCRC32C", FeatPayloadCRC32C, 1 << 2},
+		{"FeatCreditSymmetric", FeatCreditSymmetric, 1 << 3},
+		{"FeatTLSUpgrade", FeatTLSUpgrade, 1 << 4},
+		{"DefaultMaxBatchKeys", DefaultMaxBatchKeys, 512},
+		{"FloorMaxBatchKeys", FloorMaxBatchKeys, 128},
+		{"DefaultMaxFrameLen", DefaultMaxFrameLen, 268_435_456},
+		{"FloorMaxFrameLen", FloorMaxFrameLen, 16_777_216},
+		{"DefaultMaxBlobLen", DefaultMaxBlobLen, 33_554_432},
+		{"FloorMaxBlobLen", FloorMaxBlobLen, 4_194_304},
+		{"DefaultInitialCredit", DefaultInitialCredit, 134_217_728},
+		{"FloorInitialCredit", FloorInitialCredit, 16_777_216},
+		{"DefaultLeaseMS", DefaultLeaseMS, 5_000},
+		{"MaxLeaseMS", MaxLeaseMS, 60_000},
+		{"DefaultStreamTimeoutMS", DefaultStreamTimeoutMS, 30_000},
+		{"HeaderSize", HeaderSize, 64},
+		{"Version1", uint64(Version1), 0x01},
+	}
+	for _, p := range pins {
+		if p.got != p.want {
+			t.Errorf("%s = %d, spec says %d", p.name, p.got, p.want)
 		}
 	}
 }
