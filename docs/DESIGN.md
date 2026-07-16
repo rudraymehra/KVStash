@@ -290,6 +290,23 @@ syscall floor dominates.
 - At tens of GB/s the terminal wall is memory bandwidth (Netflix: 30 GB/s on
   ~150 GB/s DRAM) — count DRAM passes per byte before buying faster NICs.
 
+**Block-size characterization (fresh daemon per size, two-process, verify on).**
+Across the real workload range GET holds a flat 5–9 GB/s band with no size
+cliff: 0.4 MiB ≈ 7.7–8.5, 1 MiB ≈ 7.3–7.9, 2.5 MiB ≈ 5.4–7.6 GB/s (the slight
+decline at 2.5 MiB is the memory-bandwidth wall — larger blocks evict more
+cache per response). Method note recorded so it is not re-learned: the load
+generator seeds keys 1..N independent of block size, so sizes MUST be swept
+against SEPARATE daemon instances — reusing one daemon hits write-once
+immutable-conflict and credits new-size bytes against stale data (produced a
+physically-impossible 49 GB/s reading; discarded, not reported).
+
+**Negative result — inline vs sidecar verification (don't regress this).** A
+prototype hashing each block inline right after its read (hoping to hit it
+cache-hot and skip a second DRAM pass) measured 6.9 GB/s vs the sidecar's
+9.75 — serializing the hash into the read loop stalls the socket more than the
+second DRAM read costs. xxh3 alone is 19.2 GB/s single-core, so verification is
+never CPU-bound; the sidecar's read/hash overlap is the right design. Reverted.
+
 **Standing Week-3+ items:** re-run gate + `rawget` baseline on the bare-metal
 Linux rig (the quotable environment; Mac loopback is a sanity check per
 a1-log); pipelined/OOO client demux for the network path (loopback-flat,
