@@ -9,6 +9,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -119,7 +120,9 @@ func Load(path string, ov Overrides) (Config, error) {
 		defer f.Close()
 		dec := yaml.NewDecoder(f)
 		dec.KnownFields(true) // a typo'd key fails loudly, never silently defaults
-		if err := dec.Decode(&c); err != nil {
+		// An empty or comments-only file decodes to io.EOF: that is the
+		// documented "empty file yields the defaults" case, not an error.
+		if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
 			return Config{}, fmt.Errorf("config %s: %w", path, err)
 		}
 	}
@@ -146,14 +149,14 @@ func Load(path string, ov Overrides) (Config, error) {
 	}
 
 	if err := c.Validate(); err != nil {
-		return Config{}, err
+		return Config{}, fmt.Errorf("config: %w", err)
 	}
 	return c, nil
 }
 
 // Validate checks the configuration against the PROTOCOL.md floors and basic
 // sanity. It mutates nothing: a wrong config is an error, not a clamp.
-func (c *Config) Validate() error {
+func (c Config) Validate() error {
 	var errs []error
 	check := func(cond bool, format string, args ...any) {
 		if !cond {
@@ -161,6 +164,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	check(c.ListenAddr != "", "listen_addr: the data-plane address must be set")
 	for _, a := range []struct{ name, addr string }{
 		{"listen_addr", c.ListenAddr},
 		{"admin_addr", c.AdminAddr},
@@ -191,8 +195,8 @@ func (c *Config) Validate() error {
 		"lease_default_ms %d: must be in [1, lease_max_ms %d]", c.LeaseDefaultMS, c.LeaseMaxMS)
 	check(c.LeaseMaxMS <= protocol.MaxLeaseMS,
 		"lease_max_ms %d: exceeds the protocol clamp %d", c.LeaseMaxMS, protocol.MaxLeaseMS)
-	check(c.SockSndBuf >= 0 && c.SockRcvBuf >= 0,
-		"sock_sndbuf/sock_rcvbuf must be >= 0 (0 = OS default)")
+	check(c.SockSndBuf >= 0, "sock_sndbuf %d: must be >= 0 (0 = OS default)", c.SockSndBuf)
+	check(c.SockRcvBuf >= 0, "sock_rcvbuf %d: must be >= 0 (0 = OS default)", c.SockRcvBuf)
 
 	return errors.Join(errs...)
 }
