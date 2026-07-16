@@ -36,16 +36,17 @@ func TestPutWriteOnce(t *testing.T) {
 	}
 }
 
-// TestPutCopiesStaging: the store must own its bytes — mutating the caller's
-// buffer after Put must not change what Get returns.
-func TestPutCopiesStaging(t *testing.T) {
+// TestPutTransfersOwnership pins the no-copy contract: Put keeps the exact
+// slice it was handed (ownership transfer — the commit path discards its
+// staging extent, so copying would double every PUT's memory traffic). The
+// flip side, "caller must not reuse the slice", is the documented obligation.
+func TestPutTransfersOwnership(t *testing.T) {
 	s := New()
-	staging := []byte("immutable?")
+	staging := []byte("handed-over")
 	s.Put(1, k(2), staging, 42)
-	staging[0] = 'X'
-	data, _, _ := s.Get(1, k(2))
-	if data[0] == 'X' {
-		t.Fatal("store aliases the caller's staging buffer")
+	data, _, ok := s.Get(1, k(2))
+	if !ok || &data[0] != &staging[0] {
+		t.Fatal("store copied the staging buffer (ownership contract regressed to copy)")
 	}
 }
 

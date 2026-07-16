@@ -4,6 +4,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zeebo/xxh3"
+
 	"github.com/kvstash/kvblockd/internal/protocol"
 	"github.com/kvstash/kvblockd/internal/transport"
 )
@@ -23,6 +25,7 @@ type session struct {
 	feats  uint64
 
 	keyScratch [][32]byte // reused across batch decodes on the read goroutine
+	lendBuf    []byte     // reusable Lend extent (see Lend for the safety invariant)
 
 	streamMu    sync.Mutex
 	streams     map[uint64]*putStream // by request_id
@@ -30,13 +33,17 @@ type session struct {
 }
 
 // putStream is one in-flight PUT_STREAM (§5). buf accumulates CHUNK bytes into
-// staging that is invisible to reads until a successful COMMIT.
+// staging that is invisible to reads until a successful COMMIT. digest hashes
+// each chunk as it lands (cache-hot, right after the staging copy) so COMMIT
+// verifies with a constant-time Sum64 instead of re-reading the whole block
+// from DRAM — one full memory pass saved per PUT.
 type putStream struct {
 	ns           uint32
 	key          [32]byte
 	totalLen     uint32
 	xxh3Hint     uint64
 	buf          []byte
+	digest       *xxh3.Hasher
 	received     uint32
 	tombstoned   bool // BEGIN rejected / OK_EXISTS / reaped: consume chunks, fail COMMIT
 	lastActive   time.Time
@@ -57,11 +64,30 @@ func (s *session) bind(c *transport.Conn) {
 	go s.reaper(c)
 }
 
-// Lend / Return implement transport.BufferSource. ramstub-era buffers are plain
-// heap (a disclosed rig property); the DRAM tier will lend arena extents so
-// PUT bytes land off-heap.
-func (s *session) Lend(n int) []byte { return make([]byte, n) }
-func (s *session) Return(b []byte)   { transport.Poison(b) }
+// maxLendReuse bounds the buffer session.Lend recycles across frames. A body
+// up to this size is served from the recycled extent (recycling kills the
+// per-1MiB-chunk allocation that dominated the PUT path); a larger body gets a
+// fresh make() that GC reclaims after Return — so a single big frame can never
+// pin up to the credit window (256 MiB) for the connection's whole life,
+// invisible to every staging cap. 2 MiB covers the 0.4–2.5 MiB block range
+// (the recommended chunk ceiling) with headroom.
+const maxLendReuse = 2 << 20
+
+// Lend / Return implement transport.BufferSource. Every HandleFrame path
+// consumes (Returns) its body synchronously on the connection's one read
+// goroutine before the transport reads the next frame, so at most one lent
+// buffer is live at a time. The DRAM tier will replace this with arena extents
+// so PUT bytes land off-heap.
+func (s *session) Lend(n int) []byte {
+	if n > maxLendReuse {
+		return make([]byte, n) // oversize: transient, GC-reclaimed after Return
+	}
+	if cap(s.lendBuf) < n {
+		s.lendBuf = make([]byte, maxLendReuse)
+	}
+	return s.lendBuf[:n]
+}
+func (s *session) Return(b []byte) { transport.Poison(b) }
 
 // HandleFrame is the dispatch entry point (transport.FrameHandler). It enforces
 // HELLO-first, then routes by opcode. Every path Returns the lent body and
@@ -176,10 +202,11 @@ func (s *session) sweepStreams(now time.Time, timeout time.Duration) {
 				delete(s.streams, id)
 			}
 		case now.Sub(st.lastActive) > timeout:
-			// Idle live stream: free the staging extent and tombstone the id
-			// until it gets a terminal response or is reaped.
+			// Idle live stream: free the staging extent AND the digest, then
+			// tombstone the id until it gets a terminal response or is reaped.
 			s.stagedBytes -= int64(len(st.buf))
 			st.buf = nil
+			st.digest = nil
 			st.tombstoned = true
 			st.tombstonedAt = now
 		}

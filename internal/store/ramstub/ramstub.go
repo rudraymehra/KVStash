@@ -96,8 +96,9 @@ func (s *Store) Get(ns uint32, key [32]byte) (data []byte, xxh3 uint64, ok bool)
 // existing key returns OK_EXISTS if the checksum matches, or
 // ERR_IMMUTABLE_CONFLICT if it differs (content-derived keys mean a mismatch
 // is corruption — never overwrite). data must already be validated (length +
-// xxh3) by the caller; the store copies it so the caller's staging buffer can
-// be reused.
+// xxh3) by the caller, and OWNERSHIP TRANSFERS to the store: the caller must
+// not touch data afterwards. (The commit path discards its staging extent
+// anyway; copying here doubled every PUT's memory traffic for nothing.)
 func (s *Store) Put(ns uint32, key [32]byte, data []byte, xxh3 uint64) protocol.Status {
 	bk := blockKey{ns: ns, key: key}
 	sh := s.shard(bk)
@@ -109,9 +110,7 @@ func (s *Store) Put(ns uint32, key [32]byte, data []byte, xxh3 uint64) protocol.
 		}
 		return protocol.StatusErrImmutableConflict
 	}
-	cp := make([]byte, len(data))
-	copy(cp, data)
-	sh.m[bk] = entry{data: cp, xxh3: xxh3}
+	sh.m[bk] = entry{data: data, xxh3: xxh3}
 	return protocol.StatusOK
 }
 

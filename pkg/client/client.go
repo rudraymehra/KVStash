@@ -161,7 +161,14 @@ type conn struct {
 	nextID uint64
 	hdr    [protocol.HeaderSize]byte // reusable header scratch
 	rbuf   []byte                    // reusable readN scratch (single-caller conn)
+	wbuf   []byte                    // reusable request-body scratch (WriteTo is synchronous)
 }
+
+// reqBuf hands out the request-body scratch (len 0, grown capacity kept).
+func (cn *conn) reqBuf() []byte { return cn.wbuf[:0] }
+
+// keepReq remembers a (possibly grown) request body's backing array.
+func (cn *conn) keepReq(b []byte) { cn.wbuf = b[:0] }
 
 func dialConn(ctx context.Context, addr string, o Options) (*conn, error) {
 	d := net.Dialer{Timeout: o.DialTimeout}
@@ -273,17 +280,15 @@ func (cn *conn) nextHeader() (protocol.Header, error) {
 	}
 }
 
-// readFrame reads one full response frame's payload, skipping NOPs.
+// readFrame reads one full response frame's payload, skipping NOPs. The
+// returned slice aliases the conn's readN scratch — valid until the next
+// read on this conn; callers copy anything that outlives their verb.
 func (cn *conn) readFrame() ([]byte, error) {
 	h, err := cn.nextHeader()
 	if err != nil {
 		return nil, err
 	}
-	body := make([]byte, h.PayloadLen)
-	if _, err := io.ReadFull(cn.nc, body); err != nil {
-		return nil, err
-	}
-	return body, nil
+	return cn.readN(int(h.PayloadLen))
 }
 
 // readN reads exactly n bytes into the conn's reusable scratch. The returned

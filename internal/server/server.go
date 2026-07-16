@@ -17,6 +17,8 @@ import (
 
 // Store is the block-store surface the server dispatches to. ramstub
 // implements it now; the real DRAM/NVMe/S3 tiers implement it later.
+// Put takes OWNERSHIP of data — the caller must not touch the slice after the
+// call (the PUT commit path hands over its staging extent instead of copying).
 type Store interface {
 	ExistsPrefix(ns uint32, keys [][32]byte, withBitmap bool) (nConsecutive uint32, perKey []protocol.Status)
 	Get(ns uint32, key [32]byte) (data []byte, xxh3 uint64, ok bool)

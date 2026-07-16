@@ -106,7 +106,11 @@ func (s *session) putBegin(c *transport.Conn, h protocol.Header, body []byte) {
 		totalLen:   b.TotalLen,
 		xxh3Hint:   b.XXH3Hint,
 		lastActive: nowFn(),
-		// buf is nil: staging grows lazily as CHUNKs arrive (no eager reserve).
+		// buf and digest are nil: both are allocated lazily on the FIRST
+		// non-empty CHUNK (see putChunk). Allocating at BEGIN would let a
+		// client pin a ~1.2 KiB Hasher (and, if we sized buf here, up to
+		// max_blob_len) per cheap BEGIN — the amplification DoS the review
+		// killed. A stream that never gets a real chunk owns nothing.
 	}
 	s.respondStatus(c, h, protocol.StatusOK)
 }
@@ -124,19 +128,21 @@ func (s *session) putChunk(c *transport.Conn, h protocol.Header, body []byte) {
 		// (§3.4) — an idle client cannot pin staging with free empty frames.
 	case st.received+h.PayloadLen > st.totalLen:
 		// Overflow beyond the declared length → tombstone; COMMIT will fail.
-		s.stagedBytes -= int64(len(st.buf))
-		st.buf = nil
-		st.tombstoned = true
-		st.tombstonedAt = nowFn()
+		s.tombstoneLive(st)
 	case s.stagedBytes+int64(h.PayloadLen) > maxStagedPerConn:
 		// Per-connection staging cap reached: tombstone this stream rather than
 		// grow unbounded (the COMMIT then fails with ERR_STALE_STREAM).
-		s.stagedBytes -= int64(len(st.buf))
-		st.buf = nil
-		st.tombstoned = true
-		st.tombstonedAt = nowFn()
+		s.tombstoneLive(st)
 	default:
+		if st.buf == nil {
+			// First real chunk: reserve EXACTLY total_len (no append slack to
+			// pin for the block's lifetime) and start the running digest. Bound
+			// by total_len ≤ max_blob_len and the per-conn staging cap above.
+			st.buf = make([]byte, 0, st.totalLen)
+			st.digest = xxh3.New()
+		}
 		st.buf = append(st.buf, body...)
+		_, _ = st.digest.Write(body) // hash while the chunk is cache-hot (never errors)
 		st.received += h.PayloadLen
 		s.stagedBytes += int64(h.PayloadLen)
 		st.lastActive = nowFn()
@@ -171,7 +177,15 @@ func (s *session) putCommit(c *transport.Conn, h protocol.Header, body []byte) {
 		s.respondStatus(c, h, protocol.StatusErrShortStream)
 		return
 	}
-	if xxh3.Hash(buf) != sum {
+	// The running digest already covered every staged byte in arrival order —
+	// Sum64 is O(1) here, versus re-reading the whole block from DRAM. A stream
+	// that committed with total_len==0 never allocated a digest; its canonical
+	// empty-input hash is the constant below.
+	got := emptyXXH3
+	if st.digest != nil {
+		got = st.digest.Sum64()
+	}
+	if got != sum {
 		s.respondStatus(c, h, protocol.StatusErrChecksum)
 		return
 	}
@@ -201,5 +215,23 @@ func (s *session) tombstone(id uint64, key [32]byte) {
 	s.streams[id] = &putStream{ns: s.ns, key: key, tombstoned: true, tombstonedAt: nowFn()}
 }
 
+// tombstoneLive converts an existing live stream to a tombstone, releasing
+// BOTH heavy resources it may hold: the staging extent (counted in stagedBytes)
+// and the ~1.2 KiB xxh3 digest. Dropping the digest matters — a tombstone
+// lingers for the reap grace period and is uncounted by every cap, so keeping
+// the Hasher would let cheap overflow/over-cap chunks pin heap unboundedly.
+// Caller holds streamMu.
+func (s *session) tombstoneLive(st *putStream) {
+	s.stagedBytes -= int64(len(st.buf))
+	st.buf = nil
+	st.digest = nil
+	st.tombstoned = true
+	st.tombstonedAt = nowFn()
+}
+
 // nowFn is time.Now, indirected so tests can pin stream timing.
 var nowFn = time.Now
+
+// emptyXXH3 is xxh3.Hash(nil) — the digest a zero-length committed block must
+// match (such a stream never allocates a running Hasher).
+var emptyXXH3 = xxh3.Hash(nil)

@@ -26,7 +26,8 @@ func (c *Client) BatchExists(ctx context.Context, keys [][32]byte) (nConsecutive
 	}
 	defer func() { c.release(cn, err) }()
 
-	body := protocol.AppendKeyList(nil, 0, keys)
+	body := protocol.AppendKeyList(cn.reqBuf(), 0, keys)
+	cn.keepReq(body)
 	if err = cn.writeFrame(protocol.OpBatchExists, 0, [32]byte{}, cn.id(), body); err != nil {
 		return 0, nil, err
 	}
@@ -56,6 +57,9 @@ func (c *Client) BatchExists(ctx context.Context, keys [][32]byte) (nConsecutive
 // streamed straight from the socket into into[i] — no intermediate copy of the
 // block bytes.
 func (c *Client) BatchGet(ctx context.Context, keys [][32]byte, into [][]byte) (statuses []protocol.Status, err error) {
+	if len(keys) == 0 {
+		return nil, nil // no keys → no request; a zero-key GET would hang on the response read
+	}
 	if len(into) != len(keys) {
 		return nil, fmt.Errorf("client: into has %d slots, want %d", len(into), len(keys))
 	}
@@ -68,7 +72,8 @@ func (c *Client) BatchGet(ctx context.Context, keys [][32]byte, into [][]byte) (
 	}
 	defer func() { c.release(cn, err) }()
 
-	body := protocol.AppendKeyList(nil, 0, keys)
+	body := protocol.AppendKeyList(cn.reqBuf(), 0, keys)
+	cn.keepReq(body)
 	if err = cn.writeFrame(protocol.OpBatchGet, 0, [32]byte{}, cn.id(), body); err != nil {
 		return nil, err
 	}
@@ -268,6 +273,48 @@ func (c *Client) Put(ctx context.Context, key [32]byte, data []byte) (err error)
 	return nil
 }
 
+// Delete removes keys (§3.7). force sets F_FORCE (evict even leased/pinned —
+// lease/pin gating arrives with the tiers). Returns the per-key statuses.
+func (c *Client) Delete(ctx context.Context, keys [][32]byte, force bool) (perKey []protocol.Status, err error) {
+	if uint32(len(keys)) > c.limits.MaxBatchKeys { //nolint:gosec // G115: len vs u32 cap
+		return nil, fmt.Errorf("client: %d keys exceeds negotiated max_batch_keys %d", len(keys), c.limits.MaxBatchKeys)
+	}
+	cn, err := c.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { c.release(cn, err) }()
+
+	var flags uint16
+	if force {
+		flags |= protocol.FlagForce
+	}
+	delBody := protocol.AppendKeyList(cn.reqBuf(), 0, keys)
+	cn.keepReq(delBody)
+	if err = cn.writeFrame(protocol.OpDelete, flags, [32]byte{}, cn.id(), delBody); err != nil {
+		return nil, err
+	}
+	body, err := cn.readFrame()
+	if err != nil {
+		return nil, err
+	}
+	p, raw, err := protocol.DecodeKeyStatusResp(body)
+	if err != nil {
+		return nil, err
+	}
+	if p.Status != protocol.StatusOK {
+		return nil, &StatusError{Op: protocol.OpDelete, Status: p.Status}
+	}
+	if len(raw) != len(keys) {
+		return nil, fmt.Errorf("client: DELETE returned %d statuses for %d keys", len(raw), len(keys))
+	}
+	perKey = make([]protocol.Status, len(raw))
+	for i, s := range raw {
+		perKey[i] = protocol.Status(s)
+	}
+	return perKey, nil
+}
+
 // Stats fetches the server's JSON stats document (§3.8).
 func (c *Client) Stats(ctx context.Context) (doc []byte, err error) {
 	cn, err := c.get(ctx)
@@ -292,5 +339,8 @@ func (c *Client) Stats(ctx context.Context) (doc []byte, err error) {
 	if len(body) < protocol.PreambleSize+int(p.Count) {
 		return nil, errShortResponse
 	}
-	return body[protocol.PreambleSize : protocol.PreambleSize+int(p.Count)], nil
+	// Copy out: body aliases the conn's scratch, but doc bytes go to the caller.
+	doc = make([]byte, p.Count)
+	copy(doc, body[protocol.PreambleSize:])
+	return doc, nil
 }

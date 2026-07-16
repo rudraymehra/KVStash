@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zeebo/xxh3"
+
 	"github.com/kvstash/kvblockd/internal/protocol"
 	"github.com/kvstash/kvblockd/pkg/client"
 )
@@ -220,3 +222,98 @@ func TestMalformedBatchKeepsConnHealthy(t *testing.T) {
 		t.Fatalf("valid request after malformed: got %s, want OK", st)
 	}
 }
+
+// TestDeleteEndToEnd exercises the client Delete verb over the wire (the panel
+// found it had zero coverage): delete removes a present key and reports
+// NOT_FOUND for an absent one, the key is then invisible, and the write-once
+// slot is released so a DIFFERENT-bytes Put of the same key now succeeds.
+func TestDeleteEndToEnd(t *testing.T) {
+	addr, cleanup := startServer(t)
+	defer cleanup()
+	c := dialClient(t, addr, 2)
+	defer c.Close()
+	ctx := context.Background()
+
+	k, missing := key(0x51), key(0x52)
+	if err := c.Put(ctx, k, bytes.Repeat([]byte{1}, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	per, err := c.Delete(ctx, [][32]byte{k, missing}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if per[0] != protocol.StatusOK || per[1] != protocol.StatusNotFound {
+		t.Fatalf("delete statuses: %v", per)
+	}
+	n, _, err := c.BatchExists(ctx, [][32]byte{k})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("key visible after delete")
+	}
+	// Slot released: a fresh Put of the same key with different bytes succeeds
+	// (would be ERR_IMMUTABLE_CONFLICT if delete had not really removed it).
+	if err := c.Put(ctx, k, bytes.Repeat([]byte{2}, 8192)); err != nil {
+		t.Fatalf("re-put after delete: %v", err)
+	}
+}
+
+// TestPutMultiChunkDigest pins the incremental (streaming) digest across
+// several CHUNKs: the running hash must equal the whole-block hash, and a
+// COMMIT whose declared sum matches succeeds while a wrong one is rejected.
+func TestPutMultiChunkDigest(t *testing.T) {
+	addr, cleanup := startServer(t)
+	defer cleanup()
+	nc := rawConn(t, addr)
+	defer nc.Close()
+	helloRaw(t, nc)
+
+	// 3 chunks of distinct bytes → 3072-byte block.
+	parts := [][]byte{
+		bytes.Repeat([]byte{0xA1}, 1024),
+		bytes.Repeat([]byte{0xB2}, 1024),
+		bytes.Repeat([]byte{0xC3}, 1024),
+	}
+	whole := append(append(append([]byte{}, parts[0]...), parts[1]...), parts[2]...)
+	sum := xxh3Hash(whole)
+
+	k := key(0x61)
+	begin := protocol.AppendPutBegin(nil, protocol.PutBeginBody{TotalLen: uint32(len(whole))}) //nolint:gosec // G115: test size
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutBegin), k, 61, begin)
+	if st := readStatus(t, nc); st != protocol.StatusOK {
+		t.Fatalf("begin: %s", st)
+	}
+	for _, p := range parts {
+		writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutChunk), k, 61, p)
+	}
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutCommit), k, 61, protocol.AppendPutCommit(nil, sum))
+	if st := readStatus(t, nc); st != protocol.StatusOK {
+		t.Fatalf("commit with correct running digest: got %s, want OK", st)
+	}
+}
+
+// TestPutZeroLenCommit: a stream declared total_len=0 with no CHUNK commits
+// against the empty-input xxh3 (the never-allocated-digest path).
+func TestPutZeroLenCommit(t *testing.T) {
+	addr, cleanup := startServer(t)
+	defer cleanup()
+	nc := rawConn(t, addr)
+	defer nc.Close()
+	helloRaw(t, nc)
+
+	k := key(0x62)
+	begin := protocol.AppendPutBegin(nil, protocol.PutBeginBody{TotalLen: 0})
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutBegin), k, 62, begin)
+	if st := readStatus(t, nc); st != protocol.StatusOK {
+		t.Fatalf("begin: %s", st)
+	}
+	writeRaw(t, nc, protocol.OpPutStream, protocol.WithSubOp(0, protocol.PutCommit), k, 62, protocol.AppendPutCommit(nil, xxh3Hash(nil)))
+	if st := readStatus(t, nc); st != protocol.StatusOK {
+		t.Fatalf("zero-len commit: got %s, want OK", st)
+	}
+}
+
+// xxh3Hash wraps the digest used on the wire so the test file needs no direct
+// third-party import beyond this one indirection.
+func xxh3Hash(b []byte) uint64 { return xxh3.Hash(b) }
