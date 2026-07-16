@@ -27,6 +27,14 @@ Format: Keep a Changelog (https://keepachangelog.com), SemVer after v0.1.0.
 - `bench/microbench/rawget`: raw-socket loopback baseline for the GET-shaped
   request→response path — the fair same-shape ceiling the throughput gate is
   quoted against (%-of-ceiling methodology).
+- `bench/kvbench/getbench`: out-of-process BATCH_GET load generator (daemon
+  and load in separate processes — the production shape).
+- `pkg/client`: `Options.SkipVerify` (default off) — disables the client-side
+  xxh3 pass for consumers that re-verify downstream; used to decompose
+  verification cost in the gate benchmark.
+- Transport: startup tripwire logging if the connection is ever not a bare
+  `*net.TCPConn` (golang/go#21676 — a wrapped conn silently loses the writev
+  fast path, one Write syscall per buffer).
 
 ### Changed
 - Transport writes are windowed at `write_chunk_bytes` (~1 MiB) per writev
