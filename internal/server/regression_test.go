@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -317,3 +319,86 @@ func TestPutZeroLenCommit(t *testing.T) {
 // xxh3Hash wraps the digest used on the wire so the test file needs no direct
 // third-party import beyond this one indirection.
 func xxh3Hash(b []byte) uint64 { return xxh3.Hash(b) }
+
+// TestMixedConcurrentWorkload gives the mixed GET+PUT+EXISTS path real race
+// coverage: many goroutines read, write (write-once fresh keys), probe, and
+// delete against one store+reaper concurrently. Scaled small (4 KiB blocks,
+// ~300 ms) so it exercises the shard locks and reaper without tripping the
+// write-stall timeout under -race's slowdown — throughput-under-contention is
+// the benchmark's job (BenchmarkMixedWorkload, run without -race); this test's
+// job is "no data race, no corruption, no deadlock."
+func TestMixedConcurrentWorkload(t *testing.T) {
+	addr, cleanup := startServer(t)
+	defer cleanup()
+	c := dialClient(t, addr, 16)
+	defer c.Close()
+	ctx := context.Background()
+
+	const seeded = 16
+	seedKeys := make([][32]byte, seeded)
+	for i := range seedKeys {
+		binary.LittleEndian.PutUint32(seedKeys[i][:], uint32(i)+1) //nolint:gosec // G115: test index
+		if err := c.Put(ctx, seedKeys[i], bytes.Repeat([]byte{byte(i)}, 4096)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	var wg sync.WaitGroup
+	var ctr atomic.Uint64
+	worker := func(fn func()) {
+		defer wg.Done()
+		for time.Now().Before(deadline) {
+			fn()
+		}
+	}
+	// 4 readers, 2 writers, 2 probers, 1 deleter — all sharing the pool+store.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go worker(func() {
+			into := make([][]byte, seeded)
+			st, err := c.BatchGet(ctx, seedKeys, into)
+			if err != nil {
+				t.Errorf("get: %v", err)
+				return
+			}
+			for j := range st {
+				if st[j] == protocol.StatusOK && !bytes.Equal(into[j], bytes.Repeat([]byte{byte(j)}, 4096)) {
+					t.Errorf("corrupt block %d under concurrency", j)
+				}
+			}
+		})
+	}
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go worker(func() {
+			var k [32]byte
+			binary.LittleEndian.PutUint64(k[:], ctr.Add(1)+1_000_000)
+			_ = c.Put(ctx, k, bytes.Repeat([]byte{0xAB}, 4096))
+		})
+	}
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go worker(func() { _, _, _ = c.BatchExists(ctx, seedKeys) })
+	}
+	wg.Add(1)
+	go worker(func() {
+		var k [32]byte
+		binary.LittleEndian.PutUint64(k[:], ctr.Add(1)+1_000_000)
+		_ = c.Put(ctx, k, bytes.Repeat([]byte{0xCD}, 4096))
+		_, _ = c.Delete(ctx, [][32]byte{k}, false)
+	})
+	wg.Wait()
+
+	// Seeded blocks are write-once immutable: they must be intact and readable.
+	into := make([][]byte, seeded)
+	st, err := c.BatchGet(ctx, seedKeys, into)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for j := range st {
+		if st[j] != protocol.StatusOK || !bytes.Equal(into[j], bytes.Repeat([]byte{byte(j)}, 4096)) {
+			t.Fatalf("seeded block %d damaged by concurrent load", j)
+		}
+	}
+}
