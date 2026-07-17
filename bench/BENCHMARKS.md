@@ -65,12 +65,24 @@ Flat 5–9 GB/s, no size cliff: 0.4 MiB ≈ 7.7–8.5 · 1 MiB ≈ 7.3–7.9 ·
 
 ## PUT (write path)
 
-~5.9 GB/s at 4 streams; 1-RTT pipelined 277 µs/op vs 353 µs two-RTT (−20%),
-25 vs 32 allocs. **PUT/GET ratio ~2×, better than every store studied**
-(Redis's own SET/GET = 3.8× at 4 MB). pprof: 64% syscall, 18% goroutine-wakeup
-handoffs, memmove 1.9%, xxh3 1.6% — syscall/handoff-bound, not copy-bound.
-Per-op allocation cut 3.1 MB → 1.05 MB via ownership-transfer commit +
-first-chunk exact-cap staging + incremental digest.
+~5.9 GB/s at 4 streams; 1-RTT pipelined 277 µs/op vs 353 µs two-RTT (−20%).
+**PUT/GET ratio ~2×, better than every store studied** (Redis's own SET/GET =
+3.8× at 4 MB). pprof: 64% syscall, 18% goroutine-wakeup handoffs, memmove 1.9%,
+xxh3 1.6% — syscall/handoff-bound, not copy-bound. Per-op allocation cut
+3.1 MB → 1.05 MB (ownership-transfer commit + first-chunk exact-cap staging +
+incremental digest), and allocs/op **32 → 29** via single-chunk one-shot digest
+(skips the ~1.2 KB Hasher for the common case) + precomputed zero-alloc
+status-ack preambles.
+
+## Metadata / codec micro-wins (from the per-benchmark optimizer fan-out)
+
+- **ExistsPrefix no-bitmap early-exit**: stop probing at the first prefix miss
+  when no bitmap is negotiated — `BenchmarkExistsPrefix_FirstMiss` (64 keys,
+  miss at index 1): **30 ns vs 723 ns ≈ 24×**, 0 allocs. Bitmap path unchanged.
+- **Rejected, honestly**: codec `slices.Grow` in-place descriptor writes
+  (measured 34 ns vs 29 ns baseline — slower); sub-ns codec micro-opts (swamped
+  by thermal noise, and throughput-neutral on a bandwidth-bound path). Kept only
+  what A/B-measured a win.
 
 ## EXISTS (metadata RTT)
 
