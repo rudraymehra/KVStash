@@ -12,3 +12,6 @@ func assertf(cond bool, format string, args ...any) {
 		panic(fmt.Sprintf(format, args...))
 	}
 }
+
+// debugAssertsEnabled reports whether kvbdebug asserts are compiled in.
+func debugAssertsEnabled() bool { return true }

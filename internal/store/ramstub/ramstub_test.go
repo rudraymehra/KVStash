@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/kvstash/kvblockd/internal/protocol"
+	"github.com/kvstash/kvblockd/internal/store/storetest"
 )
 
 func k(b byte) [32]byte {
@@ -139,4 +140,10 @@ func BenchmarkExistsPrefix_FirstMiss(b *testing.B) {
 			}
 		}
 	})
+}
+
+// TestRamstubConformance runs the shared Store semantics suite — the same
+// table the DRAM tier passes, proving interchangeable behavior.
+func TestRamstubConformance(t *testing.T) {
+	storetest.RunConformance(t, func(t *testing.T) storetest.Store { return New() })
 }
