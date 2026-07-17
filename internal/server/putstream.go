@@ -72,6 +72,13 @@ func (s *session) putBegin(c *transport.Conn, h protocol.Header, body []byte) {
 		return
 	}
 
+	// The store lookup takes the store's own lock and is independent of this
+	// session's stream map, so do it BEFORE taking streamMu — no reason to hold
+	// the per-connection PUT lock (which the reaper also contends) across an
+	// unrelated store call. putBegin runs only on the single read goroutine, so
+	// the value cannot go stale against a concurrent BEGIN.
+	sealed := s.srv.store.Contains(s.ns, h.Key)
+
 	s.streamMu.Lock()
 	defer s.streamMu.Unlock()
 
@@ -84,7 +91,7 @@ func (s *session) putBegin(c *transport.Conn, h protocol.Header, body []byte) {
 	}
 	// Write-once idempotent hit: the block is already sealed, so tell the
 	// client to stop and tombstone the id (optimistic chunks get discarded).
-	if s.srv.store.Contains(s.ns, h.Key) {
+	if sealed {
 		s.tombstone(h.RequestID, h.Key)
 		s.respondStatus(c, h, protocol.StatusOKExists)
 		return
