@@ -57,6 +57,8 @@ jobs:
         run: go test -race -short -count=1 ./...
       - name: test (race, kvbdebug — buffer poisoning + credit ledger asserts)
         run: go test -race -short -count=1 -tags kvbdebug ./internal/...
+      - name: modeltest (race, kvbdebug, elevated checks — the I1–I5 harness)
+        run: go test -race -count=1 -tags kvbdebug -run TestStoreModel ./internal/store/modeltest -rapid.checks=200
 
   fuzz-short:
     runs-on: ubuntu-24.04

@@ -59,3 +59,44 @@ jobs:
         run: |
           echo "fuzz target ${{ matrix.func }} crashed — see the filed issue" >&2
           exit 1
+
+  # The weekly deep run of the I1–I5 model-based harness: 20000 checks ×
+  # up to 500 steps ≈ well past the 10^6-op gate, under -race + kvbdebug.
+  # A failure shrinks to a seed under testdata/rapid/ (uploaded + issue).
+  model-soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 480
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: model soak
+        run: |
+          set -o pipefail
+          go test -race -count=1 -tags kvbdebug -timeout 7h \
+            -run TestStoreModel ./internal/store/modeltest \
+            -rapid.checks=20000 -rapid.steps=500 || echo "CRASH=1" >> "$GITHUB_ENV"
+      - name: upload shrunk seeds
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapid-seeds
+          path: "**/testdata/rapid/**"
+          if-no-files-found: ignore
+      - name: open failure issue
+        if: env.CRASH == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh issue create --repo "$REPO" \
+            --title "Weekly model-soak invariant violation" \
+            --body "The I1-I5 harness found a violation. Shrunk seed in the rapid-seeds artifact on run $RUN_ID."
+      - name: fail the job on violation
+        if: env.CRASH == '1'
+        run: exit 1
