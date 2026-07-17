@@ -106,8 +106,16 @@ func TestStoreModel(t *testing.T) {
 					map[bool]string{true: "PROTECTED", false: "un-marked"}[m.protected(m.blocks[k])])
 			}
 		}
-		// grantLease mirrors the store's §3.3 auto-lease on every OK read.
-		grantLease := func(b *mBlock) { b.leaseUntil = m.now + int64(leaseDefaultMS)*int64(time.Millisecond) }
+		// grantLease mirrors the store's §3.3 auto-lease on every OK read —
+		// MONOTONIC, like the store's extendLease: a 5s auto-grant never
+		// truncates a live longer lease (the divergence here was the deep
+		// gate's 180-second find: model said the lease lapsed, the store
+		// correctly still held it).
+		grantLease := func(b *mBlock) {
+			if v := m.now + int64(leaseDefaultMS)*int64(time.Millisecond); v > b.leaseUntil {
+				b.leaseUntil = v
+			}
+		}
 
 		rt.Repeat(map[string]func(*rapid.T){
 			"put": func(rt *rapid.T) {
@@ -303,7 +311,9 @@ func TestStoreModel(t *testing.T) {
 					if d > leaseMaxMS {
 						d = leaseMaxMS
 					}
-					e.leaseUntil = m.now + int64(d)*int64(time.Millisecond)
+					if v := m.now + int64(d)*int64(time.Millisecond); v > e.leaseUntil {
+						e.leaseUntil = v // grant/extend — never shorten (mirrors extendLease)
+					}
 				case protocol.LeaseRelease:
 					e.leaseUntil = 0
 				case protocol.TouchRecency:
