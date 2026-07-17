@@ -1,0 +1,61 @@
+# 2026/07/17 18:25:26.746644 [TestPolicyRapidConsistency/s3fifo] [rapid] draw action: "admit"
+# 2026/07/17 18:25:26.746680 [TestPolicyRapidConsistency/s3fifo] [rapid] draw ns: 0x1
+# 2026/07/17 18:25:26.746692 [TestPolicyRapidConsistency/s3fifo] [rapid] draw kb: 0x2
+# 2026/07/17 18:25:26.746703 [TestPolicyRapidConsistency/s3fifo] [rapid] draw size: 1
+# 2026/07/17 18:25:26.746719 [TestPolicyRapidConsistency/s3fifo] [rapid] draw action: "admit"
+# 2026/07/17 18:25:26.746727 [TestPolicyRapidConsistency/s3fifo] [rapid] draw ns: 0x1
+# 2026/07/17 18:25:26.746733 [TestPolicyRapidConsistency/s3fifo] [rapid] draw kb: 0x0
+# 2026/07/17 18:25:26.746739 [TestPolicyRapidConsistency/s3fifo] [rapid] draw size: 1
+# 2026/07/17 18:25:26.746753 [TestPolicyRapidConsistency/s3fifo] [rapid] draw action: "touch"
+# 2026/07/17 18:25:26.746765 [TestPolicyRapidConsistency/s3fifo] [rapid] draw ns: 0x1
+# 2026/07/17 18:25:26.746772 [TestPolicyRapidConsistency/s3fifo] [rapid] draw kb: 0x2
+# 2026/07/17 18:25:26.746786 [TestPolicyRapidConsistency/s3fifo] [rapid] draw action: "touch"
+# 2026/07/17 18:25:26.746792 [TestPolicyRapidConsistency/s3fifo] [rapid] draw ns: 0x1
+# 2026/07/17 18:25:26.746797 [TestPolicyRapidConsistency/s3fifo] [rapid] draw kb: 0x2
+# 2026/07/17 18:25:26.746806 [TestPolicyRapidConsistency/s3fifo] [rapid] draw action: "victims"
+# 2026/07/17 18:25:26.746813 [TestPolicyRapidConsistency/s3fifo] [rapid] draw vns: 0x1
+# 2026/07/17 18:25:26.746818 [TestPolicyRapidConsistency/s3fifo] [rapid] draw need: 1
+# 
+v0.4.8#8470328487965368783
+0x1084210842108
+0x0
+0x0
+0x0
+0x0
+0x38e38e38e38e4
+0x2
+0x0
+0x0
+0x0
+0x1084210842108
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1084210842108
+0x38e38e38e38e4
+0x2
+0x0
+0x0
+0x38e38e38e38e4
+0x2
+0x1084210842108
+0x38e38e38e38e4
+0x2
+0x0
+0x0
+0x38e38e38e38e4
+0x2
+0x1084210842108
+0x38e38e38e38e4
+0x3
+0x0
+0x0
+0x0
+0x0
+0x0
