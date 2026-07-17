@@ -10,7 +10,7 @@ BIN_DIR := bin
 MUTATE_PKG := ./internal/protocol/
 MUTATE_MIN := 0.9
 
-.PHONY: all build test race lint fuzz mutate bench clean
+.PHONY: all build test race lint fuzz mutate bench clean soak-mini
 
 all: build
 
@@ -37,6 +37,12 @@ mutate:
 
 bench:
 	$(GO) test -run='^$$' -bench=. -benchmem $(PKGS)
+
+# 10-minute local endurance smoke: 256 MiB arena, ~380 MiB working set (1.5×) →
+# continuous eviction; fails on any byte-verification miss. The pre-merge
+# gate for the soak driver itself (the 24h run reuses the same binary).
+soak-mini:
+	bash bench/soak/mini.sh
 
 clean:
 	rm -rf $(BIN_DIR) dist

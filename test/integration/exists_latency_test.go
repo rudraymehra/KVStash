@@ -9,6 +9,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"sort"
 	"strconv"
@@ -18,6 +19,8 @@ import (
 	"time"
 
 	"github.com/kvstash/kvblockd/internal/config"
+	"github.com/kvstash/kvblockd/internal/eviction"
+	"github.com/kvstash/kvblockd/internal/protocol"
 	"github.com/kvstash/kvblockd/internal/server"
 	"github.com/kvstash/kvblockd/internal/store/dram"
 	"github.com/kvstash/kvblockd/pkg/client"
@@ -60,6 +63,17 @@ func TestExistsLatencyUnderGetLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := dram.New(arena, dram.Params{LeaseDefaultMS: 5000, LeaseMaxMS: 60000})
+	// Week-4 form of the gate: the p99 must hold UNDER LIVE EVICTION — the
+	// policy is attached, the watermark goroutine runs, and a churn lane
+	// (below) keeps the arena above the watermark for the whole window.
+	pol, err := eviction.New("s3fifo", 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.AttachPolicy(pol)
+	stopEvict := st.StartEvictor(context.Background(), dram.EvictorConfig{
+		WatermarkPct: 80, BatchPct: 5, Interval: 50 * time.Millisecond,
+	})
 	cfg := config.Default()
 	cfg.ListenAddr = "127.0.0.1:0"
 	srv := server.New(cfg, st, server.NewNamespaces("gate", 7, gateToken))
@@ -73,6 +87,7 @@ func TestExistsLatencyUnderGetLoad(t *testing.T) {
 		dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer dcancel()
 		srv.Drain(dctx)
+		stopEvict()
 		if err := st.Close(); err != nil {
 			t.Error(err)
 		}
@@ -124,14 +139,44 @@ func TestExistsLatencyUnderGetLoad(t *testing.T) {
 					keys[i] = gateKey((n + i) % nBlocks)
 				}
 				n += getBatch
-				if _, err := c.BatchGet(context.Background(), keys, into); err != nil {
+				sts, err := c.BatchGet(context.Background(), keys, into)
+				if err != nil {
 					workerErrs.Add(1)
 					return
+				}
+				// An evicted working-set block comes back as NOT_FOUND:
+				// re-put it (mixed load — keeps the set warm and the
+				// pressure real). Backpressure statuses are expected.
+				for i, status := range sts {
+					if status == protocol.StatusNotFound {
+						_ = c.Put(context.Background(), keys[i], blob)
+					}
 				}
 				getOps.Add(1)
 			}
 		}(w)
 	}
+
+	// The churn lane: junk PUTs keep occupancy above the watermark so the
+	// evictor runs for the WHOLE window — the "under live eviction" clause.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c, err := client.Dial(context.Background(), addr, client.Options{
+			Streams: 1, Namespace: "gate", Token: gateToken,
+		})
+		if err != nil {
+			workerErrs.Add(1)
+			return
+		}
+		defer c.Close()
+		junk := bytes.Repeat([]byte{0xC4}, blockLen)
+		for seq := 0; !stopFlag.Load(); seq++ {
+			var k [32]byte
+			k[0], k[1], k[2] = byte(seq), byte(seq>>8), 0xC4
+			_ = c.Put(context.Background(), k, junk) // quota/busy = expected
+		}
+	}()
 
 	// EXISTS lanes: the latency under test.
 	samples := make([][]time.Duration, nExistsWorkers)
@@ -180,9 +225,16 @@ func TestExistsLatencyUnderGetLoad(t *testing.T) {
 	p50 := all[len(all)/2]
 	p99 := all[len(all)*99/100]
 	p999 := all[len(all)*999/1000]
-	t.Logf("EXISTS under %d GET lanes (%v window): %d samples, p50=%v p99=%v p99.9=%v; %d GET batches (%d MiB served)",
+	var doc struct {
+		Evictions uint64 `json:"evictions_total"`
+	}
+	_ = json.Unmarshal(st.Stats(), &doc)
+	t.Logf("EXISTS under %d GET lanes + live eviction (%v window): %d samples, p50=%v p99=%v p99.9=%v; %d GET batches (%d MiB served); %d evictions",
 		nGetWorkers, gateSeconds(), len(all), p50, p99, p999,
-		getOps.Load(), getOps.Load()*getBatch*blockLen>>20)
+		getOps.Load(), getOps.Load()*getBatch*blockLen>>20, doc.Evictions)
+	if doc.Evictions == 0 {
+		t.Fatal("zero evictions during the window — the gate did not run under live eviction")
+	}
 	if p99 >= p99Budget {
 		t.Fatalf("EXISTS p99 = %v, gate demands < %v", p99, p99Budget)
 	}

@@ -394,3 +394,58 @@ allocation-free in the blob band.
 **Week-3 ladder outcome (FULL, 5 stages + Opus diversity breaker, 4 refuters — all HIGH+ findings confirmed).** Fixed pre-push: spec-legal empty blocks were rejected ERR_QUOTA_BYTES (now extent-less, conformance-tested both stores); soft pins wrongly debited the §3.6 hard-pin quota (now: charge only on transition into hard, upgrade passes the gate, downgrade refunds); arena-full COMMIT emitted ERR_QUOTA_BYTES outside §3.4's frozen set (now: advisory BEGIN capacity check answers it there; the rare commit race maps to retryable ERR_BUSY — §3.4/§5 amended one line each); a drain-timeout could munmap the arena under an in-flight writev (transport now caps post-close writes at the 1s drain budget, Drain reports success/failure, main skips the unmap on timeout); CanEvict required refcount==0 and was structurally false for every resident block (now the refcount==1 indexed-block pre-filter, race-audited); daemon deadlocked on startup errors with metrics enabled (defer order); BEGIN ttl_ms was silently dropped (now applied at commit; no wire-observable effect until the evictor — review-covered, not behavior-testable yet); max_blob_len==max_frame_len made frame-cap blobs unreadable (negotiation now reserves the 32 B GET-header headroom); plain dram Get returned an arena view after release (now copies — the wire path uses GetRef and never pays it); a writeLoop flush-failure leaked the socket fd.
 
 **Known ceilings (documented, deliberate):** PUT staging stays heap-side (copy-at-commit; the reviewed DoS posture) until the Week-4+ reservation API. The allocator node pool caps at 2^17 live blocks regardless of arena size (Allocation.Meta's 18 slot bits) — irrelevant at the 1 GiB default, binds first on ≥8 GiB arenas of small blocks; widening Meta is scheduled with the evictor. kvb_hits_total hardcodes tier="dram" until the Recorder seam carries a tier. TouchLease can land on a ref a concurrent Delete just removed (client sees OK for a lease on a dead block — memory-safe, pre-existing, evictor-week item).
+
+## Week 4 — eviction + the model-based correctness harness
+
+<!-- RUDRAY: prose first per the Merge Rule — write this section from memory
+     (why S3-FIFO beats LRU for one-hit-wonders and what exactly the ghost
+     ring remembers and why hashes suffice; the three-pass evictor and the
+     §6 ladder precedence; why eviction is metadata-only and therefore
+     cheap; why a LOSSY store can still have a STRICT correctness oracle —
+     the asymmetric I1 and the maybeGone reconciliation; the happens-before
+     story between a reader's refcount and the evictor's gate) — THEN
+     fact-check against the code. The results below are raw inputs. -->
+
+**Ladder outcome (FULL, 5 stages + Opus breaker + 1 measuring refuter).**
+One reproduced BLOCKER (S3-FIFO Admit/Remove atomicity gap — the zero-value
+queue state collided with qSmall; a plain PUT-vs-forced-DELETE race
+corrupted the FIFO and panicked the evictor; found independently by two
+stages AND re-reproduced by the refuter on its snapshot) — fixed with an
+explicit qUnqueued state + tombstone handshake and a hammer regression.
+HIGHs fixed: GET auto-lease TRUNCATED longer explicit leases (now monotonic
+extendLease — spec says grant/extend, RELEASE is the only shortener);
+evictOne conflated not-found with gate-refused, minting permanent phantom
+policy entries under delete churn (three-way outcome now; phantoms proven
+dropped); the soak driver exited 0 when the client's own xxh3 check failed
+(checksum errors now count as verify failures and any hard error fails the
+run); policy.Remove raced re-publishing Puts (now inside the DeleteIf gate,
+atomic with the removal). The breaker's request-path eviction-convoy claim
+was REFUTED at HIGH by measurement (insert p99 ≈ eviction-free memcpy
+contention; 29% of passes return at the trigger re-check; disabling the
+synchronous pass collapsed goodput 47×) and recorded as the p999-tail note
+below. The breaker's empty-block flood DoS was CONFIRMED by measurement
+(181 B of index heap per zero-length block, unbounded) — zero-length blocks
+now carry a nominal count slot and the emergency sweep gained a COUNT goal.
+The deep rapid gate also caught one harness bug of ours (the extent-leak
+bound needed the held-ref allowance) — the oracle audits itself.
+
+**Deliberate ceilings & notes (Week-4 vintage):**
+- p999 tail under sustained overcommit is the evictMu queue (measured
+  16–43 ms worst-case waits at 16 hammering writers on a laptop; p99
+  unaffected). Revisit gate: if the 24h soak's put_p99 exceeds ~10 ms,
+  implement single-flight-with-shared-completion on the eviction pass.
+- The TIMING WHEEL is deferred (lazy expiry + expired-first sweeps; the
+  plan's own fallback). Revisit gate: expired-resident bytes >10% of arena
+  between pressure events, or expired-sweep >5 ms in the soak.
+- The modeltest oracle hard-codes "eviction = data loss". The Week-6 NVMe
+  tier turns eviction into DEMOTION — reconcileMiss and evictOne both need
+  the demotion seam before tier stacking (recorded for the Week-6 plan).
+- Strict per-tenant PRESSURE isolation needs Week-6 quotas; until then
+  attribution is proportional-to-resident-bytes with a remainder round.
+- ttlBlocks is a skip-hint that can ratchet up under lease-churn races
+  (never down): worst case is a wasted expired-sweep per pass, never a
+  correctness issue.
+- Ghost rings ratchet to their high-watermark (bounded by the arena-derived
+  ceiling) and don't shrink with cold domains; a gate-refused small-evictee
+  re-admits to MAIN via its own ghost entry (deliberate: proved-protected
+  blocks upgrade).

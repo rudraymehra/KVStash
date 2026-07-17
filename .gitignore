@@ -14,7 +14,12 @@ testdata/corpus-large/
 
 # Local env
 .env
-soak/
+
+# Soak ARTIFACTS (logs, JSONL, pprof snapshots) — never the driver source
+/soak
+/soak.jsonl
+bench/rigs/aws-soak/results/
+bench/rigs/aws-dramgate/allocs-*.pb.gz
 
 # Claude session rules — private, never push
 CLAUDE.md
