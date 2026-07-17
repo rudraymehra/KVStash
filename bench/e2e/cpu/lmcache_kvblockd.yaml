@@ -1,0 +1,9 @@
+# LMCache config selecting kvblockd as the remote backend (plugin path).
+chunk_size: 256
+local_cpu: true
+remote_url: "kvblockd://127.0.0.1:9440?namespace=lmcache&streams=4"
+remote_storage_plugins: ["kvblockd"]
+extra_config:
+  kvblockd_token: "e2e-token"
+  remote_storage_plugin.kvblockd.module_path: "lmcache_kvblockd.adapter"
+  remote_storage_plugin.kvblockd.class_name: "KvblockdConnectorAdapter"

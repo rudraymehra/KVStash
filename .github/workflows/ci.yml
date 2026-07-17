@@ -74,3 +74,58 @@ jobs:
         run: bash .github/scripts/fuzz-short.sh FuzzParseHeader 90s
       - name: FuzzParseBatch 90s
         run: bash .github/scripts/fuzz-short.sh FuzzParseBatch 90s
+
+  python:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install ruff + kvblockd
+        run: |
+          pip install ruff pytest
+          pip install -e ./python/kvblockd
+      - name: ruff
+        run: ruff check python/
+      - name: pytest kvblockd (protocol + client-vs-daemon + hash parity)
+        env:
+          PYTHONHASHSEED: "0"
+        run: pytest python/kvblockd/tests -q
+
+  python-connector:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install torch (CPU) + deps
+        run: |
+          # pytest is NOT on the pytorch index — install it from PyPI first.
+          pip install pytest numpy blake3 xxhash
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # The connector unit suite FAKES MemoryObj and does not need lmcache
+          # (adapter.py falls back to object); --no-deps keeps CI off the heavy
+          # lmcache/CUDA-torch resolve.
+          pip install --no-deps ./python/kvblockd ./python/lmcache_kvblockd
+      - name: pytest connector (meta + fake-MemoryObj unit suite)
+        env:
+          PYTHONHASHSEED: "0"
+        run: pytest python/lmcache_kvblockd/tests -q

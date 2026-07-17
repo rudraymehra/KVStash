@@ -38,6 +38,11 @@ jobs:
           PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu pip install "lmcache==${{ matrix.version }}"
       - name: check interface
         run: python .github/scripts/check_imports.py --target lmcache
+      - name: adapter imports + instantiates against this LMCache
+        run: |
+          pip install blake3 xxhash
+          pip install --no-deps ./python/kvblockd ./python/lmcache_kvblockd
+          python bench/e2e/cpu/import_check.py
 
   vllm-abi:
     # Best-effort: vLLM CPU install is heavy (~5-15 min) and old versions may not
@@ -60,3 +65,8 @@ jobs:
           PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu pip install "vllm==${{ matrix.version }}"
       - name: check interface
         run: python .github/scripts/check_imports.py --target vllm
+      - name: kvblockd client imports against this vLLM's torch
+        run: |
+          pip install blake3 xxhash
+          pip install --no-deps ./python/kvblockd
+          python -c "import kvblockd; from kvblockd.client import Client"

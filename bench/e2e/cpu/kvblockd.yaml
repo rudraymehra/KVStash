@@ -1,0 +1,8 @@
+# DRAM-only daemon for the CPU e2e. NVMe (Week 6) is invisible to the adapter
+# by design (opaque blocks, tiering behind the verbs).
+listen_addr: "127.0.0.1:9440"
+metrics_addr: "127.0.0.1:9442"
+dram_arena_bytes: 2147483648    # 2 GiB
+pinned_bytes_cap: 268435456     # 256 MiB (must be <= arena)
+eviction_policy: "s3fifo"
+namespaces_path: "bench/e2e/cpu/namespaces.yaml"

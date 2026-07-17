@@ -33,6 +33,10 @@ cmd/xferspike/xferspike
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+python/**/dist/
 
 # mutation-testing artifacts
 report.json

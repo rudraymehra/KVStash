@@ -1,0 +1,2 @@
+{"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both",
+ "kv_connector_extra_config": {"lmcache_config_file": "bench/e2e/cpu/lmcache_kvblockd.yaml"}}

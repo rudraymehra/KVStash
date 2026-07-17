@@ -1,0 +1,2 @@
+namespaces:
+  - { name: lmcache, id: 1, token: e2e-token }

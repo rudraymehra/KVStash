@@ -1,0 +1,94 @@
+name: e2e-cpu
+
+on:
+  schedule:
+    - cron: "0 4 * * 1" # Monday 04:00 UTC
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "python/**"
+      - "internal/protocol/**"
+      - "bench/e2e/cpu/**"
+      - ".github/workflows/e2e-cpu.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: build kvblockd
+        run: go build -o bin/kvblockd ./cmd/kvblockd
+      - name: start daemon (DRAM-only)
+        run: |
+          ./bin/kvblockd -config bench/e2e/cpu/kvblockd.yaml > /tmp/kvbd.log 2>&1 &
+          echo $! > /tmp/kvbd.pid
+          bash scripts/wait-healthz.sh 127.0.0.1:9442 30
+      - name: cache pip + wheels
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: e2e-cpu-${{ hashFiles('bench/e2e/cpu/versions.env') }}
+      - name: install stack
+        run: bash bench/e2e/cpu/install.sh
+      - name: serve vLLM (CPU) + verify
+        env:
+          PYTHONHASHSEED: "0"
+          VLLM_CPU_KVCACHE_SPACE: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          set -o pipefail
+          source bench/e2e/cpu/versions.env
+          vllm serve "$MODEL" --port 18000 --dtype bfloat16 --max-model-len 2048 \
+            --max-num-seqs 1 --no-enable-prefix-caching \
+            --kv-transfer-config "$(cat bench/e2e/cpu/kv_transfer_kvblockd.json)" \
+            > /tmp/vllm.log 2>&1 &
+          echo $! > /tmp/vllm.pid
+          bash scripts/wait-http.sh http://127.0.0.1:18000/health 600
+          python bench/e2e/cpu/verify.py --vllm http://127.0.0.1:18000 --metrics http://127.0.0.1:9442
+      - name: restart vLLM, hits must persist (property d)
+        env:
+          PYTHONHASHSEED: "0"
+          VLLM_CPU_KVCACHE_SPACE: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          set -o pipefail
+          source bench/e2e/cpu/versions.env
+          kill "$(cat /tmp/vllm.pid)" 2>/dev/null || true
+          sleep 3
+          # kvblockd stays up; a fresh vLLM must still hit the cache it wrote.
+          vllm serve "$MODEL" --port 18000 --dtype bfloat16 --max-model-len 2048 \
+            --max-num-seqs 1 --no-enable-prefix-caching \
+            --kv-transfer-config "$(cat bench/e2e/cpu/kv_transfer_kvblockd.json)" \
+            > /tmp/vllm2.log 2>&1 &
+          echo $! > /tmp/vllm.pid
+          bash scripts/wait-http.sh http://127.0.0.1:18000/health 600
+          python bench/e2e/cpu/verify.py --vllm http://127.0.0.1:18000 --metrics http://127.0.0.1:9442 --expect-hits
+      - name: logs
+        if: always()
+        run: |
+          echo "=== daemon ==="; tail -50 /tmp/kvbd.log 2>/dev/null || true
+          echo "=== vllm ==="; tail -50 /tmp/vllm.log 2>/dev/null || true
+          echo "=== vllm (post-restart) ==="; tail -50 /tmp/vllm2.log 2>/dev/null || true
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cpu-logs
+          path: |
+            /tmp/kvbd.log
+            /tmp/vllm.log
+            /tmp/vllm2.log
+          if-no-files-found: ignore
