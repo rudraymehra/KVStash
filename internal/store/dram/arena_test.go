@@ -175,10 +175,21 @@ func TestArenaUnitsRoundTrip(t *testing.T) {
 }
 
 // TestArenaBytesCloseRace pins the TOCTOU fix (a confirmed HIGH): concurrent
-// Bytes and Close must be -race-clean, and every Bytes outcome must be either
-// a valid view or the loud closed-arena panic — never a silent wild slice.
-// (The drain-before-Close contract forbids this shape in production; the test
-// exists so the SAFETY NET itself is race-free.)
+// Bytes vs Close must be -race-clean on the base pointer, and every Bytes
+// outcome must be either a valid view or the loud closed-arena panic — never
+// a silent wild slice fabricated from a torn base (the W3 TOCTOU). The base
+// atomic is the detector: if it were a plain field, -race flags the Bytes
+// read against the Close write; nil-on-close turns a post-Close call into a
+// panic, not a wild slice.
+//
+// The racing goroutine CONSTRUCTS views but never dereferences one that a
+// concurrent Close may have munmap'd — a write/read through an unmapped page
+// is a `fatal error: fault`, uncatchable by recover(), so touching the view
+// mid-munmap would make this test crash-flaky (it did, intermittently, on
+// CI). Production forbids the shape entirely via drain-before-Close;
+// munmap-under-a-live-view being structurally impossible is a future arena
+// refcount change (see arena.go doc), not something this test can safely
+// exercise.
 func TestArenaBytesCloseRace(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		a, err := NewArena(1<<20, false)
@@ -188,13 +199,23 @@ func TestArenaBytesCloseRace(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			defer func() { _ = recover() }() // closed-arena panic is the correct loud outcome
+			defer func() { _ = recover() }() // post-Close call panics — the correct loud outcome
 			for j := 0; j < 100; j++ {
-				seg := a.Bytes(0, 16)
-				seg[0] = byte(j) // write through the view: valid mapping or panic, never wild
+				// Construct the view (the atomic base load -race checks); do
+				// NOT deref it — a concurrent munmap would fault fatally.
+				_ = a.Bytes(0, 16)
 			}
 		}()
 		_ = a.Close()
 		<-done
+		// After Close returns, Bytes is deterministically the loud panic.
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("Bytes on a closed arena did not panic")
+				}
+			}()
+			_ = a.Bytes(0, 16)
+		}()
 	}
 }
