@@ -14,7 +14,7 @@ import (
 // key for the same CacheEngineKey.
 func TestWireKeyGoldenParity(t *testing.T) {
 	path := filepath.Join("..", "..", "python", "kvblockd", "tests", "golden", "hash_chain.json")
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: fixed repo-relative test fixture path
 	if err != nil {
 		t.Skipf("golden vectors not present (%v)", err)
 	}

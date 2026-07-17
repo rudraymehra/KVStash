@@ -23,12 +23,14 @@ var wireKeyDomain = []byte("kvblockd-cek-v1\x00")
 // (fmt, model_name, str(world_size), str(worker_id), str(chunk_hash)).
 func WireKey(fields ...string) [32]byte {
 	h := blake3.New(32, nil)
-	h.Write(wireKeyDomain)
+	// hash.Hash.Write never returns an error (documented contract); the
+	// blank assignments satisfy errcheck without noise.
+	_, _ = h.Write(wireKeyDomain)
 	var lenbuf [4]byte
 	for _, f := range fields {
 		binary.LittleEndian.PutUint32(lenbuf[:], uint32(len(f))) //nolint:gosec // field lengths are small
-		h.Write(lenbuf[:])
-		h.Write([]byte(f))
+		_, _ = h.Write(lenbuf[:])
+		_, _ = h.Write([]byte(f))
 	}
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
