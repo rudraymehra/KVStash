@@ -22,7 +22,7 @@ jobs:
           - func: FuzzParseBatch
             pkg: ./internal/protocol
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: actions/setup-go@v5
