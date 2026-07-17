@@ -117,3 +117,31 @@ func BenchmarkExists_32Keys(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkDelete_32Keys covers the DELETE metadata round trip (§3.7) — the
+// only verb without a benchmark until now — and isolates the per-session
+// status-scratch reuse (statusBuf). Each op re-PUTs then deletes 32 keys so
+// the deletes actually hit; the PUT cost is included (documented), so this is
+// an upper bound on DELETE-only latency, not a pure figure.
+func BenchmarkDelete_32Keys(b *testing.B) {
+	_, c, cleanup := benchServer(b, 4)
+	defer cleanup()
+	ctx := context.Background()
+	keys := make([][32]byte, 32)
+	for i := range keys {
+		binary.LittleEndian.PutUint32(keys[i][:], uint32(i)+1) //nolint:gosec // G115: bench index
+	}
+	blob := []byte("x")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := range keys {
+			if err := c.Put(ctx, keys[j], blob); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if _, err := c.Delete(ctx, keys, false); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
