@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lmcache-kvblockd"
+version = "0.1.0"
+description = "LMCache remote-storage backend backed by kvblockd"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Rudray Mehra", email = "rudraymehra@gmail.com" }]
+dependencies = [
+    "kvblockd>=0.1.0",
+    "lmcache>=0.5.1,<0.6",
+    "numpy",  # zero-copy MemoryObj views via tensor.numpy() (torch does not pull it)
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "torch"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lmcache_kvblockd"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
