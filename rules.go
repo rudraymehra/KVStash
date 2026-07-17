@@ -23,7 +23,9 @@ func wireByteOrder(m dsl.Matcher) {
 // reviewed line-by-line (gosec G103 is globally excluded for that reason).
 // Anywhere else it needs an explicit justification comment and a nolint.
 func unsafeOutsideArena(m dsl.Matcher) {
-	m.Match(`unsafe.Pointer($_)`, `unsafe.Sizeof($_)`, `unsafe.Offsetof($_)`, `unsafe.Alignof($_)`).
+	m.Match(`unsafe.Pointer($_)`, `unsafe.Sizeof($_)`, `unsafe.Offsetof($_)`, `unsafe.Alignof($_)`,
+		`unsafe.Add($_, $_)`, `unsafe.Slice($_, $_)`, `unsafe.SliceData($_)`,
+		`unsafe.String($_, $_)`, `unsafe.StringData($_)`).
 		Where(!m.File().PkgPath.Matches(`store/dram`) && !m.File().Name.Matches(`arena|align|target`)).
 		Report(`unsafe outside the arena/alignment code: justify with a comment + nolint, or move it behind the arena seam`)
 }
