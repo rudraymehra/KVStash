@@ -399,8 +399,11 @@ func TestNegotiateLimits(t *testing.T) {
 		batch, frame                   uint32
 		wantBatch, wantFrame, wantBlob uint32
 	}{
-		{0, 0, DefaultMaxBatchKeys, DefaultMaxFrameLen, DefaultMaxBlobLen},          // no opinion
-		{128, 16 << 20, 128, 16 << 20, 16 << 20},                                    // lower frame → blob clamped under it
+		{0, 0, DefaultMaxBatchKeys, DefaultMaxFrameLen, DefaultMaxBlobLen}, // no opinion
+		// Lower frame → blob clamped under frame MINUS the single-descriptor
+		// GET header (32 B): a frame-sized blob's every GET response frame
+		// would otherwise exceed max_frame_len and be over-cap to the client.
+		{128, 16 << 20, 128, 16 << 20, 16<<20 - uint32(GetRespHeaderSize(1))},       //nolint:gosec // G115: constant 32
 		{1024, 1 << 30, DefaultMaxBatchKeys, DefaultMaxFrameLen, DefaultMaxBlobLen}, // client higher loses; blob unchanged
 	}
 	for i, c := range cases {

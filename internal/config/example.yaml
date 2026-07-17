@@ -5,7 +5,7 @@
 
 listen_addr: ":9440"          # data plane (KVB1 frames)
 admin_addr: "127.0.0.1:9441"  # accepted, not yet served by this build
-metrics_addr: "127.0.0.1:9442" # accepted, not yet served by this build
+metrics_addr: "127.0.0.1:9442" # ops endpoint: /metrics, /healthz, /debug/pprof ("" = disabled)
 
 max_conns: 1024               # global accept cap (cheap DoS floor)
 
@@ -26,3 +26,10 @@ namespaces_path: ""           # namespaces/tokens YAML (required once auth lands
 # benchmark rig; untuned hosts silently clamp (the daemon logs effective sizes).
 sock_sndbuf: 16777216         # 16 MiB
 sock_rcvbuf: 16777216         # 16 MiB
+
+write_chunk_bytes: 1048576    # 1 MiB per writev within a coalesced flush (0 = unchunked)
+
+# DRAM tier (the hot tier: one mmap'd arena + O(1) allocator).
+dram_arena_bytes: 1073741824  # 1 GiB; must hold at least one max_blob_len block
+dram_hugepages: false         # Linux MAP_HUGETLB (needs vm.nr_hugepages); off = THP-eligible
+pinned_bytes_cap: 134217728   # 128 MiB pinned per namespace (§3.6 ERR_PIN_QUOTA); 0 = unlimited

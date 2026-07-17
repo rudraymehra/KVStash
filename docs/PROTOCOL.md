@@ -187,7 +187,7 @@ per-block framing costs nothing and keeps commit atomicity per block). Header
 
 - **BEGIN** payload: `total_len u32 | ttl_ms u32 | xxh3_64_hint u64 (0 if unknown) | flags u32 | reserved u32`. No BEGIN flags are defined in v1: the field MUST be 0 on send and is ignored on receive. `total_len`=0 is legal (an empty block; its GET descriptor is `status=OK, len=0`). Response always sent: `OK` (staging reserved) | `OK_EXISTS` (write-once idempotent hit — client stops sending) | `ERR_QUOTA_BYTES` | `ERR_TOO_LARGE` | `ERR_BUSY`.
 - **CHUNK** payload: raw bytes (recommended 512 KiB–4 MiB per chunk; each ≤ `max_frame_len`). No response per chunk. Chunks for one stream MUST stay on the BEGIN connection, in order; the header `key`+`request_id` route bytes into the staged arena extent with zero body parsing. Zero-length CHUNKs are permitted but do NOT reset the inactivity timer (§5) — an idle client cannot pin staging with free empty frames.
-- **COMMIT** payload: `xxh3_64 u64` (authoritative — client computes while streaming from GPU; overrides hint). Response always sent: `OK` | `ERR_SHORT_STREAM` (bytes ≠ total_len) | `ERR_CHECKSUM` | `ERR_STALE_STREAM` | `OK_EXISTS` (lost a same-key race; server verifies xxh3_64 equality, mismatch → `ERR_IMMUTABLE_CONFLICT`, which with content-derived keys means corruption — alert, never overwrite).
+- **COMMIT** payload: `xxh3_64 u64` (authoritative — client computes while streaming from GPU; overrides hint). Response always sent: `OK` | `ERR_SHORT_STREAM` (bytes ≠ total_len) | `ERR_CHECKSUM` | `ERR_STALE_STREAM` | `OK_EXISTS` (lost a same-key race; server verifies xxh3_64 equality, mismatch → `ERR_IMMUTABLE_CONFLICT`, which with content-derived keys means corruption — alert, never overwrite) | `ERR_BUSY` (rare: the BEGIN-time quota check passed but a competing commit took the last extent; transient — retry, and the fresh BEGIN reports `ERR_QUOTA_BYTES` if the tier is genuinely full).
 - **ABORT** payload: empty. Response always sent, exactly one: `OK` on a live stream (staging freed immediately) | `ERR_STALE_STREAM` on a tombstoned, timed-out, or unknown stream.
 
 ### 3.5 `0x05 TOUCH_LEASE` (sub-ops: 0=TOUCH, 1=LEASE, 2=RELEASE)
@@ -248,7 +248,10 @@ length-prefixed, so the server skips it cleanly).
 
 ```
                     BEGIN
-                      │  quota check, reserve staging extent (total_len, arena)
+                      │  quota check (advisory — no arena bytes reserved;
+                      │  staging allocates lazily as chunks arrive, the
+                      │  anti-amplification posture; a lost commit race
+                      │  answers ERR_BUSY at COMMIT)
         ┌─────────────┼──────────────────────────────┐
    resp OK       resp OK_EXISTS                 resp ERR_*
         │             │                              │

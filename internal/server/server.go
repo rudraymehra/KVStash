@@ -28,6 +28,43 @@ type Store interface {
 	Stats() []byte
 }
 
+// refGetter is the zero-copy read extension an arena-backed store implements:
+// Get plus a release callback the server fires AFTER the transport has
+// written the bytes (WriteFrames' post-writev hook) — the §12
+// hold-until-written rule that stops a concurrent DELETE from recycling the
+// extent under an in-flight response. Optional: ramstub's heap blocks are
+// immortal-until-GC, so it doesn't implement it and the release is nil.
+type refGetter interface {
+	GetRef(ns uint32, key [32]byte) (data []byte, xxh3 uint64, release func(), ok bool)
+}
+
+// lifecycler is the lease/pin extension (§3.5/§3.6). Optional: without it the
+// server answers the pre-tier metadata ack (present→OK, absent→NOT_FOUND).
+type lifecycler interface {
+	TouchLease(ns uint32, key [32]byte, sub uint8, ttlMS uint32) protocol.Status
+	PinOp(ns uint32, key [32]byte, sub uint8) protocol.Status
+}
+
+// quotaChecker is the optional BEGIN-time capacity probe (§3.4 answers
+// ERR_QUOTA_BYTES at BEGIN; §5 "quota check"). Advisory: no reservation is
+// made, so a yes can still lose the commit race (→ ERR_BUSY at COMMIT).
+type quotaChecker interface {
+	CanStore(n uint32) bool
+}
+
+// Recorder observes served requests (the metrics seam, satisfied structurally
+// by internal/metrics — this package never imports Prometheus). A nil
+// recorder costs one branch per event.
+type Recorder interface {
+	// Op is one served request's handling time: decode + store + queue-to-
+	// writer, not the socket flush.
+	Op(op protocol.Opcode, seconds float64)
+	// GetResult is one BATCH_GET's per-key outcomes and payload bytes out.
+	GetResult(ns uint32, hits, misses, bytesOut int)
+	// PutCommitted is one committed block's payload bytes in.
+	PutCommitted(ns uint32, n int)
+}
+
 // Server accepts and serves KVB1 connections.
 type Server struct {
 	cfg    config.Config
@@ -36,10 +73,13 @@ type Server struct {
 	lcfg   transport.Config
 	ln     *transport.Listener
 	logger *slog.Logger
+	rec    Recorder // nil = no metrics
 
 	mu       sync.Mutex
 	draining bool
 	conns    map[*transport.Conn]struct{}
+
+	acceptDone chan struct{} // closed when acceptLoop has fully exited
 }
 
 // New builds a server. cfg supplies the negotiated limits and timeouts; ns is
@@ -50,14 +90,19 @@ func New(cfg config.Config, store Store, ns *Namespaces) *Server {
 	lcfg.RcvBuf = cfg.SockRcvBuf
 	lcfg.WriteChunkBytes = cfg.WriteChunkBytes
 	return &Server{
-		cfg:    cfg,
-		store:  store,
-		ns:     ns,
-		lcfg:   lcfg,
-		logger: slog.Default(),
-		conns:  make(map[*transport.Conn]struct{}),
+		cfg:        cfg,
+		store:      store,
+		ns:         ns,
+		lcfg:       lcfg,
+		logger:     slog.Default(),
+		conns:      make(map[*transport.Conn]struct{}),
+		acceptDone: make(chan struct{}),
 	}
 }
+
+// SetRecorder installs the metrics recorder. Call before Start; the sessions
+// read it without synchronization.
+func (s *Server) SetRecorder(r Recorder) { s.rec = r }
 
 // Start binds the listener (so the address is available immediately, useful
 // with ":0") and runs the accept loop in the background. It returns the bound
@@ -78,18 +123,25 @@ func (s *Server) Start(ctx context.Context) (string, error) {
 	return ln.Addr().String(), nil
 }
 
-// acceptLoop spawns a session per accepted connection until the listener closes.
+// acceptLoop spawns a session per accepted connection until the listener
+// closes. acceptDone closes only after the loop has fully exited — including
+// draining a final connection that Drain's snapshot could not see.
 func (s *Server) acceptLoop(ln *transport.Listener) {
+	defer close(s.acceptDone)
 	for {
 		sess := newSession(s)
 		conn, err := ln.Accept(sess, sess)
 		if err != nil {
 			return // listener closed (ctx cancel or Drain)
 		}
-		// track reports false if Drain has already started; then this conn is
-		// not in the drain set, so close it here rather than leak it.
+		// track reports false if Drain has already started; this conn is
+		// invisible to Drain's snapshot (its loops are ALREADY running and
+		// may have served pipelined requests holding arena views), so it
+		// must be closed AND fully drained here, before acceptDone lets
+		// Drain — and the store Close behind it — proceed.
 		if !s.track(conn) {
 			_ = conn.Close()
+			<-conn.Done()
 			return
 		}
 		sess.bind(conn)
@@ -131,9 +183,12 @@ func (s *Server) reapOnClose(c *transport.Conn) {
 }
 
 // Drain stops accepting and closes every live connection, waiting up to
-// timeout for them to finish. It closes the listener first so no new
-// connections arrive.
-func (s *Server) Drain(ctx context.Context) {
+// ctx's deadline for them to finish. It closes the listener first so no new
+// connections arrive, and waits for acceptLoop to exit (covering a final
+// connection its snapshot could not see). It reports whether EVERY
+// connection finished: false means writers may still hold store views —
+// the caller MUST NOT close/unmap the store (the drain-before-Close rule).
+func (s *Server) Drain(ctx context.Context) (drained bool) {
 	if s.ln != nil {
 		_ = s.ln.Close()
 	}
@@ -152,7 +207,15 @@ func (s *Server) Drain(ctx context.Context) {
 		select {
 		case <-c.Done():
 		case <-ctx.Done():
-			return
+			return false
 		}
 	}
+	if s.ln != nil { // Start ran: acceptLoop is live and must fully exit
+		select {
+		case <-s.acceptDone:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return true
 }

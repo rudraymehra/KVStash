@@ -390,9 +390,11 @@ func IntersectFeatures(client, server uint64) uint64 {
 // carries only the client's max_batch_keys and max_frame_len proposals
 // (blob/credit are server-dictated); a client value of 0 means "no opinion".
 // Callers guarantee the server side already satisfies the §4 floors
-// (config.Validate's job). MaxBlobLen is clamped under the negotiated frame:
-// otherwise a client proposing a small frame could store a blob (chunked PUT,
-// each chunk ≤ frame) that no single GET response frame could ever return.
+// (config.Validate's job). MaxBlobLen is clamped under the negotiated frame
+// MINUS the single-descriptor GET response header: otherwise a blob equal to
+// the frame cap could be stored (chunked PUT, each chunk ≤ frame) whose every
+// GET response frame — payload plus the 32-byte header region — would exceed
+// max_frame_len and be rejected as over-cap by a conformant client parser.
 func NegotiateLimits(server Limits, clientBatchKeys, clientFrameLen uint32) Limits {
 	l := server
 	if clientBatchKeys != 0 && clientBatchKeys < l.MaxBatchKeys {
@@ -401,8 +403,8 @@ func NegotiateLimits(server Limits, clientBatchKeys, clientFrameLen uint32) Limi
 	if clientFrameLen != 0 && clientFrameLen < l.MaxFrameLen {
 		l.MaxFrameLen = clientFrameLen
 	}
-	if l.MaxBlobLen > l.MaxFrameLen {
-		l.MaxBlobLen = l.MaxFrameLen
+	if headroom := uint32(GetRespHeaderSize(1)); l.MaxBlobLen > l.MaxFrameLen-headroom { //nolint:gosec // G115: constant 32
+		l.MaxBlobLen = l.MaxFrameLen - headroom
 	}
 	return l
 }

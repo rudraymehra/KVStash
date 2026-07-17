@@ -24,9 +24,9 @@ import (
 type Config struct {
 	// ListenAddr is the data-plane TCP listener ("host:port").
 	ListenAddr string `yaml:"listen_addr"`
-	// AdminAddr and MetricsAddr are accepted for schema stability but not yet
-	// served by this build (the admin/metrics surfaces land with the metrics
-	// package); the daemon logs them as configured-but-inactive.
+	// MetricsAddr serves the ops endpoint (/metrics, /healthz, /debug/pprof);
+	// empty disables it. AdminAddr is accepted for schema stability but not
+	// yet served (the admin surface is a later week).
 	AdminAddr   string `yaml:"admin_addr"`
 	MetricsAddr string `yaml:"metrics_addr"`
 
@@ -60,6 +60,17 @@ type Config struct {
 	// within a coalesced flush (0 = unchunked). ~1 MiB keeps the kernel
 	// copy pipeline overlapped with the receiver; see transport.Config.
 	WriteChunkBytes int `yaml:"write_chunk_bytes"`
+
+	// DramArenaBytes sizes the DRAM tier's arena mapping (the hot-tier block
+	// capacity). It must hold at least one max_blob_len block.
+	DramArenaBytes int64 `yaml:"dram_arena_bytes"`
+	// DramHugepages requests explicit hugepages for the arena (Linux
+	// MAP_HUGETLB; falls back to THP-eligible mappings elsewhere — see
+	// the dram arena docs).
+	DramHugepages bool `yaml:"dram_hugepages"`
+	// PinnedBytesCap caps per-namespace pinned bytes (§3.6 ERR_PIN_QUOTA);
+	// 0 = unlimited.
+	PinnedBytesCap int64 `yaml:"pinned_bytes_cap"`
 }
 
 // Overrides are the command-line flags an operator actually needs at launch;
@@ -89,6 +100,8 @@ func Default() Config {
 		SockSndBuf:      16 << 20,
 		SockRcvBuf:      16 << 20,
 		WriteChunkBytes: 1 << 20,
+		DramArenaBytes:  1 << 30,   // 1 GiB hot tier
+		PinnedBytesCap:  128 << 20, // 128 MiB per namespace
 	}
 }
 
@@ -107,6 +120,30 @@ var envTable = []struct {
 			return fmt.Errorf("KVBLOCKD_MAX_CONNS: %w", err)
 		}
 		c.MaxConns = n
+		return nil
+	}},
+	{"KVBLOCKD_DRAM_ARENA_BYTES", func(c *Config, v string) error {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("KVBLOCKD_DRAM_ARENA_BYTES: %w", err)
+		}
+		c.DramArenaBytes = n
+		return nil
+	}},
+	{"KVBLOCKD_DRAM_HUGEPAGES", func(c *Config, v string) error {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("KVBLOCKD_DRAM_HUGEPAGES: %w", err)
+		}
+		c.DramHugepages = b
+		return nil
+	}},
+	{"KVBLOCKD_PINNED_BYTES_CAP", func(c *Config, v string) error {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("KVBLOCKD_PINNED_BYTES_CAP: %w", err)
+		}
+		c.PinnedBytesCap = n
 		return nil
 	}},
 }
@@ -204,6 +241,11 @@ func (c Config) Validate() error {
 	check(c.SockSndBuf >= 0, "sock_sndbuf %d: must be >= 0 (0 = OS default)", c.SockSndBuf)
 	check(c.SockRcvBuf >= 0, "sock_rcvbuf %d: must be >= 0 (0 = OS default)", c.SockRcvBuf)
 	check(c.WriteChunkBytes >= 0, "write_chunk_bytes %d: must be >= 0 (0 = unchunked)", c.WriteChunkBytes)
+	check(c.DramArenaBytes > 0, "dram_arena_bytes %d: must be > 0", c.DramArenaBytes)
+	check(c.DramArenaBytes >= int64(c.MaxBlobLen),
+		"dram_arena_bytes %d: must hold at least one max_blob_len (%d) block", c.DramArenaBytes, c.MaxBlobLen)
+	check(c.PinnedBytesCap >= 0 && c.PinnedBytesCap <= c.DramArenaBytes,
+		"pinned_bytes_cap %d: must be in [0, dram_arena_bytes %d]", c.PinnedBytesCap, c.DramArenaBytes)
 
 	return errors.Join(errs...)
 }

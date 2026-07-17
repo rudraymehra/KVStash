@@ -25,7 +25,7 @@ func (s *session) writeResp2(c *transport.Conn, h protocol.Header, bufs net.Buff
 	resp := protocol.Header{
 		Opcode:      h.Opcode,
 		Flags:       protocol.FlagResp,
-		NamespaceID: h.NamespaceID,
+		NamespaceID: s.respNS(h),
 		RequestID:   h.RequestID,
 	}
 	_ = c.WriteFrames(resp, bufs, release)
@@ -101,6 +101,14 @@ func (s *session) putBegin(c *transport.Conn, h protocol.Header, body []byte) {
 		s.respondStatus(c, h, protocol.StatusErrTooLarge)
 		return
 	}
+	// §3.4/§5: the quota check lives at BEGIN. Advisory (no arena bytes are
+	// reserved — staging stays lazy per the DoS posture): a yes can still
+	// lose the commit race, which maps to a retryable ERR_BUSY there.
+	if qc, ok := s.srv.store.(quotaChecker); ok && !qc.CanStore(b.TotalLen) {
+		s.tombstone(h.RequestID, h.Key)
+		s.respondStatus(c, h, protocol.StatusErrQuotaBytes)
+		return
+	}
 	if s.liveStreamCount() >= maxLiveStreams {
 		// Too many concurrent streams on this connection: backpressure, don't
 		// allocate. No tombstone (the id was never accepted).
@@ -111,6 +119,7 @@ func (s *session) putBegin(c *transport.Conn, h protocol.Header, body []byte) {
 		ns:         s.ns,
 		key:        h.Key,
 		totalLen:   b.TotalLen,
+		ttlMS:      b.TTLms,
 		xxh3Hint:   b.XXH3Hint,
 		lastActive: nowFn(),
 		// buf and digest are nil: both are allocated lazily on the FIRST
@@ -214,6 +223,25 @@ func (s *session) putCommit(c *transport.Conn, h protocol.Header, body []byte) {
 		return
 	}
 	status := s.srv.store.Put(st.ns, st.key, buf, sum)
+	if status == protocol.StatusErrQuotaBytes {
+		// The BEGIN-time quota check said yes but a competing commit won the
+		// last extent: §3.4 keeps ERR_QUOTA_BYTES out of COMMIT's response
+		// set, so this rare race maps to the retryable ERR_BUSY — the
+		// client's fresh BEGIN then reports the honest quota answer.
+		status = protocol.StatusErrBusy
+	}
+	if status == protocol.StatusOK {
+		if r := s.srv.rec; r != nil {
+			r.PutCommitted(st.ns, len(buf))
+		}
+		// §3.4: ttl_ms from BEGIN takes effect at commit (0 = no TTL until
+		// namespace defaults land with tenancy).
+		if st.ttlMS > 0 {
+			if lc, ok := s.srv.store.(lifecycler); ok {
+				_ = lc.TouchLease(st.ns, st.key, protocol.TouchRecency, st.ttlMS)
+			}
+		}
+	}
 	s.respondStatus(c, h, status)
 }
 

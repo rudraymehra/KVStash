@@ -71,25 +71,24 @@ func (s *session) handleHello(c *transport.Conn, h protocol.Header, body []byte)
 }
 
 // decodeKeys decodes the shared key-list body into the reusable scratch,
-// returning the keys (aliasing scratch) and the aux u32. On a body error it
-// consumes the frame, answers the mapped status, and returns ok=false.
-func (s *session) decodeKeys(c *transport.Conn, h protocol.Header, body []byte) (keys [][32]byte, ok bool) {
-	// aux (the second u32) is ttl_ms for TOUCH_LEASE; the current metadata
-	// no-op ignores it, so it is discarded here.
-	_, keys, err := protocol.DecodeKeyList(body, s.limits.MaxBatchKeys, s.keyScratch[:0])
+// returning the keys (aliasing scratch) and the aux u32 (ttl_ms for
+// TOUCH_LEASE; reserved-zero elsewhere). On a body error it consumes the
+// frame, answers the mapped status, and returns ok=false.
+func (s *session) decodeKeys(c *transport.Conn, h protocol.Header, body []byte) (aux uint32, keys [][32]byte, ok bool) {
+	aux, keys, err := protocol.DecodeKeyList(body, s.limits.MaxBatchKeys, s.keyScratch[:0])
 	s.keyScratch = keys[:0] // keep the grown backing array for the next batch
 	s.consume(c, h, body)
 	if err != nil {
 		s.respondStatus(c, h, protocol.ErrorStatus(err))
-		return nil, false
+		return 0, nil, false
 	}
-	return keys, true
+	return aux, keys, true
 }
 
 // handleBatchExists serves the consecutive-prefix probe from the store index
 // (§3.2). The bitmap is included only when FEAT_EXISTS_BITMAP was negotiated.
 func (s *session) handleBatchExists(c *transport.Conn, h protocol.Header, body []byte) {
-	keys, ok := s.decodeKeys(c, h, body)
+	_, keys, ok := s.decodeKeys(c, h, body)
 	if !ok {
 		return
 	}
@@ -107,12 +106,26 @@ func (s *session) handleBatchExists(c *transport.Conn, h protocol.Header, body [
 // A single block always fits a frame (max_blob_len ≤ max_frame_len, clamped at
 // negotiation), so greedy packing never wedges.
 func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []byte) {
-	keys, ok := s.decodeKeys(c, h, body)
+	_, keys, ok := s.decodeKeys(c, h, body)
 	if !ok {
 		return
 	}
+	// Zero-copy stores hand out per-block release callbacks that must fire
+	// after the kernel accepts THIS frame's writev (the §12 hold-until-written
+	// rule); heap stores (ramstub) don't implement refGetter and release nil.
+	rg, hasRefs := s.srv.store.(refGetter)
+
 	maxFrame := int(s.limits.MaxFrameLen)
 	total := len(keys)
+	if total == 0 {
+		// §3.2 note: an empty batch still gets a well-formed count=0
+		// response — silence would wedge the request id forever.
+		region := protocol.AppendGetRespHeader(make([]byte, 0, protocol.GetRespHeaderSize(0)),
+			protocol.StatusOK, 0, 0, nil)
+		s.writeRespFlags(c, h, protocol.FlagResp, net.Buffers{region}, nil)
+		return
+	}
+	var nHits, nMisses, bytesOut int
 	for i := 0; i < total; {
 		// descScratch is reused across frames and requests: AppendGetRespHeader
 		// (below) serializes it into the region bytes synchronously, so it is
@@ -120,10 +133,21 @@ func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []by
 		// recycle, unlike region/bufs themselves.
 		descs := s.descScratch[:0]
 		bufs := net.Buffers{nil} // iov[0] placeholder for the header region
+		// releases is FRESH per frame (never scratch): the combined closure is
+		// captured by the async writer and fires after the flush.
+		var releases []func()
 		payloadBytes := 0
 		j := i
 		for j < total {
-			data, sum, hit := s.srv.store.Get(s.ns, keys[j])
+			var data []byte
+			var sum uint64
+			var hit bool
+			var rel func()
+			if hasRefs {
+				data, sum, rel, hit = rg.GetRef(s.ns, keys[j])
+			} else {
+				data, sum, hit = s.srv.store.Get(s.ns, keys[j])
+			}
 			blen := 0
 			var d protocol.Desc
 			if hit {
@@ -136,12 +160,27 @@ func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []by
 			// keep at least one descriptor per frame so progress is guaranteed.
 			projected := protocol.GetRespHeaderSize(len(descs)+1) + payloadBytes + blen
 			if len(descs) > 0 && projected > maxFrame {
+				if rel != nil {
+					rel() // block not packed into this frame; re-fetched next frame
+				}
 				break
 			}
 			descs = append(descs, d)
 			if hit {
-				bufs = append(bufs, data)
-				payloadBytes += blen
+				if blen > 0 { // a zero-length block is descriptor-only (§3.4)
+					bufs = append(bufs, data)
+					payloadBytes += blen
+				}
+				nHits++
+				bytesOut += blen
+				if rel != nil {
+					releases = append(releases, rel)
+				}
+			} else {
+				nMisses++
+				if rel != nil {
+					rel() // defensive: a miss never hands out a release
+				}
 			}
 			j++
 		}
@@ -153,21 +192,35 @@ func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []by
 		if j < total {
 			flags |= protocol.FlagMore
 		}
-		s.writeRespFlags(c, h, flags, bufs)
+		// Fold this frame's per-block releases into ONE closure for the writer.
+		var frameRelease func()
+		if len(releases) > 0 {
+			rels := releases
+			frameRelease = func() {
+				for _, r := range rels {
+					r()
+				}
+			}
+		}
+		s.writeRespFlags(c, h, flags, bufs, frameRelease)
 		i = j
+	}
+	if r := s.srv.rec; r != nil {
+		r.GetResult(s.ns, nHits, nMisses, bytesOut)
 	}
 }
 
-// writeRespFlags queues a response frame with explicit flags (the F_MORE split
-// path); echoes opcode/namespace/request_id.
-func (s *session) writeRespFlags(c *transport.Conn, h protocol.Header, flags uint16, bufs net.Buffers) {
+// writeRespFlags queues a response frame with explicit flags (the F_MORE
+// split path); echoes opcode/namespace/request_id. release (may be nil) fires
+// once after the kernel accepts the frame — the arena-refcount drop.
+func (s *session) writeRespFlags(c *transport.Conn, h protocol.Header, flags uint16, bufs net.Buffers, release func()) {
 	resp := protocol.Header{
 		Opcode:      h.Opcode,
 		Flags:       flags,
-		NamespaceID: h.NamespaceID,
+		NamespaceID: s.respNS(h),
 		RequestID:   h.RequestID,
 	}
-	_ = c.WriteFrames(resp, bufs, nil)
+	_ = c.WriteFrames(resp, bufs, release)
 }
 
 // statusBuf returns the per-session per-key-status scratch sized to n. The
@@ -181,35 +234,48 @@ func (s *session) statusBuf(n int) []protocol.Status {
 	return s.statusScratch[:n]
 }
 
-// handleKeyStatusVerb serves TOUCH_LEASE and PIN as metadata acks (§3.5/§3.6):
-// ramstub has no lease/pin state yet, so every present key is OK and every
-// absent key NOT_FOUND. Real semantics arrive with the tiers.
+// handleKeyStatusVerb serves TOUCH_LEASE and PIN (§3.5/§3.6). A lifecycle-
+// aware store (the DRAM tier) gets the real semantics — sub-op dispatch,
+// ttl_ms from the key-list aux, ERR_PIN_QUOTA; a store without the
+// lifecycler extension (ramstub) answers the pre-tier metadata ack
+// (present→OK, absent→NOT_FOUND).
 func (s *session) handleKeyStatusVerb(c *transport.Conn, h protocol.Header, body []byte) {
 	if protocol.SubOp(h.Flags) > protocol.Unpin { // TOUCH/LEASE/RELEASE and PIN/UNPIN sub-ops are 0..2
 		s.consume(c, h, body)
 		s.respondStatus(c, h, protocol.StatusErrUnsupported)
 		return
 	}
-	keys, ok := s.decodeKeys(c, h, body)
+	ttlMS, keys, ok := s.decodeKeys(c, h, body)
 	if !ok {
 		return
 	}
+	lc, hasLifecycle := s.srv.store.(lifecycler)
+	sub := protocol.SubOp(h.Flags)
 	perKey := s.statusBuf(len(keys))
 	for i, k := range keys {
-		if s.srv.store.Contains(s.ns, k) {
-			perKey[i] = protocol.StatusOK
-		} else {
-			perKey[i] = protocol.StatusNotFound
+		switch {
+		case !hasLifecycle:
+			// Pre-tier metadata ack: present→OK, absent→NOT_FOUND.
+			if s.srv.store.Contains(s.ns, k) {
+				perKey[i] = protocol.StatusOK
+			} else {
+				perKey[i] = protocol.StatusNotFound
+			}
+		case h.Opcode == protocol.OpTouchLease:
+			perKey[i] = lc.TouchLease(s.ns, k, sub, ttlMS)
+		default: // OpPin
+			perKey[i] = lc.PinOp(s.ns, k, sub)
 		}
 	}
 	out := protocol.AppendKeyStatusResp(make([]byte, 0, protocol.PreambleSize+len(perKey)+8), perKey)
 	s.writeResp(c, h, out)
 }
 
-// handleDelete removes each key (§3.7). ramstub has no lease/pin protection, so
-// F_FORCE is a no-op and every present key deletes.
+// handleDelete removes each key (§3.7). The store gates each delete
+// (ERR_LEASED / ERR_PINNED on the DRAM tier; ramstub is ungated) and
+// F_FORCE overrides leases and soft pins — never a hard pin.
 func (s *session) handleDelete(c *transport.Conn, h protocol.Header, body []byte) {
-	keys, ok := s.decodeKeys(c, h, body)
+	_, keys, ok := s.decodeKeys(c, h, body)
 	if !ok {
 		return
 	}

@@ -318,6 +318,60 @@ func (c *Client) Delete(ctx context.Context, keys [][32]byte, force bool) (perKe
 	return perKey, nil
 }
 
+// TouchLease drives the §3.5 lifecycle sub-ops: sub is protocol.TouchRecency
+// (recency bump + TTL extend), protocol.LeaseGrant, or protocol.LeaseRelease.
+// ttlMS rides the key-list aux field (0 = server default; the server clamps to
+// its lease_max). Returns the per-key statuses.
+func (c *Client) TouchLease(ctx context.Context, keys [][32]byte, sub uint8, ttlMS uint32) (perKey []protocol.Status, err error) {
+	return c.keyStatusVerb(ctx, protocol.OpTouchLease, sub, ttlMS, keys)
+}
+
+// Pin drives the §3.6 sub-ops: protocol.PinSoft, protocol.PinHard, or
+// protocol.Unpin. Returns the per-key statuses (ERR_PIN_QUOTA when the
+// namespace's pinned-bytes cap is exhausted).
+func (c *Client) Pin(ctx context.Context, keys [][32]byte, sub uint8) (perKey []protocol.Status, err error) {
+	return c.keyStatusVerb(ctx, protocol.OpPin, sub, 0, keys)
+}
+
+// keyStatusVerb issues a key-list request whose response is the shared
+// per-key-status shape (TOUCH_LEASE and PIN — DELETE differs only in using
+// F_FORCE instead of a sub-op, and keeps its own method for that reason).
+func (c *Client) keyStatusVerb(ctx context.Context, op protocol.Opcode, sub uint8, aux uint32, keys [][32]byte) (perKey []protocol.Status, err error) {
+	if uint32(len(keys)) > c.limits.MaxBatchKeys { //nolint:gosec // G115: len vs u32 cap
+		return nil, fmt.Errorf("client: %d keys exceeds negotiated max_batch_keys %d", len(keys), c.limits.MaxBatchKeys)
+	}
+	cn, err := c.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { c.release(cn, err) }()
+
+	reqBody := protocol.AppendKeyList(cn.reqBuf(), aux, keys)
+	cn.keepReq(reqBody)
+	if err = cn.writeFrame(op, protocol.WithSubOp(0, sub), [32]byte{}, cn.id(), reqBody); err != nil {
+		return nil, err
+	}
+	body, err := cn.readFrame()
+	if err != nil {
+		return nil, err
+	}
+	p, raw, err := protocol.DecodeKeyStatusResp(body)
+	if err != nil {
+		return nil, err
+	}
+	if p.Status != protocol.StatusOK {
+		return nil, &StatusError{Op: op, Status: p.Status}
+	}
+	if len(raw) != len(keys) {
+		return nil, fmt.Errorf("client: opcode 0x%02x returned %d statuses for %d keys", uint8(op), len(raw), len(keys))
+	}
+	perKey = make([]protocol.Status, len(raw))
+	for i, s := range raw {
+		perKey[i] = protocol.Status(s)
+	}
+	return perKey, nil
+}
+
 // Stats fetches the server's JSON stats document (§3.8).
 func (c *Client) Stats(ctx context.Context) (doc []byte, err error) {
 	cn, err := c.get(ctx)

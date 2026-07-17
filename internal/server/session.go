@@ -43,6 +43,7 @@ type putStream struct {
 	ns           uint32
 	key          [32]byte
 	totalLen     uint32
+	ttlMS        uint32 // §3.4 BEGIN ttl_ms; applied at commit (0 = no TTL)
 	xxh3Hint     uint64
 	buf          []byte
 	digest       *xxh3.Hasher // streaming hasher, allocated only for MULTI-chunk streams
@@ -97,6 +98,14 @@ func (s *session) Return(b []byte) { transport.Poison(b) }
 // Grants its payload bytes exactly once (via consume) — the credit-conservation
 // contract the transport relies on.
 func (s *session) HandleFrame(c *transport.Conn, h protocol.Header, body []byte) {
+	// Record REQUESTS (frames that produce a response), not raw frames: a
+	// PUT CHUNK or NOP would otherwise flood kvb_op_seconds{put_stream}
+	// with sub-microsecond samples and drown the BEGIN/COMMIT signal.
+	if r := s.srv.rec; r != nil && h.Opcode != protocol.OpNop &&
+		(h.Opcode != protocol.OpPutStream || protocol.SubOp(h.Flags) != protocol.PutChunk) {
+		start := time.Now()
+		defer func() { r.Op(h.Opcode, time.Since(start).Seconds()) }()
+	}
 	if !s.authed {
 		if h.Opcode != protocol.OpHello {
 			// Pre-auth traffic is one of the three connection-fatal things (§9).
@@ -172,6 +181,16 @@ var statusPreambles = func() (t [256][protocol.PreambleSize]byte) {
 
 func (s *session) respondStatus(c *transport.Conn, h protocol.Header, status protocol.Status) {
 	s.writeResp(c, h, statusPreambles[status][:])
+}
+
+// respNS is the namespace id echoed on responses: the AUTHENTICATED id once
+// HELLO bound one (a lying client gets the truth back, not its lie echoed),
+// the request's own field before auth (the HELLO reject path).
+func (s *session) respNS(h protocol.Header) uint32 {
+	if s.authed {
+		return s.ns
+	}
+	return h.NamespaceID
 }
 
 // writeResp queues a single-slice response frame echoing the request's

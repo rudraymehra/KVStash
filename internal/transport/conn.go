@@ -100,10 +100,15 @@ func startConn(nc net.Conn, bs BufferSource, h FrameHandler, cfg Config) *Conn {
 	go func() { defer wg.Done(); c.writeLoop() }()
 	go func() {
 		wg.Wait()
-		// Both loops have exited. The read goroutine is the sole producer of
-		// release-bearing writeReqs (handlers call WriteFrames on it), so once
-		// it is gone no more can be enqueued: this final drain fires every
-		// release exactly once, closing the writer-death strand window.
+		// Both loops have exited. Close the socket here unconditionally: the
+		// writeLoop's flush-failure exits return WITHOUT reaching the
+		// closed-branch nc.Close, which would leak the fd until GC (the
+		// double-close on the normal path is a harmless ErrClosed).
+		_ = c.nc.Close()
+		// The read goroutine is the sole producer of release-bearing
+		// writeReqs (handlers call WriteFrames on it), so once it is gone no
+		// more can be enqueued: this final drain fires every release exactly
+		// once, closing the writer-death strand window.
 		c.finalDrain()
 		conserveCheck(&c.credit) // no-op unless built with -tags kvbdebug
 		close(c.done)
@@ -363,7 +368,7 @@ func (c *Conn) writeLoop() {
 				select {
 				case r := <-c.wq:
 					reqs = append(reqs[:0], r)
-					if !c.flushBy(hdrArena, reqs, &iovs, deadline) {
+					if !c.flushBy(hdrArena, reqs, &iovs, deadline, false) {
 						_ = c.nc.Close()
 						return
 					}
@@ -382,15 +387,15 @@ func (c *Conn) flush(hdrArena []byte, reqs []writeReq, iovs *net.Buffers, timeou
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)
 	}
-	return c.flushBy(hdrArena, reqs, iovs, deadline)
+	return c.flushBy(hdrArena, reqs, iovs, deadline, true)
 }
 
 // flushBy emits one writev for the batch against an absolute deadline (zero =
 // none). iovecs alternate marshalled headers (from the per-flush arena) and
 // payload slices; the first header carries any pending credit grant. Releases
 // fire after WriteTo returns, success or error (§12). Returns false on write
-// failure.
-func (c *Conn) flushBy(hdrArena []byte, reqs []writeReq, iovs *net.Buffers, deadline time.Time) bool {
+// failure. capOnClose: see the closed re-check below.
+func (c *Conn) flushBy(hdrArena []byte, reqs []writeReq, iovs *net.Buffers, deadline time.Time, capOnClose bool) bool {
 	buf := (*iovs)[:0]
 	for i := range reqs {
 		if i == 0 {
@@ -407,6 +412,24 @@ func (c *Conn) flushBy(hdrArena []byte, reqs []writeReq, iovs *net.Buffers, dead
 
 	if !deadline.IsZero() {
 		_ = c.nc.SetWriteDeadline(deadline)
+	}
+	if capOnClose {
+		// Close() pokes the deadline so a stalled writer unblocks — but the
+		// arm above can RE-ARM it (dequeue-before-Close, arm-after-poke: an
+		// ordinary race), leaving a drain to wait out the full stall window
+		// (2×stream_timeout) under a peer that stopped reading. Re-check
+		// after arming and CAP a post-close write at the 1s closed-drain
+		// budget: a healthy peer still receives the final frames (the §9
+		// fatal report rides this), a stalled one unblocks the drain in ~1s
+		// — comfortably inside the server's shutdown window. The closed-
+		// branch drain passes false: its own deadline IS that budget.
+		select {
+		case <-c.closed:
+			if d := time.Now().Add(time.Second); deadline.IsZero() || d.Before(deadline) {
+				_ = c.nc.SetWriteDeadline(d)
+			}
+		default:
+		}
 	}
 	// WriteTo advances its receiver as it consumes iovecs, so hand it a COPY of
 	// the slice header — otherwise *iovs would be left pointing at the end of
