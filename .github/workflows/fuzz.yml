@@ -1,8 +1,7 @@
 name: fuzz
 
+# Cost: long fuzz + model-soak are dispatch-only while the repo is private (heavy Actions minutes); run before a release/demo.
 on:
-  schedule:
-    - cron: "0 2 * * 0" # Sunday 02:00 UTC
   workflow_dispatch: {}
 
 permissions:

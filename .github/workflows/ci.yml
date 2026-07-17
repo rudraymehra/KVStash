@@ -1,9 +1,15 @@
 name: ci
 
+# Cost note: the repo is PRIVATE, so Actions minutes bill (macOS at 10×).
+# Push-time CI runs ubuntu only; the macOS cross-check runs on a weekly cron
+# + manual dispatch. Flip back to per-push macОS when the repo goes public.
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # Monday 06:00 UTC — the weekly macOS cross-check
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -39,10 +45,7 @@ jobs:
           govulncheck ./...
 
   test:
-    strategy:
-      matrix:
-        os: [ubuntu-24.04, macos-14]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -59,6 +62,25 @@ jobs:
         run: go test -race -short -count=1 -tags kvbdebug ./internal/...
       - name: modeltest (race, kvbdebug, elevated checks — the I1–I5 harness)
         run: go test -race -count=1 -tags kvbdebug -run TestStoreModel ./internal/store/modeltest -rapid.checks=200
+
+  # macOS cross-check: weekly + on demand only (10× billing on a private repo).
+  test-macos:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: false
+      - name: build
+        run: go build ./...
+      - name: test (race)
+        run: go test -race -short -count=1 ./...
+      - name: test (race, kvbdebug)
+        run: go test -race -short -count=1 -tags kvbdebug ./internal/...
 
   fuzz-short:
     runs-on: ubuntu-24.04
