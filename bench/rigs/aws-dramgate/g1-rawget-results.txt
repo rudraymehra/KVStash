@@ -1,0 +1,4 @@
+=== G1 honest pairs: rawget same-shape ceiling | getbench vs DRAM daemon ===
+pair 1: rawget: streams=8 hot=false chunk=1048576: 27.25 GB/s (272.5 GB in 10s) | streams=8 batch=32x1024KiB pool=4096 (4096MiB): 26.42 GB/s (264.2 GB in 10s)
+pair 2: rawget: streams=8 hot=false chunk=1048576: 27.28 GB/s (272.8 GB in 10s) | streams=8 batch=32x1024KiB pool=4096 (4096MiB): 26.18 GB/s (261.8 GB in 10s)
+pair 3: rawget: streams=8 hot=false chunk=1048576: 27.41 GB/s (274.1 GB in 10s) | streams=8 batch=32x1024KiB pool=4096 (4096MiB): 26.31 GB/s (263.1 GB in 10s)

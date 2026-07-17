@@ -1,0 +1,14 @@
+=== box: 16 vCPU, 30 GiB, 6.1.176-221.360.amzn2023.x86_64 ===
+=== G1: interleaved pairs (xferspike ceiling | getbench vs DRAM daemon), 4 GiB working set ===
+pair 1: ceiling 54.65 GB/s | streams=8 batch=32x1024KiB pool=4096 (4096MiB): 26.85 GB/s (268.5 GB in 10s)
+pair 2: ceiling 54.56 GB/s | streams=8 batch=32x1024KiB pool=4096 (4096MiB): 26.92 GB/s (269.2 GB in 10s)
+pair 3: ceiling 54.74 GB/s | streams=8 batch=32x1024KiB pool=4096 (4096MiB): 27.16 GB/s (271.6 GB in 10s)
+=== G3: allocs profile under a 40s GET storm (15s capture) ===
+ok
+ <- healthz
+streams=8 batch=32x1024KiB pool=4096 (4096MiB): 26.79 GB/s (1071.8 GB in 40s)
+=== G2: 512-key EXISTS p99 under 8 GET lanes, 60s (in-process daemon) ===
+2026/07/17 10:46:49 INFO transport: socket buffers effective_snd=33554432 effective_rcv=33554432
+    exists_latency_test.go:183: EXISTS under 8 GET lanes (1m0s window): 1200855 samples, p50=160.662µs p99=704.95µs p99.9=1.392893ms; 571391 GET batches (2285564 MiB served)
+--- PASS: TestExistsLatencyUnderGetLoad (60.23s)
+PASS

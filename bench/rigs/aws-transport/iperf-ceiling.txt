@@ -1,8 +1,8 @@
 == -P 8 ==
-49.5 Gbit/s
+75.3 Gbit/s
 == -P 16 ==
-49.8 Gbit/s
+99.1 Gbit/s
 == -P 32 ==
-49.8 Gbit/s
+99.8 Gbit/s
 == -P 64 ==
-49.8 Gbit/s
+99.8 Gbit/s

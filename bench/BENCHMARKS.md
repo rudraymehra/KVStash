@@ -44,6 +44,29 @@ go build -o /tmp/getbench ./bench/kvbench/getbench
 go run ./bench/microbench/rawget -streams 4 -secs 3   # GET shape
 ```
 
+## DRAM tier, same-host (c7i.4xlarge, AL2023 — the `aws-dramgate` rig)
+
+The first run with the real tier behind the wire (mmap arena + O(1)
+allocator + 256-shard index + refcounted zero-copy GET), replacing the RAM
+stub. Interleaved pairs against the same-shape `rawget` ceiling, 4 GiB
+working set, verify-off:
+
+| pair | rawget ceiling | kvblockd (DRAM tier) | ratio |
+|---|---:|---:|---:|
+| 1 | 27.25 GB/s | 26.42 GB/s | 0.97 |
+| 2 | 27.28 GB/s | 26.18 GB/s | 0.96 |
+| 3 | 27.41 GB/s | 26.31 GB/s | 0.96 |
+
+The full stack — protocol, auth, credit, descriptors, index, refcounts,
+lease grants, release-after-writev — costs ~3–4% over a raw socket moving
+the same bytes. Same box, same session: 512-key BATCH_EXISTS p99 = 705 µs
+under 8 saturated GET lanes (1.2 M samples / 60 s), and the 15 s allocation
+profile under the storm shows zero per-request blob-band heap allocations
+(GET-path objects are 24–896 B; the only 2 MiB sites are one-time
+per-connection receive buffers). xferspike prints 54.7 GB/s on this box —
+a one-way hot-buffer blast, a different shape; quoted for scale, never as
+the ceiling (see Honesty notes).
+
 ## THE HEADLINE — 100 GbE (c7gn.8xlarge pair, us-east-1)
 
 **kvblockd serves KV-cache blocks at 12.67 GB/s (101.4 Gbit/s) over a real

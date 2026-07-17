@@ -355,3 +355,42 @@ goalpost does not move.
 formal 1h-per-target gate is the Day-7 item. **PUT_STREAM invariants**
 (invisible-until-COMMIT, ERR_CHECKSUM, exactly-one-response incl. ABORT,
 OK_EXISTS idempotency) covered by server tests; goleak clean.
+
+## Week 3 — the DRAM tier (arena + allocator + index + lifecycle)
+
+<!-- RUDRAY: prose first per the Merge Rule — write this section from memory
+     (arena layout & prefault, the OffsetAllocator port and where it diverges
+     from Aaltonen's C++, index sharding + maphash seeding, BlockRef field
+     semantics, the lease/pin/TTL ladder ordering table, two-phase visibility,
+     copy-at-commit and why stage-in-arena was rejected this week, the GET
+     refcount/release path through WriteFrames) — THEN fact-check against the
+     code and replace the measured-numbers block below with your own reading
+     of the gate logs. The numbers here are the raw results for you to
+     interpret, not prose to copy. -->
+
+**Measured gate results (Day 6).** All three gates are same-host relative;
+the recorded venue is Linux (c7i.4xlarge, 16 vCPU AL2023 — the `aws-dramgate`
+rig); the Mac runs are the dev-box sanity check.
+
+| gate | Mac (8-core M-series, dev box) | Linux c7i.4xlarge (recorded) |
+|---|---|---|
+| G1: getbench ÷ same-shape ceiling, ≥0.9× | 0.98 / 1.02 / 1.09 (3 interleaved pairs, 768 MiB set) | **0.97 / 0.96 / 0.96 — PASS** (rawget ceiling 27.3–27.4, kvblockd 26.2–26.4 GB/s, 4 GiB set) |
+| G2: 512-key EXISTS p99 under 8 GET lanes, <1 ms | 4.6 ms — 8-core oversubscription (2-lane control: 697 µs) | **p99 = 705 µs — PASS** (1.2 M samples, 60 s, GET lanes serving ~37 GB/s throughout) |
+| G3: blob-band (0.4–2.5 MB) alloc sites on the GET path | ZERO (only 256 B/896 B header-region objects; 220 GB served, 33 MB total heap alloc in 15 s) | **ZERO per-request — PASS** (~400 GB through the 15 s window, 46 MB heap alloc total; only per-CONNECTION one-time 2 MiB `Lend` recycle buffers + pprof's own writer touch the band) |
+
+G1 note (the Week-2 ruling reapplied): xferspike is a one-way hot-buffer
+blast — a different shape. On the Mac the two shapes coincide (memory-bound
+either way); on the 16-vCPU box they diverge (xferspike prints 54.7 GB/s).
+The binding ceiling is `bench/microbench/rawget` — the same request→response
+GET shape on raw sockets with no protocol/auth/checksums. "≥0.9× the
+same-shape ceiling; the goalpost does not move."
+
+PUT staging remains on the Go heap by the locked copy-at-commit decision
+(the Week-2-reviewed DoS posture: lazy, capped, tombstoned); it IS a
+blob-band alloc site and is the documented exception until the Week-4+
+arena Reservation API removes the copy. The GET path — the 99% path — is
+allocation-free in the blob band.
+
+**Week-3 ladder outcome (FULL, 5 stages + Opus diversity breaker, 4 refuters — all HIGH+ findings confirmed).** Fixed pre-push: spec-legal empty blocks were rejected ERR_QUOTA_BYTES (now extent-less, conformance-tested both stores); soft pins wrongly debited the §3.6 hard-pin quota (now: charge only on transition into hard, upgrade passes the gate, downgrade refunds); arena-full COMMIT emitted ERR_QUOTA_BYTES outside §3.4's frozen set (now: advisory BEGIN capacity check answers it there; the rare commit race maps to retryable ERR_BUSY — §3.4/§5 amended one line each); a drain-timeout could munmap the arena under an in-flight writev (transport now caps post-close writes at the 1s drain budget, Drain reports success/failure, main skips the unmap on timeout); CanEvict required refcount==0 and was structurally false for every resident block (now the refcount==1 indexed-block pre-filter, race-audited); daemon deadlocked on startup errors with metrics enabled (defer order); BEGIN ttl_ms was silently dropped (now applied at commit; no wire-observable effect until the evictor — review-covered, not behavior-testable yet); max_blob_len==max_frame_len made frame-cap blobs unreadable (negotiation now reserves the 32 B GET-header headroom); plain dram Get returned an arena view after release (now copies — the wire path uses GetRef and never pays it); a writeLoop flush-failure leaked the socket fd.
+
+**Known ceilings (documented, deliberate):** PUT staging stays heap-side (copy-at-commit; the reviewed DoS posture) until the Week-4+ reservation API. The allocator node pool caps at 2^17 live blocks regardless of arena size (Allocation.Meta's 18 slot bits) — irrelevant at the 1 GiB default, binds first on ≥8 GiB arenas of small blocks; widening Meta is scheduled with the evictor. kvb_hits_total hardcodes tier="dram" until the Recorder seam carries a tier. TouchLease can land on a ref a concurrent Delete just removed (client sees OK for a lease on a dead block — memory-safe, pre-existing, evictor-week item).
