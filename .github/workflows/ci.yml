@@ -69,6 +69,6 @@ jobs:
           go-version: "1.26"
           cache: false
       - name: FuzzParseHeader 90s
-        run: go test -fuzz='^FuzzParseHeader$' -fuzztime=90s ./internal/protocol
+        run: bash .github/scripts/fuzz-short.sh FuzzParseHeader 90s
       - name: FuzzParseBatch 90s
-        run: go test -fuzz='^FuzzParseBatch$' -fuzztime=90s ./internal/protocol
+        run: bash .github/scripts/fuzz-short.sh FuzzParseBatch 90s
