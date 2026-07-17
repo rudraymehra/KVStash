@@ -12,8 +12,9 @@ const (
 )
 
 // Pin flag bits (PinFlags). NOT atomic: every mutation happens under the
-// owning index shard's write lock (Pin/Unpin/Delete all take it). TODO(week4):
-// the lock-free evictor path will need PinFlags atomic — flip it then.
+// owning index shard's write lock (Pin/Unpin/Delete all take it), and the
+// evictor reads them only inside its DeleteIf gate — also under the shard
+// write lock — so the non-atomic representation stays correct by design.
 const (
 	pinSoftBit = 1 << 0
 	pinHardBit = 1 << 1
@@ -102,8 +103,9 @@ func (r *BlockRef) HardPinned() bool { return r.PinFlags&pinHardBit != 0 }
 // It is a pre-filter, not the free gate — the safe-to-free mechanism stays
 // the whichever-Release-hits-zero rule, so a reader that Acquires between
 // this check and the removal is still safe (its release frees the extent).
-// The quota-emergency mode (soft-pinned blocks become eligible, §6 ladder)
-// is a Week-4 parameter, deliberately absent from this form.
+// evictOne's DeleteIf gate calls this; the quota-emergency widening (soft
+// pins become eligible, §6) is the gate's own extra branch, deliberately
+// absent from this normal-pressure form.
 func (r *BlockRef) CanEvict(now int64) bool {
 	return r.Refcount.Load() == 1 && !r.Leased(now) && !r.Pinned()
 }

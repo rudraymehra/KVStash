@@ -2,6 +2,7 @@ package dram
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kvstash/kvblockd/internal/protocol"
@@ -16,26 +17,30 @@ import (
 // Leases and TTLs are atomics on the BlockRef (readers race freely); pin
 // flags mutate only under the index shard lock (Index.WithShardLock).
 
-// lifeNow is the lifecycle clock (unix nanos), swappable in tests.
-var lifeNow = func() int64 { return time.Now().UnixNano() }
-
 // lifecycle owns the lease/pin/TTL rules plus the per-namespace pinned-bytes
 // accounting (the Week-3 slice of tenancy: the cap check and ERR_PIN_QUOTA
 // exist now; the full quota machinery is a later week).
 type lifecycle struct {
 	leaseDefaultMS uint32
 	leaseMaxMS     uint32
-	pinnedCap      int64 // per-namespace pinned-bytes cap (0 = unlimited)
+	pinnedCap      int64        // per-namespace pinned-bytes cap (0 = unlimited)
+	now            func() int64 // instance clock (unix nanos) — Params.Now seam
 
 	mu     sync.Mutex // guards pinned (cold path: pin/unpin/delete only)
 	pinned map[uint32]int64
+
+	// ttlBlocks counts blocks whose TTLUntil is set — the evictor's hint to
+	// skip the full-index expired sweep entirely in TTL-free workloads
+	// (a hint, not a gate: an unnecessary sweep is only wasted work).
+	ttlBlocks atomic.Int64
 }
 
-func newLifecycle(leaseDefaultMS, leaseMaxMS uint32, pinnedCap int64) *lifecycle {
+func newLifecycle(leaseDefaultMS, leaseMaxMS uint32, pinnedCap int64, now func() int64) *lifecycle {
 	return &lifecycle{
 		leaseDefaultMS: leaseDefaultMS,
 		leaseMaxMS:     leaseMaxMS,
 		pinnedCap:      pinnedCap,
+		now:            now,
 		pinned:         make(map[uint32]int64),
 	}
 }
@@ -54,29 +59,61 @@ func (l *lifecycle) clampLeaseMS(ttlMS uint32) uint32 {
 
 // GrantReadLease is the §3.3 auto-lease every OK GET carries: the block
 // cannot be evicted or reclaimed mid-transfer or before the client finishes
-// copying. One atomic store on the hot path.
-func (l *lifecycle) GrantReadLease(ref *BlockRef) {
-	now := lifeNow()
-	ref.LeaseUntil.Store(now + int64(l.leaseDefaultMS)*int64(time.Millisecond))
+// copying. Returns the now it drew so the caller can reuse the same instant
+// (the policy Touch hook) without a second clock read.
+//
+// The grant is MONOTONIC (extendLease): leases are grant/extend semantics
+// (§3.5; RELEASE is the only shortening op), so a 5s auto-grant must never
+// TRUNCATE a live 60s explicit lease — the eviction protection a client
+// paid for would silently evaporate on its own read.
+func (l *lifecycle) GrantReadLease(ref *BlockRef) int64 {
+	now := l.now()
+	extendLease(ref, now+int64(l.leaseDefaultMS)*int64(time.Millisecond))
 	ref.LastAccess.Store(now)
+	return now
+}
+
+// extendLease raises LeaseUntil to at least until (never lowers it).
+func extendLease(ref *BlockRef, until int64) {
+	for {
+		cur := ref.LeaseUntil.Load()
+		if cur >= until {
+			return
+		}
+		if ref.LeaseUntil.CompareAndSwap(cur, until) {
+			return
+		}
+	}
 }
 
 // Touch (§3.5 sub-op 0) bumps recency and, with ttlMS>0, extends the TTL.
 // Metadata-only: never triggers restores, never grants leases.
 func (l *lifecycle) Touch(ref *BlockRef, ttlMS uint32) {
-	now := lifeNow()
+	now := l.now()
 	ref.LastAccess.Store(now)
 	if ttlMS > 0 {
-		ref.TTLUntil.Store(now + int64(ttlMS)*int64(time.Millisecond))
+		if ref.TTLUntil.Swap(now+int64(ttlMS)*int64(time.Millisecond)) == 0 {
+			l.ttlBlocks.Add(1) // first TTL on this block
+		}
+	}
+}
+
+// noteTTLGone decrements the TTL hint when a TTL-bearing block leaves the
+// index (delete/evict).
+func (l *lifecycle) noteTTLGone(ref *BlockRef) {
+	if ref.TTLUntil.Load() != 0 {
+		l.ttlBlocks.Add(-1)
 	}
 }
 
 // Lease (§3.5 sub-op 1) grants/extends the eviction-protection lease —
 // the same mechanism GET auto-grants, with an explicit clamped duration.
+// Monotonic like the auto-grant: "grants/extends", never shortens (RELEASE
+// is the shortening op).
 func (l *lifecycle) Lease(ref *BlockRef, ttlMS uint32) {
 	d := l.clampLeaseMS(ttlMS)
-	now := lifeNow()
-	ref.LeaseUntil.Store(now + int64(d)*int64(time.Millisecond))
+	now := l.now()
+	extendLease(ref, now+int64(d)*int64(time.Millisecond))
 	ref.LastAccess.Store(now)
 }
 
@@ -155,7 +192,7 @@ func (l *lifecycle) canDelete(ref *BlockRef, force bool) protocol.Status {
 	if force {
 		return protocol.StatusOK
 	}
-	if ref.Leased(lifeNow()) {
+	if ref.Leased(l.now()) {
 		return protocol.StatusErrLeased
 	}
 	if ref.Pinned() { // soft (hard handled above)

@@ -196,6 +196,10 @@ func NewAllocatorMax(size, maxAllocs uint32) *Allocator {
 	return newAllocator(size, maxAllocs)
 }
 
+// MaxAllocs reports the effective live-allocation budget after the Meta
+// slot-field clamp — the evictor's node-pool watermark denominator.
+func (a *Allocator) MaxAllocs() uint32 { return a.maxAllocs }
+
 // newAllocator lets tests shrink the node pool to force exhaustion.
 func newAllocator(size, maxAllocs uint32) *Allocator {
 	a := &Allocator{size: size, maxAllocs: maxAllocs}

@@ -8,14 +8,12 @@ import (
 	"github.com/kvstash/kvblockd/internal/protocol"
 )
 
-// pinClock pins the lifecycle clock for a test and restores it on cleanup.
-func pinClock(t *testing.T, start int64) *int64 {
-	t.Helper()
+// testClock builds an instance clock pinned at start: pass the func to
+// newLifecycle (the Params.Now seam) and advance time through the pointer.
+// No global state — tests parallelize safely.
+func testClock(start int64) (func() int64, *int64) {
 	cur := start
-	old := lifeNow
-	lifeNow = func() int64 { return cur }
-	t.Cleanup(func() { lifeNow = old })
-	return &cur
+	return func() int64 { return cur }, &cur
 }
 
 func msToNanos(ms int64) int64 { return ms * int64(time.Millisecond) }
@@ -77,8 +75,8 @@ func TestBlockRefAcquireRelease(t *testing.T) {
 // TestLeaseTTLExpiry pins Leased/Expired against the fake clock, including
 // the lease clamp and the lazy-expiry rule.
 func TestLeaseTTLExpiry(t *testing.T) {
-	clk := pinClock(t, msToNanos(1_000_000))
-	l := newLifecycle(5000, 60000, 0)
+	nowFn, clk := testClock(msToNanos(1_000_000))
+	l := newLifecycle(5000, 60000, 0, nowFn)
 	ref := &BlockRef{}
 
 	// Auto-lease: 5s default.
@@ -122,8 +120,8 @@ func TestLeaseTTLExpiry(t *testing.T) {
 
 // TestDeleteGatingTruthTable pins the §3.7 matrix exactly.
 func TestDeleteGatingTruthTable(t *testing.T) {
-	pinClock(t, msToNanos(1_000_000))
-	l := newLifecycle(5000, 60000, 0)
+	nowFn, _ := testClock(msToNanos(1_000_000))
+	l := newLifecycle(5000, 60000, 0, nowFn)
 
 	cases := []struct {
 		name       string
@@ -173,8 +171,8 @@ func TestDeleteGatingTruthTable(t *testing.T) {
 // per-namespace cap (soft pins are quota-free), every transition into hard
 // passes the gate (incl. soft→hard upgrades), and leaving hard refunds.
 func TestPinQuota(t *testing.T) {
-	pinClock(t, msToNanos(1_000_000))
-	l := newLifecycle(5000, 60000, 1000) // 1000-byte cap
+	nowFn, _ := testClock(msToNanos(1_000_000))
+	l := newLifecycle(5000, 60000, 1000, nowFn) // 1000-byte cap
 
 	a := &BlockRef{NamespaceID: 7, Len: 600}
 	b := &BlockRef{NamespaceID: 7, Len: 600}
@@ -227,8 +225,8 @@ func TestPinQuota(t *testing.T) {
 // The idle case is the load-bearing row — an idle, unleased, unpinned
 // resident block MUST be evictable, else the Week-4 evictor finds nothing.
 func TestCanEvictLadder(t *testing.T) {
-	clk := pinClock(t, msToNanos(1_000_000))
-	l := newLifecycle(5000, 60000, 0)
+	nowFn, clk := testClock(msToNanos(1_000_000))
+	l := newLifecycle(5000, 60000, 0, nowFn)
 
 	ref := &BlockRef{Len: 10}
 	ref.Refcount.Store(1) // resident: the index's own reference
@@ -266,7 +264,7 @@ func TestCanEvictLadder(t *testing.T) {
 // TestIndexBasics: put/get/delete/lost-race + ExistsPrefix parity + expired-
 // still-present, with aggregate-only assertions (never shard placement).
 func TestIndexBasics(t *testing.T) {
-	clk := pinClock(t, msToNanos(1_000_000))
+	_, clk := testClock(msToNanos(1_000_000))
 	idx := NewIndex()
 	k := func(b byte) Key { var h [32]byte; h[0] = b; return Key{NS: 1, Hash: h} }
 
