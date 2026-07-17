@@ -65,6 +65,27 @@ func main() {
 		}
 	}
 
+	// Guard against the write-once-reuse artifact: if this daemon already held
+	// these keys at a DIFFERENT block size (a prior getbench run at another
+	// -block-kib), our Put silently returned OK_EXISTS and the store still has
+	// the OLD size — but total is credited at the NEW size, inflating GB/s
+	// (this is how a stale daemon once produced a physically-impossible reading).
+	// Fetch key 0 and require the stored length to match; refuse to report a
+	// bogus number.
+	{
+		probe := make([][]byte, 1)
+		if _, err := c.BatchGet(ctx, pkeys[:1], probe); err != nil {
+			fmt.Fprintln(os.Stderr, "probe get:", err)
+			c.Close()
+			os.Exit(1) //nolint:gocritic
+		}
+		if len(probe[0]) != sz {
+			fmt.Fprintf(os.Stderr, "stale daemon: key 0 stored at %d bytes, want %d — restart the daemon before a different -block-kib\n", len(probe[0]), sz)
+			c.Close()
+			os.Exit(1) //nolint:gocritic
+		}
+	}
+
 	var total atomic.Int64
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
