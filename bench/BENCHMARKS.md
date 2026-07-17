@@ -44,7 +44,24 @@ go build -o /tmp/getbench ./bench/kvbench/getbench
 go run ./bench/microbench/rawget -streams 4 -secs 3   # GET shape
 ```
 
-## REAL-NIC gate (c6in.8xlarge pair, 50 GbE, us-east-1) — the quotable number
+## THE HEADLINE — 100 GbE (c7gn.8xlarge pair, us-east-1)
+
+**kvblockd serves KV-cache blocks at 12.67 GB/s (101.4 Gbit/s) over a real
+100 GbE network — ~102% of the iperf3 ceiling (99.8 Gbit/s), with end-to-end
+xxh3 integrity ON.** The project's "10+ GB/s" target, measured, not projected.
+
+| streams | verify ON | % of ceiling |
+|--------:|----------:|-------------:|
+| 16 | 7.91 GB/s | 63% |
+| 32 | 12.54 | 100.5% |
+| 64 | 12.61 | 101.1% |
+| 96 | **12.67** | **~102%** |
+
+verify OFF is identical (12.68 at 96) — integrity is free on a real network.
+Graviton c7gn delivered wire saturation at half the x86 vCPU/price. Run ~$2,
+teardown $0-residue verified.
+
+## REAL-NIC gate (c6in.8xlarge pair, 50 GbE, us-east-1) — the first cloud run
 
 Loopback is a dev sanity check; this is the real one. iperf3 link ceiling
 **49.8 Gbit/s (6.23 GB/s)**. Over the private 50 GbE link:

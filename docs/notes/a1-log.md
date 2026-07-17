@@ -86,3 +86,28 @@ out on a real NIC, exactly inverse to loopback (where it declined).
    retires the loopback verify-gap concern for real deployments.
 
 Raw data: `bench/rigs/aws-transport/{iperf-ceiling.txt,xferspike-results.jsonl}`.
+
+## 100 GbE VERDICT — the 10+ GB/s headline (2026-07-17, c7gn.8xlarge pair)
+
+Rig: 2× c7gn.8xlarge (Graviton, 32 vCPU, 100 Gbps NIC each — half the vCPUs and
+price of the x86 equivalent; node A landed on spot), cluster placement group,
+same ESnet/BBR/MTU-9001 tuning, arm64 cross-builds. ~25 min, ~$2, $0 residue.
+
+**iperf3 link ceiling: 99.8 Gbit/s = 12.48 GB/s** (-P 32/64).
+
+**kvblockd GET (full daemon, verify ON) over the private 100 GbE link:**
+| streams | GB/s | Gbit/s | % of ceiling |
+|--------:|-----:|-------:|-------------:|
+| 16 | 7.91 | 63.3 | 63% |
+| 32 | 12.54 | 100.3 | 100.5% |
+| 64 | 12.61 | 100.9 | 101.1% |
+| 96 | **12.67** | **101.4** | **~102%** |
+
+verify OFF at 64/96 streams: 12.60 / 12.68 — **identical to verify ON** again.
+
+**THE PROJECT'S HEADLINE NUMBER, MEASURED: kvblockd serves KV-cache blocks at
+12.67 GB/s over a real 100 GbE network — >10 GB/s with end-to-end xxh3
+integrity on, saturating the wire (~102% of what iperf3 itself achieves).**
+Both A1 findings replicate at 2× the bandwidth: NIC-bound not code-bound, and
+verification is free on a real network. c7gn note for future rigs: Graviton
+delivered the same saturation at half the x86 vCPU/price point.

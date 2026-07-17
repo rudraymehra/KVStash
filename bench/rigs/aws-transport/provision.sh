@@ -6,6 +6,9 @@ set -euo pipefail
 
 REGION="${REGION:-us-east-1}"
 ITYPE="${ITYPE:-c6in.8xlarge}"
+# CPU arch of the AMI — x86_64 (c6in etc.) or arm64 (c7gn Graviton, which
+# offers 100 Gbps at half the vCPUs/price of the x86 equivalent).
+ARCH="${ARCH:-x86_64}"
 PG="${PG:-kvbench-transport-pg}"
 SG="${SG:-kvbench-transport-sg}"
 KEY="${KEY:-kvbench}"          # EC2 key pair name (create once: aws ec2 create-key-pair)
@@ -20,7 +23,7 @@ echo "[provision] region=$REGION type=$ITYPE"
 
 # Amazon Linux 2023 x86_64 AMI (SSM public parameter — always current).
 AMI=$(aws ssm get-parameter --region "$REGION" \
-  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --name "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-${ARCH}" \
   --query Parameter.Value --output text)
 
 # Cluster placement group = instances physically close = max network throughput.
