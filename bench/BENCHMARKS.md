@@ -6,6 +6,25 @@ the real gate (per `docs/notes/a1-log.md`). Every number here is a *ratio
 against a same-shape ceiling* where one exists; absolute GB/s on a laptop
 varies ±15% with thermal state.
 
+## Improvements this optimization pass (before → after)
+
+Deterministic metrics (allocs, ns — thermal-stable) and throughput *ratios*
+(laptop absolute GB/s swings ±20% run-to-run, so ratios are the honest claim):
+
+| metric | before | after | how |
+|---|---|---|---|
+| GET throughput ÷ same-shape raw-socket ceiling | ~0.7× | **~0.97×** (parity) | writev windowing + sidecar-overlapped verify + tuning |
+| PUT memory/op | 3.1 MB | **1.05 MB** (−66%) | ownership-transfer commit + first-chunk exact-cap staging |
+| PUT allocs/op | 32 | **29** | single-chunk one-shot digest + zero-alloc status preambles |
+| EXISTS pipelined (depth-16 vs 1) | synchronous | **~5.8×** (23.5→4.0 µs) | in-order request pipelining |
+| ExistsPrefix, no-bitmap prefix-miss | 723 ns | **28 ns (~24×)** | early-exit at first miss |
+| EXISTS allocs/op | 18 | **9** | per-conn request-scratch reuse |
+
+Not improved, honestly: GET absolute GB/s (already at the kernel copy ceiling —
+needs the real NIC rig); codec ns (in-place-descriptor candidate measured
+*slower*, rejected). Also fixed this pass: 3 HIGH bugs (tombstone-Hasher memory
+DoS, lendBuf credit-window pin, client deadlocks), 1 CI flake, panel MED/LOW.
+
 ## How to reproduce
 
 ```
