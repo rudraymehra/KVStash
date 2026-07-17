@@ -31,3 +31,4 @@ __pycache__/
 
 # mutation-testing artifacts
 report.json
+bench/rigs/*/.rig-state

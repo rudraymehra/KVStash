@@ -55,3 +55,34 @@ Deferred (not blocking A1; scheduled):
 - **[MED] socket buffers set post-handshake** — for the cloud %iperf3 run, either set via `ListenConfig.Control`/`Dialer.Control` (setsockopt before connect) or rely on kernel autotune and treat `-sndbuf/-rcvbuf` as loopback-only. Decide in the aws-transport rig.
 - **[LOW] server memory amplification** (alloc up to max-frame before body) — firewall the cloud bind to the client IP; acceptable for a rig.
 - **[LOW] bytes_total includes 16B header** (wire throughput, not goodput) — negligible at ≥1 MiB frames; report goodput separately if ever needed.
+
+## CLOUD VERDICT — the real A1 gate (2026-07-17, c6in.8xlarge pair, us-east-1, 50 GbE)
+
+Rig: 2× c6in.8xlarge, cluster placement group, ESnet sysctls + BBR + jumbo MTU 9001.
+On-demand pair (spot at capacity), ~35 min, teardown verified $0 residue.
+
+**iperf3 link ceiling: 49.8 Gbit/s = 6.23 GB/s** (best of -P 8/16/32/64).
+
+**xferspike (transport proxy) sweep — best 64 streams × 4 MiB:**
+6.267 GB/s = **50.13 Gbit/s = 100.6% of the iperf3 ceiling**, at **0.79 CPU cores**.
+Throughput RISES with stream count (8→64) — the parallel-streams thesis proves
+out on a real NIC, exactly inverse to loopback (where it declined).
+
+**kvblockd (the actual daemon, not the proxy) GET over the private 50 GbE link:**
+| streams | verify ON | verify OFF |
+|--------:|----------:|-----------:|
+| 8  | 4.70 GB/s | — |
+| 16 | 6.26 | 6.25 |
+| 32 | 6.29 | 6.29 |
+| 64 | **6.37 (51.0 Gbit/s = ~102% of ceiling)** | 6.38 |
+
+**A1 GATE: PASS.** ≥12 GB/s loopback (14.1 recorded) AND ≥85% of iperf3 ceiling
+(hit ~100–102%). Two headline findings:
+1. **kvblockd saturates a 50 GbE NIC end to end** (6.37 GB/s) with the full
+   protocol + store + integrity path — NIC-bound, not CPU- or code-bound.
+2. **xxh3 verification is FREE on a real network** (verify ON == OFF, 6.37 vs
+   6.38) — it overlaps network latency. The ~12% verify cost seen on loopback
+   was a loopback-only artifact (no network latency to hide behind). This
+   retires the loopback verify-gap concern for real deployments.
+
+Raw data: `bench/rigs/aws-transport/{iperf-ceiling.txt,xferspike-results.jsonl}`.

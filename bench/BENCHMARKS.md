@@ -44,7 +44,25 @@ go build -o /tmp/getbench ./bench/kvbench/getbench
 go run ./bench/microbench/rawget -streams 4 -secs 3   # GET shape
 ```
 
-## GET (read path) — the headline
+## REAL-NIC gate (c6in.8xlarge pair, 50 GbE, us-east-1) — the quotable number
+
+Loopback is a dev sanity check; this is the real one. iperf3 link ceiling
+**49.8 Gbit/s (6.23 GB/s)**. Over the private 50 GbE link:
+
+| path | throughput | vs iperf3 ceiling | CPU |
+|---|---:|---:|---:|
+| xferspike (transport proxy), 64×4 MiB | 6.27 GB/s | **~100%** | 0.79 cores |
+| **kvblockd GET, verify ON, 64 streams** | **6.37 GB/s (51.0 Gbit/s)** | **~102%** | — |
+| kvblockd GET, verify OFF, 64 streams | 6.38 GB/s | ~102% | — |
+
+**kvblockd saturates the 50 GbE NIC end-to-end** (full protocol + store +
+integrity), NIC-bound not code-bound. Throughput RISES with streams (8→64:
+4.70→6.37) — the parallel-streams thesis, opposite to loopback. **xxh3 verify
+is FREE on a real network** (ON == OFF) — it overlaps network latency; the ~12%
+loopback verify cost was a loopback-only artifact. A1 gate PASS (≥12 GB/s
+loopback [14.1] AND ≥85% of ceiling [~100%]). Run cost ~$2, $0 residue.
+
+## GET (read path) — the headline (loopback)
 
 **The claim is a RATIO, not an absolute.** Absolute GB/s on this laptop swings
 ±20% run-to-run under sustained load (the raw-socket ceiling itself ranged
