@@ -100,9 +100,10 @@ func (cn *conn) readGetInto(keys [][32]byte, into [][]byte, verify bool) ([]prot
 	// The sidecar only reads into[slot] contents the reader has finished with
 	// and never touches conn state; verifyWait joins it before return.
 	var verifyCh chan verifyJob
-	verifyErr := make(chan error, 1)
+	var verifyErr chan error
 	if verify {
 		verifyCh = make(chan verifyJob, 32)
+		verifyErr = make(chan error, 1)
 		go func() {
 			var err error
 			for j := range verifyCh {

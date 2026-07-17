@@ -136,14 +136,28 @@ func (s *session) putChunk(c *transport.Conn, h protocol.Header, body []byte) {
 	default:
 		if st.buf == nil {
 			// First real chunk: reserve EXACTLY total_len (no append slack to
-			// pin for the block's lifetime) and start the running digest. Bound
-			// by total_len ≤ max_blob_len and the per-conn staging cap above.
+			// pin for the block's lifetime). Bound by total_len ≤ max_blob_len
+			// and the per-conn staging cap above.
 			st.buf = make([]byte, 0, st.totalLen)
-			st.digest = xxh3.New()
 		}
 		st.buf = append(st.buf, body...)
-		_, _ = st.digest.Write(body) // hash while the chunk is cache-hot (never errors)
 		st.received += h.PayloadLen
+		switch {
+		case st.digest != nil:
+			// Already a multi-chunk stream: keep feeding the streaming hasher.
+			_, _ = st.digest.Write(body)
+		case st.received == st.totalLen:
+			// This chunk completed the block on the FIRST arrival — the common
+			// single-chunk case. One-shot hash the cache-hot buffer; no
+			// *xxh3.Hasher (~1.2 KiB) is ever allocated.
+			st.oneShot = xxh3.Hash(st.buf)
+		default:
+			// A partial first chunk: this is a multi-chunk stream after all.
+			// Allocate the streaming hasher and seed it with the bytes so far;
+			// later chunks feed it above (cache-hot per chunk, still one pass).
+			st.digest = xxh3.New()
+			_, _ = st.digest.Write(st.buf)
+		}
 		s.stagedBytes += int64(h.PayloadLen)
 		st.lastActive = nowFn()
 	}
@@ -177,13 +191,16 @@ func (s *session) putCommit(c *transport.Conn, h protocol.Header, body []byte) {
 		s.respondStatus(c, h, protocol.StatusErrShortStream)
 		return
 	}
-	// The running digest already covered every staged byte in arrival order —
-	// Sum64 is O(1) here, versus re-reading the whole block from DRAM. A stream
-	// that committed with total_len==0 never allocated a digest; its canonical
-	// empty-input hash is the constant below.
+	// The digest already covered every staged byte, cache-hot as chunks landed
+	// (no re-read from DRAM at commit). Three cases: a multi-chunk stream has a
+	// streaming Hasher; a single-chunk stream has the one-shot sum; a
+	// total_len==0 stream hashed nothing → the canonical empty-input hash.
 	got := emptyXXH3
-	if st.digest != nil {
+	switch {
+	case st.digest != nil:
 		got = st.digest.Sum64()
+	case st.received > 0:
+		got = st.oneShot
 	}
 	if got != sum {
 		s.respondStatus(c, h, protocol.StatusErrChecksum)

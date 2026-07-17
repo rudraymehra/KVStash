@@ -59,6 +59,13 @@ func (s *Store) ExistsPrefix(ns uint32, keys [][32]byte, withBitmap bool) (nCons
 	}
 	consecutiveDone := false
 	for i, k := range keys {
+		// Without a bitmap the caller wants only n_consecutive, so once the
+		// prefix chain is broken there is nothing left to compute — skip the
+		// remaining shard lookups entirely. (With a bitmap every key's status
+		// is required, so we must probe them all.)
+		if consecutiveDone && !withBitmap {
+			break
+		}
 		bk := blockKey{ns: ns, key: k}
 		sh := s.shard(bk)
 		sh.mu.RLock()

@@ -111,3 +111,32 @@ func TestStats(t *testing.T) {
 		t.Fatalf("stats: %s", doc)
 	}
 }
+
+// BenchmarkExistsPrefix_FirstMiss measures the no-bitmap early-exit: 64 keys
+// where key[0] is present but key[1] misses — n_consecutive is 1 and the
+// remaining 62 probes are skippable. withBitmap=true must still probe all 64.
+func BenchmarkExistsPrefix_FirstMiss(b *testing.B) {
+	s := New()
+	keys := make([][32]byte, 64)
+	for i := range keys {
+		keys[i][0] = byte(i)
+		keys[i][1] = byte(i >> 8)
+	}
+	s.Put(1, keys[0], []byte("x"), 1) // only the first key present
+	b.Run("noBitmap", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if n, _ := s.ExistsPrefix(1, keys, false); n != 1 {
+				b.Fatalf("n=%d", n)
+			}
+		}
+	})
+	b.Run("withBitmap", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if n, _ := s.ExistsPrefix(1, keys, true); n != 1 {
+				b.Fatalf("n=%d", n)
+			}
+		}
+	})
+}

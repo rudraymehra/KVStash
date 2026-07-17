@@ -44,7 +44,8 @@ type putStream struct {
 	totalLen     uint32
 	xxh3Hint     uint64
 	buf          []byte
-	digest       *xxh3.Hasher
+	digest       *xxh3.Hasher // streaming hasher, allocated only for MULTI-chunk streams
+	oneShot      uint64       // single-chunk digest (digest stays nil — no Hasher alloc)
 	received     uint32
 	tombstoned   bool // BEGIN rejected / OK_EXISTS / reaped: consume chunks, fail COMMIT
 	lastActive   time.Time
