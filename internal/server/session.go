@@ -24,9 +24,10 @@ type session struct {
 	limits protocol.Limits
 	feats  uint64
 
-	keyScratch  [][32]byte      // reused across batch decodes on the read goroutine
-	descScratch []protocol.Desc // reused across GET frames (consumed synchronously into the header region)
-	lendBuf     []byte          // reusable Lend extent (see Lend for the safety invariant)
+	keyScratch    [][32]byte        // reused across batch decodes on the read goroutine
+	descScratch   []protocol.Desc   // reused across GET frames (consumed synchronously into the header region)
+	statusScratch []protocol.Status // reused per-key-status verb (consumed synchronously into the response)
+	lendBuf       []byte            // reusable Lend extent (see Lend for the safety invariant)
 
 	streamMu    sync.Mutex
 	streams     map[uint64]*putStream // by request_id
@@ -156,9 +157,21 @@ func (s *session) consume(c *transport.Conn, h protocol.Header, body []byte) {
 
 // respondStatus writes a preamble-only response (status, count=0) — the ack
 // shape for PUT sub-ops and error replies (§3).
+// statusPreambles is an IMMUTABLE preamble-only response body (status,
+// count=0) for every status value. respondStatus hands these read-only slices
+// straight to the writer, which only writevs them (never Returns or appends to
+// their contents), so one shared backing array across all connections and
+// concurrent acks is safe — every PUT ack and error reply used to make+append
+// a fresh 8 bytes.
+var statusPreambles = func() (t [256][protocol.PreambleSize]byte) {
+	for st := range t {
+		protocol.AppendPreamble(t[st][:0], protocol.Status(st), 0) // fills t[st] in place (cap == PreambleSize)
+	}
+	return
+}()
+
 func (s *session) respondStatus(c *transport.Conn, h protocol.Header, status protocol.Status) {
-	body := protocol.AppendPreamble(make([]byte, 0, protocol.PreambleSize), status, 0)
-	s.writeResp(c, h, body)
+	s.writeResp(c, h, statusPreambles[status][:])
 }
 
 // writeResp queues a single-slice response frame echoing the request's

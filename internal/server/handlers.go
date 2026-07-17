@@ -170,6 +170,17 @@ func (s *session) writeRespFlags(c *transport.Conn, h protocol.Header, flags uin
 	_ = c.WriteFrames(resp, bufs, nil)
 }
 
+// statusBuf returns the per-session per-key-status scratch sized to n. The
+// slice is consumed synchronously by AppendKeyStatusResp (copied into the
+// response body) before the response is queued, so recycling it across the
+// key-status verbs is safe.
+func (s *session) statusBuf(n int) []protocol.Status {
+	if cap(s.statusScratch) < n {
+		s.statusScratch = make([]protocol.Status, n)
+	}
+	return s.statusScratch[:n]
+}
+
 // handleKeyStatusVerb serves TOUCH_LEASE and PIN as metadata acks (§3.5/§3.6):
 // ramstub has no lease/pin state yet, so every present key is OK and every
 // absent key NOT_FOUND. Real semantics arrive with the tiers.
@@ -183,7 +194,7 @@ func (s *session) handleKeyStatusVerb(c *transport.Conn, h protocol.Header, body
 	if !ok {
 		return
 	}
-	perKey := make([]protocol.Status, len(keys))
+	perKey := s.statusBuf(len(keys))
 	for i, k := range keys {
 		if s.srv.store.Contains(s.ns, k) {
 			perKey[i] = protocol.StatusOK
@@ -203,7 +214,7 @@ func (s *session) handleDelete(c *transport.Conn, h protocol.Header, body []byte
 		return
 	}
 	force := h.Flags&protocol.FlagForce != 0
-	perKey := make([]protocol.Status, len(keys))
+	perKey := s.statusBuf(len(keys))
 	for i, k := range keys {
 		perKey[i] = s.srv.store.Delete(s.ns, k, force)
 	}
