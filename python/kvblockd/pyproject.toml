@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kvblockd"
+version = "0.1.0"
+description = "Python client for the kvblockd KV-cache block store (KVB1 wire protocol)"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Rudray Mehra", email = "rudraymehra@gmail.com" }]
+dependencies = [
+    "blake3>=0.4",   # adapter key derivation (CacheEngineKey → 32B wire key)
+    "xxhash>=3.4",   # payload checksums (XXH3-64, seed 0 — matches zeebo/xxh3)
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-repeat"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kvblockd"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

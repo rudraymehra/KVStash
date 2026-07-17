@@ -1,0 +1,566 @@
+{
+  "scheme": "kvblockd-cek-v1",
+  "note": "fields = (fmt, model_name, str(world_size), str(worker_id), str(chunk_hash)); wire_key = blake3-256 over domain 'kvblockd-cek-v1\\x00' + u32-LE-length-prefixed UTF-8 fields. Shared oracle for Python kvblockd.hashing.wire_key and Go pkg/client.WireKey. Includes adversarial vectors: empty fields, unicode, boundary-split pairs.",
+  "vectors": [
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "8",
+        "7",
+        "12308302348852047333"
+      ],
+      "wire_key_hex": "7e5d264863ca97883ad6c22c9701a1b9189ac5c60f04bcd389a9f745e4afbcb1"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "2",
+        "1",
+        "6697888959316915977"
+      ],
+      "wire_key_hex": "88ab862efef12a77654c9dcfcf472888a5cf33cc538fba5a198019a60db5d9e5"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "2",
+        "0",
+        "13480925150539569748"
+      ],
+      "wire_key_hex": "7d79703ee4a7afe55a1acbf2439ec14663d66d4bdcbf54552bb3a8c24766dd9a"
+    },
+    {
+      "fields": [
+        "vllm",
+        "mistralai/Mistral-7B-v0.3",
+        "1",
+        "0",
+        "7307216772117151434"
+      ],
+      "wire_key_hex": "038de5daa238d466059bb47307d3417763c05e7ce38453400fda3c5adaff5c7a"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "8",
+        "5",
+        "4113731863287815698"
+      ],
+      "wire_key_hex": "ae86c7d5222f745374646789956e035a2fc783df125e72914cae2adecc866534"
+    },
+    {
+      "fields": [
+        "vllm",
+        "mistralai/Mistral-7B-v0.3",
+        "1",
+        "0",
+        "16392408859671556848"
+      ],
+      "wire_key_hex": "4360e4f1bb68c758c5375438295f87aae9d96df9c241beb3a116cd1c83363478"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "8",
+        "4",
+        "14709350520210971734"
+      ],
+      "wire_key_hex": "a2cbe300e2c0a2ca5baa609cbfe9592ca89a82558eb795f04db4c8977c0402d9"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "4",
+        "3",
+        "17647642545551171664"
+      ],
+      "wire_key_hex": "776532120004ded5e112d656a78bcc82fbf6e30c39621a79c1f19230f4013b04"
+    },
+    {
+      "fields": [
+        "vllm",
+        "mistralai/Mistral-7B-v0.3",
+        "8",
+        "7",
+        "4286076651139031408"
+      ],
+      "wire_key_hex": "e5d44a8c3c40883e09e2ad2045b17cbdbc209eca0aa65e4c419f6e8f1bfa318e"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "4",
+        "3",
+        "16825669553770913575"
+      ],
+      "wire_key_hex": "342a909733120082eb620f64e31581957cc0eaa7456137b922e7ff49bceb6ae0"
+    },
+    {
+      "fields": [
+        "vllm",
+        "meta-llama/Llama-3.1-8B",
+        "2",
+        "1",
+        "17585875772336014640"
+      ],
+      "wire_key_hex": "5f8f7ecdd7f40517171a312572c999a0f6d82e1a7d1f2d710a8dfd0571d59b70"
+    },
+    {
+      "fields": [
+        "vllm",
+        "mistralai/Mistral-7B-v0.3",
+        "1",
+        "0",
+        "2640224354586198048"
+      ],
+      "wire_key_hex": "820532498b3d84c42789462006c0691d28a61c76e9f5250ede658cc2bbd8e164"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "4",
+        "3",
+        "4017746305932834177"
+      ],
+      "wire_key_hex": "8bec3d883cbfe61b7f32fbc3a82024a5c681a9207d77d72630dfb35f9bd895a5"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "1",
+        "0",
+        "9521782592442520256"
+      ],
+      "wire_key_hex": "280272c5ef09ec374ee9474d8d527f04a560cd43c7a377aa29745a503d9ca822"
+    },
+    {
+      "fields": [
+        "vllm",
+        "mistralai/Mistral-7B-v0.3",
+        "1",
+        "0",
+        "7768477529352742337"
+      ],
+      "wire_key_hex": "bbb249d076641e7a4307bcd5637ef81a42397626e83b209760f5cbfbd6601329"
+    },
+    {
+      "fields": [
+        "vllm",
+        "meta-llama/Llama-3.1-8B",
+        "2",
+        "1",
+        "17566393754132006334"
+      ],
+      "wire_key_hex": "cdb480f43264c96114d3e9d7107806fcd01ef2696800a22b676e3042dd734178"
+    },
+    {
+      "fields": [
+        "vllm",
+        "meta-llama/Llama-3.1-8B",
+        "8",
+        "4",
+        "8619056512557721723"
+      ],
+      "wire_key_hex": "569e4455237bb09487bf0207e6b11f68e2ab0a46d6278aba5d9a13a32b2168d0"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "4",
+        "3",
+        "18188172970962609057"
+      ],
+      "wire_key_hex": "02eaa0ad37e0b894aed53c0d6d5255df3e0be1ce498db2e5b57099ec4d38352a"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "1",
+        "0",
+        "16735181102365673232"
+      ],
+      "wire_key_hex": "9ababc3912e0077ed4fbf47c22f5f3575386dac16016c68f73a9bcd27e568953"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "1",
+        "0",
+        "13570407587699451217"
+      ],
+      "wire_key_hex": "dd9e4f13ab08715c08b7ca1a5eab88f235237cb7fe0cedf644bc4001afa24cca"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "2",
+        "1",
+        "4209147829058423205"
+      ],
+      "wire_key_hex": "ade16866e4852aba769f49f579eacff3442d9be3f60fe23ac92ecb68b7e90d10"
+    },
+    {
+      "fields": [
+        "vllm",
+        "meta-llama/Llama-3.1-8B",
+        "1",
+        "0",
+        "5275038750045771507"
+      ],
+      "wire_key_hex": "5e5da5551b1a31acff7ab51e4accaa58574d8c1a15026910b648ec17c3c4ca9c"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "8",
+        "4",
+        "7136974654277341627"
+      ],
+      "wire_key_hex": "3753fb2ebd5c4093b99cf831b464a937882a0b5bc70a560c12ac9bedd5c96476"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "2",
+        "0",
+        "13528415675360990359"
+      ],
+      "wire_key_hex": "8c9cef96c43039ab24c247002e6d2aa8354c51bc92820ff2d1bbc0be827393e4"
+    },
+    {
+      "fields": [
+        "vllm",
+        "meta-llama/Llama-3.1-8B",
+        "2",
+        "1",
+        "4721997043215074324"
+      ],
+      "wire_key_hex": "662593ca9a8cbb35c6e45ef35f4386f9335dda716c554869696502e01f01049e"
+    },
+    {
+      "fields": [
+        "vllm",
+        "meta-llama/Llama-3.1-8B",
+        "1",
+        "0",
+        "8343279012343803466"
+      ],
+      "wire_key_hex": "4c3dd48c8494deb7566fda31d4c9ed55173d61d01f69368879cb4c8558257f1a"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "4",
+        "3",
+        "5522614843718358953"
+      ],
+      "wire_key_hex": "80c0ae3aded539f6725373fe0b327aeab9c24eb14ba067637ccaeec82902ac93"
+    },
+    {
+      "fields": [
+        "vllm",
+        "mistralai/Mistral-7B-v0.3",
+        "1",
+        "0",
+        "14855322652381937055"
+      ],
+      "wire_key_hex": "3c5f718888c7e5c1197a64e408481255f9a4615b617d50da06ce2284d887f563"
+    },
+    {
+      "fields": [
+        "vllm",
+        "meta-llama/Llama-3.1-8B",
+        "8",
+        "0",
+        "17225632832415584445"
+      ],
+      "wire_key_hex": "dafe95599d0829640314531a9950ee39229f80bafb1e976ffb568f3df3a74b9a"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "1",
+        "0",
+        "13877385246355918491"
+      ],
+      "wire_key_hex": "b3deb29b59c92f8ce803a302840539014bc6afd4836996ed2ef1476984a1af84"
+    },
+    {
+      "fields": [
+        "vllm",
+        "meta-llama/Llama-3.1-8B",
+        "2",
+        "0",
+        "9199935489895174154"
+      ],
+      "wire_key_hex": "d72fc3754360cb48482d7e82d2dbc921f80c1a30539217af1298ecc89680ab8b"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "1",
+        "0",
+        "15320727889497224657"
+      ],
+      "wire_key_hex": "e0e04aef421d67a39b28aac346e976f4e1f54b2bf6d34ea266ea9aecc585e642"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "8",
+        "1",
+        "12222771955617863067"
+      ],
+      "wire_key_hex": "a8047b87ece1c9acac4922153598fa9bce39b9a9fe54e16e518d37d530dc7984"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "2",
+        "1",
+        "9414816051585649013"
+      ],
+      "wire_key_hex": "241c579029309ef0fa4e4995ace2404d36ec35b23ce68df7515c43d66e8f3f9a"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "8",
+        "2",
+        "1389833436326674733"
+      ],
+      "wire_key_hex": "799584fcef3bf31299b2273ca9832b89b99698c049b4e5ffa7024511fe03c395"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "4",
+        "3",
+        "11646422317374170469"
+      ],
+      "wire_key_hex": "c072e162b398d1f2b7fd24a0288f69ffa0d5bc8e960c3e2ea5deee16313d79ed"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "8",
+        "3",
+        "9345995710440139613"
+      ],
+      "wire_key_hex": "52ecb90979f5beeb87ee52d9b14f171b59e8a3a30734543db26b565f361158a5"
+    },
+    {
+      "fields": [
+        "vllm",
+        "mistralai/Mistral-7B-v0.3",
+        "4",
+        "3",
+        "15207167490468875162"
+      ],
+      "wire_key_hex": "0d305cbd2ad202031d1f85420e9d33bba3ac9f8b4ed741a7b327eeb42360cb87"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "8",
+        "0",
+        "115298573967268763"
+      ],
+      "wire_key_hex": "19d62ebefe28d6bdfd874e31e286d3af028d8b4135495d08418c131b7db4dd52"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "2",
+        "1",
+        "966759625470207017"
+      ],
+      "wire_key_hex": "57156e68a322e277c5e661012e8ce761efd0da34984baed2e19baaa786559686"
+    },
+    {
+      "fields": [
+        "vllm",
+        "mistralai/Mistral-7B-v0.3",
+        "8",
+        "5",
+        "10348992677280072882"
+      ],
+      "wire_key_hex": "d03b37b3822053cc0166ae4e061d99ffc265893432ef989030ea45f0bff78c00"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "8",
+        "6",
+        "2272009103975841697"
+      ],
+      "wire_key_hex": "49af32c3a8beab15fc04b53a21eefb4f84a7a3339d592ef8c0f7bd7159cf718a"
+    },
+    {
+      "fields": [
+        "vllm",
+        "facebook/opt-125m",
+        "8",
+        "6",
+        "325045580957663073"
+      ],
+      "wire_key_hex": "6aa0bcece62440a19b0c0be7eee5e45515198c0254bbbe331526ac9ca411046c"
+    },
+    {
+      "fields": [
+        "vllm",
+        "mistralai/Mistral-7B-v0.3",
+        "8",
+        "6",
+        "12065636445330317904"
+      ],
+      "wire_key_hex": "0852dbafd476c9d4c01276b6b1028706790c36e23271d35d459c4dc1790f5e0d"
+    },
+    {
+      "fields": [
+        "vllm",
+        "mistralai/Mistral-7B-v0.3",
+        "1",
+        "0",
+        "1468035237944822629"
+      ],
+      "wire_key_hex": "2a3968c3b477066b8a703f3a8ac6942ba6df38b9de3e64952b9c4b6491bc84b4"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "4",
+        "2",
+        "1681284963340258844"
+      ],
+      "wire_key_hex": "4751e75430527a402c9dbd58f2ede6f45a1af20a66e635216f80aa4ba849048a"
+    },
+    {
+      "fields": [
+        "vllm",
+        "meta-llama/Llama-3.1-8B",
+        "2",
+        "0",
+        "17185891797207168836"
+      ],
+      "wire_key_hex": "05bd341be0c1b76f020e7d55eaf369eb7565230e2c212f8211ac7447000dfb9f"
+    },
+    {
+      "fields": [
+        "vllm",
+        "meta-llama/Llama-3.1-8B",
+        "1",
+        "0",
+        "15400016911070609857"
+      ],
+      "wire_key_hex": "b5798a65581d9beb61ebc83a69b8c2ce2d6ac394daa61d7f39862f6ae9ab7b07"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "4",
+        "3",
+        "3191645833569790763"
+      ],
+      "wire_key_hex": "1b82f9b12cadabb996927b73bfeb52ba594e11715ff6d7e7ecfd1b50e65b58fb"
+    },
+    {
+      "fields": [
+        "vllm",
+        "Qwen/Qwen2.5-7B@rev2",
+        "2",
+        "0",
+        "14575403675562506858"
+      ],
+      "wire_key_hex": "00b14009154958e2c2fb7627acd7a684b43a25f872ffa294f4f47ed36b9fd31f"
+    },
+    {
+      "fields": [
+        "vllm",
+        "",
+        "1",
+        "0",
+        "5"
+      ],
+      "wire_key_hex": "8e897d346e3badb957283cbddaca85340dcd329afd662066dab2302b93632f05"
+    },
+    {
+      "fields": [
+        "vllm",
+        "org/model",
+        "1",
+        "0",
+        ""
+      ],
+      "wire_key_hex": "0d24f506d4a6e1b999e7eec5c72bb7a580c6f168bb0366eaaedba7246589070f"
+    },
+    {
+      "fields": [
+        "vllm",
+        "org",
+        "model",
+        "1",
+        "0"
+      ],
+      "wire_key_hex": "40704c2c609bda9c476f5f28607166c046624d8e43c24bc7ef0cdca354f6fd9d"
+    },
+    {
+      "fields": [
+        "vllm",
+        "org/model",
+        "1",
+        "0",
+        "5"
+      ],
+      "wire_key_hex": "b24004c68a23b7836ac839a20c5abc445738deb04f4b1f47b3e56c2c9ce8ec54"
+    },
+    {
+      "fields": [
+        "vllm",
+        "café/λlm-模型",
+        "8",
+        "7",
+        "18446744073709551615"
+      ],
+      "wire_key_hex": "0139fb18692633a81d601c0db2ac2bcd1f08e25d92d5579d421861f5ac734aae"
+    },
+    {
+      "fields": [
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "wire_key_hex": "6a258f0a4bf5d9160637842ceee02a1222fb9e7dac695f06ee685c54d778e83d"
+    }
+  ]
+}
