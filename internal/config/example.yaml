@@ -33,3 +33,9 @@ write_chunk_bytes: 1048576    # 1 MiB per writev within a coalesced flush (0 = u
 dram_arena_bytes: 1073741824  # 1 GiB; must hold at least one max_blob_len block
 dram_hugepages: false         # Linux MAP_HUGETLB (needs vm.nr_hugepages); off = THP-eligible
 pinned_bytes_cap: 134217728   # 128 MiB pinned per namespace (§3.6 ERR_PIN_QUOTA); 0 = unlimited
+
+# Eviction (memory pressure; PROTOCOL.md §6 ladder is always honored).
+eviction_policy: "s3fifo"     # s3fifo | sampled-lru | none (none = Week-3 hard wall)
+eviction_watermark_pct: 95    # trigger an eviction batch at 95% arena occupancy
+eviction_batch_pct: 5         # each batch frees down to 90% (95 - 5)
+eviction_ghost_entries: 0     # per-tenant S3-FIFO ghost cap; 0 = auto (arena-derived)

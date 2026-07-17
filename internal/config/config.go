@@ -71,6 +71,17 @@ type Config struct {
 	// PinnedBytesCap caps per-namespace pinned bytes (§3.6 ERR_PIN_QUOTA);
 	// 0 = unlimited.
 	PinnedBytesCap int64 `yaml:"pinned_bytes_cap"`
+
+	// EvictionPolicy selects the pressure policy: "s3fifo" (default),
+	// "sampled-lru", or "none" (the Week-3 hard-wall behavior).
+	EvictionPolicy string `yaml:"eviction_policy"`
+	// EvictionWatermarkPct triggers an eviction batch at this arena
+	// occupancy; EvictionBatchPct is how far below it one batch frees.
+	EvictionWatermarkPct int `yaml:"eviction_watermark_pct"`
+	EvictionBatchPct     int `yaml:"eviction_batch_pct"`
+	// EvictionGhostEntries caps each tenant's S3-FIFO ghost ring;
+	// 0 = auto (arena-derived: one fingerprint per conceivable block).
+	EvictionGhostEntries int `yaml:"eviction_ghost_entries"`
 }
 
 // Overrides are the command-line flags an operator actually needs at launch;
@@ -102,6 +113,10 @@ func Default() Config {
 		WriteChunkBytes: 1 << 20,
 		DramArenaBytes:  1 << 30,   // 1 GiB hot tier
 		PinnedBytesCap:  128 << 20, // 128 MiB per namespace
+
+		EvictionPolicy:       "s3fifo",
+		EvictionWatermarkPct: 95, // Mooncake numbers: evict at 95%…
+		EvictionBatchPct:     5,  // …freeing 5% per batch
 	}
 }
 
@@ -242,10 +257,22 @@ func (c Config) Validate() error {
 	check(c.SockRcvBuf >= 0, "sock_rcvbuf %d: must be >= 0 (0 = OS default)", c.SockRcvBuf)
 	check(c.WriteChunkBytes >= 0, "write_chunk_bytes %d: must be >= 0 (0 = unchunked)", c.WriteChunkBytes)
 	check(c.DramArenaBytes > 0, "dram_arena_bytes %d: must be > 0", c.DramArenaBytes)
+	check(c.DramArenaBytes < 1<<44,
+		"dram_arena_bytes %d: must be below 16 TiB (the allocator's uint32 granule addressing)", c.DramArenaBytes)
 	check(c.DramArenaBytes >= int64(c.MaxBlobLen),
 		"dram_arena_bytes %d: must hold at least one max_blob_len (%d) block", c.DramArenaBytes, c.MaxBlobLen)
 	check(c.PinnedBytesCap >= 0 && c.PinnedBytesCap <= c.DramArenaBytes,
 		"pinned_bytes_cap %d: must be in [0, dram_arena_bytes %d]", c.PinnedBytesCap, c.DramArenaBytes)
+	switch c.EvictionPolicy {
+	case "s3fifo", "sampled-lru", "none":
+	default:
+		errs = append(errs, fmt.Errorf("eviction_policy %q: want s3fifo, sampled-lru, or none", c.EvictionPolicy))
+	}
+	check(c.EvictionWatermarkPct >= 50 && c.EvictionWatermarkPct <= 99,
+		"eviction_watermark_pct %d: must be in [50, 99]", c.EvictionWatermarkPct)
+	check(c.EvictionBatchPct >= 1 && c.EvictionBatchPct < c.EvictionWatermarkPct,
+		"eviction_batch_pct %d: must be in [1, eviction_watermark_pct %d)", c.EvictionBatchPct, c.EvictionWatermarkPct)
+	check(c.EvictionGhostEntries >= 0, "eviction_ghost_entries %d: must be >= 0 (0 = auto)", c.EvictionGhostEntries)
 
 	return errors.Join(errs...)
 }

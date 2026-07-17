@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kvstash/kvblockd/internal/config"
+	"github.com/kvstash/kvblockd/internal/eviction"
 	"github.com/kvstash/kvblockd/internal/metrics"
 	"github.com/kvstash/kvblockd/internal/server"
 	"github.com/kvstash/kvblockd/internal/store/dram"
@@ -64,6 +65,39 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Eviction: policy attach + the watermark goroutine. stopEvict must run
+	// before EVERY store.Close (and on the drain-timeout path too) so no
+	// eviction free races the arena unmap; it is safe to call repeatedly.
+	stopEvict := func() {}
+	if cfg.EvictionPolicy != "none" {
+		ghost := cfg.EvictionGhostEntries
+		if ghost == 0 {
+			// Auto ceiling: one fingerprint per conceivable resident block
+			// (arena / 64 KiB) — the policy itself stays arena-ignorant.
+			ghost = int(cfg.DramArenaBytes >> 16)
+		}
+		pol, perr := eviction.New(cfg.EvictionPolicy, ghost)
+		if perr != nil {
+			_ = store.Close()
+			return perr
+		}
+		store.AttachPolicy(pol)
+		stopOnce := store.StartEvictor(ctx, dram.EvictorConfig{
+			WatermarkPct: cfg.EvictionWatermarkPct,
+			BatchPct:     cfg.EvictionBatchPct,
+		})
+		var stopped bool
+		stopEvict = func() {
+			if !stopped {
+				stopped = true
+				stopOnce()
+			}
+		}
+		defer stopEvict()
+		fmt.Fprintln(os.Stderr, "kvblockd: eviction policy", pol.Name(),
+			"watermark", cfg.EvictionWatermarkPct, "batch", cfg.EvictionBatchPct)
+	}
+
 	set := metrics.New(store.Stats)
 	srv.SetRecorder(set)
 	if cfg.MetricsAddr != "" {
@@ -75,6 +109,7 @@ func run() error {
 		}
 		bound, wait, err := set.Serve(ctx, cfg.MetricsAddr)
 		if err != nil {
+			stopEvict()
 			_ = store.Close()
 			return fmt.Errorf("metrics endpoint: %w", err)
 		}
@@ -86,6 +121,7 @@ func run() error {
 	}
 
 	if _, err := srv.Start(ctx); err != nil {
+		stopEvict()
 		_ = store.Close()
 		return err
 	}
@@ -99,9 +135,12 @@ func run() error {
 		// Unmapping now could send unrelated process memory to that peer —
 		// skip the unmap; the process exit reclaims everything anyway.
 		fmt.Fprintln(os.Stderr, "kvblockd: drain timed out — leaving the arena mapped for process exit")
+		stopEvict()
 		return nil
 	}
-	// Strictly AFTER a SUCCESSFUL Drain: every conn's writer has flushed, so
-	// every GET release has fired and the arena unmaps with no live views.
+	// Strictly AFTER a SUCCESSFUL Drain (and a stopped evictor): every
+	// conn's writer has flushed and no eviction pass is mid-free, so the
+	// arena unmaps with no live views.
+	stopEvict()
 	return store.Close()
 }

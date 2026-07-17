@@ -37,7 +37,6 @@ type Set struct {
 	hits      *prometheus.CounterVec
 	misses    *prometheus.CounterVec
 	bytes     *prometheus.CounterVec
-	evictions prometheus.Counter
 }
 
 // New builds the registry. stats, when non-nil, is the store's Stats()
@@ -66,12 +65,8 @@ func New(stats func() []byte) *Set {
 			Name: "kvb_bytes_total",
 			Help: "Block payload bytes by direction (in = committed PUTs, out = served GETs) and namespace id.",
 		}, []string{"dir", "ns"}),
-		evictions: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "kvb_evictions_total",
-			Help: "Blocks evicted under pressure (registered now; the evictor increments it).",
-		}),
 	}
-	s.reg.MustRegister(s.opSeconds, s.hits, s.misses, s.bytes, s.evictions)
+	s.reg.MustRegister(s.opSeconds, s.hits, s.misses, s.bytes)
 	s.reg.MustRegister(collectors.NewGoCollector()) // GC pause/heap — the launch-day GC defense reads these
 	if stats != nil {
 		s.reg.MustRegister(&storeCollector{stats: stats})
@@ -147,6 +142,14 @@ var (
 		"DRAM arena occupancy by state (total / free / largest_free_region).", []string{"state"}, nil)
 	descPinned = prometheus.NewDesc("kvb_pinned_bytes",
 		"Pinned bytes charged against the namespace's pin quota.", []string{"ns"}, nil)
+	// Evictions live in the store (which never imports Prometheus), so the
+	// counter is scrape-time const, fed from the Stats JSON like the gauges.
+	descEvictions = prometheus.NewDesc("kvb_evictions_total",
+		"Blocks evicted under memory pressure.", []string{"tier"}, nil)
+	descLiveAllocs = prometheus.NewDesc("kvb_live_allocs",
+		"Live arena extents (the allocator node-pool watermark numerator).", []string{"tier"}, nil)
+	descMaxAllocs = prometheus.NewDesc("kvb_max_allocs",
+		"Allocator node-pool capacity (live extents ceiling).", []string{"tier"}, nil)
 )
 
 // storeCollector decodes the store's Stats() JSON at scrape time. A document
@@ -161,6 +164,9 @@ func (c *storeCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descStoreBytes
 	ch <- descArenaBytes
 	ch <- descPinned
+	ch <- descEvictions
+	ch <- descLiveAllocs
+	ch <- descMaxAllocs
 }
 
 func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
@@ -172,6 +178,9 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 		ArenaFreeBytes   float64            `json:"arena_free_bytes"`
 		LargestFreeBytes float64            `json:"largest_free_region_bytes"`
 		PinnedBytes      map[string]float64 `json:"pinned_bytes"`
+		EvictionsTotal   float64            `json:"evictions_total"`
+		LiveAllocs       float64            `json:"live_allocs"`
+		MaxAllocs        float64            `json:"max_allocs"`
 	}
 	if err := json.Unmarshal(c.stats(), &doc); err != nil {
 		return
@@ -189,6 +198,11 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	for ns, b := range doc.PinnedBytes {
 		ch <- prometheus.MustNewConstMetric(descPinned, prometheus.GaugeValue, b, ns)
+	}
+	ch <- prometheus.MustNewConstMetric(descEvictions, prometheus.CounterValue, doc.EvictionsTotal, tier)
+	if doc.MaxAllocs > 0 {
+		ch <- prometheus.MustNewConstMetric(descLiveAllocs, prometheus.GaugeValue, doc.LiveAllocs, tier)
+		ch <- prometheus.MustNewConstMetric(descMaxAllocs, prometheus.GaugeValue, doc.MaxAllocs, tier)
 	}
 }
 

@@ -16,7 +16,8 @@ func fakeStats() []byte {
 	return []byte(`{"schema":1,"store":"dram","blocks":3,"bytes":3145728,` +
 		`"arena_bytes":67108864,"arena_free_bytes":63963136,` +
 		`"largest_free_region_bytes":63963136,"hugepages":false,` +
-		`"pinned_bytes":{"7":1048576}}`)
+		`"pinned_bytes":{"7":1048576},` +
+		`"evictions_total":12,"live_allocs":3,"max_allocs":131072}`)
 }
 
 func TestEndpointAndReadiness(t *testing.T) {
@@ -48,7 +49,9 @@ func TestEndpointAndReadiness(t *testing.T) {
 		`kvb_misses_total{ns="7"} 1`,
 		`kvb_bytes_total{dir="out",ns="7"} 5.24288e+06`,
 		`kvb_bytes_total{dir="in",ns="7"} 1.048576e+06`,
-		`kvb_evictions_total 0`,
+		`kvb_evictions_total{tier="dram"} 12`,
+		`kvb_live_allocs{tier="dram"} 3`,
+		`kvb_max_allocs{tier="dram"} 131072`,
 		`kvb_blocks{tier="dram"} 3`,
 		`kvb_store_bytes{tier="dram"} 3.145728e+06`,
 		`kvb_arena_bytes{state="free"} 6.3963136e+07`,
