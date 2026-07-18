@@ -449,3 +449,107 @@ bound needed the held-ref allowance) — the oracle audits itself.
   ceiling) and don't shrink with cold domains; a gate-refused small-evictee
   re-admits to MAIN via its own ghost entry (deliberate: proved-protected
   blocks upgrade).
+
+## Week 6 — the NVMe tier (log-structured segments + kill -9 recovery)
+
+The durability differentiator: a warm tier that survives `kill -9` mid-write-storm
+with **zero corrupt reads** — where KVBM unlinks its NVMe file on restart
+(dynamo #6031), PegaFlow's SSD index is memory-only, and PrisKV "persists" to
+tmpfs. (Honesty note: Mooncake's bucket backend does have SSD eviction; the
+restart-recoverable index is the contrast, not SSD eviction itself.)
+
+### Geometry and formats (all little-endian, versioned)
+
+- **Segments**: fixed-size append-only files (`seg-<id>.kvbs`), default
+  **256 MB** (CacheLib-Navy-informed; `nvme_segment_bytes`), fallocated at
+  create (create-time fsync — size metadata never changes again). Records are
+  **4 KiB-aligned**: 56 B header `{magic "KVBR", ns u32, key[32], len u32,
+  rsvd, xxh3_64}` + payload + zero pad.
+- **Seal footer**: entry table `{ns, key, off, len, xxh3_64}×n` at dataEnd +
+  a 64 B trailer in the file's final 4 KiB (`magic "KVBF"`, version, counts,
+  CRC32C over table+trailer — the same Castagnoli discipline as the wire
+  header). Sealed segments are write-once: after the seal fdatasync no write
+  ever targets the file, so a torn tail is confined to the single unsealed
+  segment.
+- **Checkpoints** (`ckpt-<seq>.kvbi`): the sealed-segment index serialized
+  every `nvme_ckpt_every_segments` seals, written tmp→fsync→rename→fsync(dir).
+  Recovery trusts it for covered segments (skipping their footer reads — the
+  warm-restart seconds-per-GB win) and footer-scans anything newer.
+- **Recovery** (in `OpenVolume`, before the daemon accepts traffic): newest
+  CRC-valid checkpoint → validated entries; sealed segments beyond it →
+  footer scan (later segID wins per key); the unsealed tail → forward record
+  scan verifying every payload's xxh3, **truncate at the first torn record,
+  then seal the recovered prefix in place** (append never resumes into a
+  scanned tail). Lose data, never serve corruption. `RecoveryReport` is
+  logged at startup and quoted by the demo.
+
+### Tier orchestration (`internal/store.Tiered`)
+
+- Separate 256-shard NVMe index (nskey → `{Loc, len, xxh3, lease/TTL
+  atomics, pin flags}`); dram's BlockRef/allocator stay untouched. A
+  DRAM-only config takes the pre-tiering code paths and emits no
+  `kvb_nvme_*` scrape families (metrics_test asserts their absence; the
+  hot-path Stats document is the dram tier's own).
+- **Demotion** at 90% DRAM occupancy (below the evictor's 95): policy
+  victims → reader-ref held across a bounded writer queue → group-commit
+  append (fdatasync every `nvme_sync_every_bytes`) → the index swap runs
+  INSIDE the dram shard-lock delete gate (zero-width: a concurrent GET
+  serves exactly one tier). Never-read blocks (admission filter,
+  `nvme_admit_min_hits`) are evicted, not written — SSD endurance. Bytes
+  already NVMe-resident (dual residency after promotion) are never
+  rewritten.
+- **GETs**: DRAM first; NVMe via a bounded per-volume reader pool —
+  saturation answers a per-key `ERR_BUSY` descriptor (retryable; §3's
+  per-key-outcomes-ride-in-descriptors mechanism, no wire change). Every
+  device read is verified (magic + nskey + xxh3) BEFORE a byte is served;
+  verification failure self-heals the index entry and counts
+  `kvb_nvme_checksum_errors_total`. **BATCH_EXISTS never touches the
+  device** (a spy IOBackend that panics on read enforces it in CI).
+- **Promotion** NVMe→DRAM only on the 2nd hit within
+  `nvme_promote_window_ms`; a hard PIN promotes synchronously (the
+  pinned-bytes ledger stays single and unbypassable).
+- **Reclaim**: whole-segment FIFO (write-once ⇒ FIFO≈LRU, no compaction);
+  segments holding leased or pinned blocks are SKIPPED (gated under the
+  shard lock); in-flight READS need no skip — the file is unlinked with
+  the fd held open and the retire drains them before closing.
+
+### The crash contract (what the torture harness enforces)
+
+PUT COMMIT ack = DRAM-committed (a cache, not a database). After `kill -9`:
+whatever the recovered daemon says EXISTS must GET **byte-identical**
+(client-side xxh3 scrub against regenerated content); a key whose COMMIT was
+never acked must NEVER exist; recovery-to-ready < 5 s; fresh traffic serves.
+DRAM-only blocks die with the process — honest loss, never corruption.
+Harness: `go run -tags crashtest ./test/crash -loops N` (journal written
+parent-side strictly AFTER each ack; ~30% of streams deliberately abandoned
+mid-CHUNK). CI runs 10 loops per push on ubuntu; the rig runs 50 on real
+NVMe; Docker rehearsals run 100+.
+
+### Week-6 measured results
+
+| What | Where | Number |
+|---|---|---|
+| torture, darwin dev box | 3 loops | 0 corrupt, 0 phantom (mechanism check) |
+| torture, Linux kernel (Docker) | 100 loops | **0 corrupt, 0 phantom** over 18,160 journaled acks, 234 s (2026-07-18) |
+| torture, real NVMe (i7i) | 50 loops | _Day-6 session (run-tier.sh T2)_ |
+| daemon NVMe GET storm, per device | i7i.8xlarge | _T1a — quote GB/s AND %-of-fio-ceiling_ |
+| daemon NVMe GET storm, both devices | i7i.8xlarge | _T1b_ |
+| warm restart | ~20 GB fill | _T3 — wall seconds + seconds-per-GB + hits-survive_ |
+
+A3 status: OPEN — the pre-registered ≥6.0 GB/s/device line is not printable
+on any AWS instance-store device (i4i ceiling 2.99; i7i projected ~4.5); the
+session records %-of-ceiling with the same discipline the A1 transport gates
+used, and the literal gate awaits either a dated amendment or bare-metal
+PCIe-Gen4 hardware.
+
+### What Rudray owns (Merge Rule; write BEFORE reading the code back)
+
+- The recovery-algorithm narrative — checkpoint load → footer scan → tail
+  truncation — from memory, then diff against `internal/store/nvme/recovery.go`.
+- The durability-contract explanation: what a COMMIT ack promises, why the
+  parent journals AFTER the ack, why a torn tail cannot damage sealed
+  segments, what fsync/fdatasync actually guarantee (and why darwin's
+  fsync does not flush the drive cache).
+- O_DIRECT alignment discipline (4 KiB buffers/offsets/lengths; why the
+  aligned pool exists) and the build-tag split (`io_direct_linux.go` /
+  `io_direct_other.go` / `kvb_uring` stub — why io_uring is deferred).
