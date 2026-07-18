@@ -3,7 +3,9 @@ package target
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -95,7 +97,10 @@ func (t *FS) BatchGet(ctx context.Context, keys [][32]byte, dst [][]byte) ([]Sta
 		_, file := t.path(keys[i])
 		n, err := readBlock(file, &dst[i], t.blob)
 		if err != nil {
-			if os.IsNotExist(err) {
+			// errors.Is, NOT os.IsNotExist: the Linux O_DIRECT reader wraps
+			// ENOENT in its own type, and os.IsNotExist only unwraps the
+			// stdlib Path/Link/Syscall error wrappers.
+			if errors.Is(err, fs.ErrNotExist) {
 				return Miss, nil
 			}
 			return Errored, err

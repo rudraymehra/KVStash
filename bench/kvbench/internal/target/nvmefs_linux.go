@@ -118,6 +118,7 @@ type notExistError struct{ err error }
 func (e *notExistError) Error() string { return e.err.Error() }
 func (e *notExistError) Unwrap() error { return e.err }
 
-// Is makes os.IsNotExist / errors.Is(fs.ErrNotExist) work on the wrapped
-// unix error.
+// Is makes errors.Is(err, fs.ErrNotExist) work on the wrapped unix error
+// (os.IsNotExist does NOT — it never unwraps custom types; callers must
+// use errors.Is).
 func (e *notExistError) Is(target error) bool { return errors.Is(e.err, target) }

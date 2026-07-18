@@ -3,6 +3,7 @@
 package stats
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -33,8 +34,8 @@ func parseProcStat(s string) (cpuSeconds float64, rssBytes int64, err error) {
 	utime, err1 := strconv.ParseFloat(fields[11], 64) // field 14
 	stime, err2 := strconv.ParseFloat(fields[12], 64) // field 15
 	rssPages, err3 := strconv.ParseInt(fields[21], 10, 64)
-	if err1 != nil || err2 != nil || err3 != nil {
-		return 0, 0, fmt.Errorf("stats: /proc stat parse: %v %v %v", err1, err2, err3)
+	if err := errors.Join(err1, err2, err3); err != nil {
+		return 0, 0, fmt.Errorf("stats: /proc stat parse: %w", err)
 	}
 	const userHZ = 100
 	return (utime + stime) / userHZ, rssPages * int64(os.Getpagesize()), nil
