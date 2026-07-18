@@ -1,0 +1,40 @@
+# bench/VERSIONS.lock — every pin the benchmark week depends on.
+# Frozen so a stranger reproduces Chart 1 for ~$12 and Chart 2 exactly.
+# Format: one "key = value  # note" per line; digests are the source of truth.
+#
+# NOTE (2026-07-18): image digests are placeholders (image@sha256:PENDING)
+# until the baseline rig session pulls and records them — filling a digest
+# requires the pull, which happens on the rig. Version tags are pinned now;
+# digests land with the Rig-T run. A digest reading PENDING means "do not
+# publish a chart from this baseline yet".
+
+## Go bench dependencies (already in go.mod)
+go = 1.26
+go-redis = github.com/redis/go-redis/v9 v9.21.0          # zero-copy GetToBuffer/SetFromBuffer (the strongest-client bar)
+hdrhistogram = github.com/HdrHistogram/hdrhistogram-go v1.1.2  # 3-sig-fig percentiles + .hgrm
+
+## Baseline services (digest-pinned at the rig)
+valkey   = valkey/valkey:8.1@sha256:PENDING      # io-threads 8, save "", appendonly no, allkeys-lru
+redis    = redis:7.4@sha256:PENDING              # same config as valkey for the go-redis bar
+etcd     = quay.io/coreos/etcd:v3.5.17@sha256:PENDING   # Mooncake metadata store only
+mooncake = kvcache-ai/mooncake:LATEST-TAG@sha256:PENDING  # protocol="tcp"; every non-default knob documented in baselines/mooncake/
+
+## Baseline clients
+redis-py = 8.0.1     # the client LMCache actually ships (RESP3 default; we report RESP2 & RESP3 if they differ >5%)
+
+## GPU stack (Rig E, AWS g5.xlarge — A10G)
+vllm    = 0.25.1     # matches the CPU e2e recipe pin (bench/e2e/cpu)
+lmcache = 0.5.1      # + lmcache_kvblockd (python/lmcache_kvblockd)
+model   = meta-llama/Llama-3.1-8B-Instruct
+torch   = cu124      # CUDA 12.4 wheels (A10G, sm_86)
+
+## Measurement tools
+iperf3 = 3.16        # multithreaded -P; the transport ceiling
+fio    = 3.36        # 128k/1M seq QD32; the NVMe device ceiling
+
+## Traces (SHAs recorded by traces/fetch.sh at clone time)
+bailian_repo  = alibaba-edu/qwen-bailian-usagetraces-anon @ PENDING-SHA
+mooncake_repo = kvcache-ai/Mooncake @ PENDING-SHA          # FAST25-release/traces/
+# Published request counts (converter count-exactness gate):
+#   bailian: 4 files (per-file counts recorded in traces/README.md at fetch)
+#   mooncake: 12031 / 23608 / 3993
