@@ -56,12 +56,31 @@ jobs:
           cache: false
       - name: build
         run: go build ./...
+      - name: build (tagged variants stay compiling — kvb_uring stub, crashtest harness)
+        run: |
+          go build -tags kvb_uring ./internal/store/nvme/
+          go vet -tags crashtest ./test/crash/
       - name: test (race)
         run: go test -race -short -count=1 ./...
       - name: test (race, kvbdebug — buffer poisoning + credit ledger asserts)
         run: go test -race -short -count=1 -tags kvbdebug ./internal/...
-      - name: modeltest (race, kvbdebug, elevated checks — the I1–I5 harness)
+      - name: modeltest (race, kvbdebug, elevated checks — the I1–I6 harness incl. crash/recovery)
         run: go test -race -count=1 -tags kvbdebug -run TestStoreModel ./internal/store/modeltest -rapid.checks=200
+
+  # The kill -9 recovery contract on a real Linux kernel: 10 loops per push.
+  # The i7i rig runs 50 on real NVMe; Docker rehearsals run 100+.
+  crash-torture:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: false
+      - name: 10-loop kill -9 torture (journal-after-ack oracle)
+        run: go run -tags crashtest ./test/crash -loops 10 -dir "$RUNNER_TEMP/crash"
 
   # macOS cross-check: weekly + on demand only (10× billing on a private repo).
   test-macos:
