@@ -140,12 +140,15 @@ func run(loops int, dir, bin string, seed int64, stormMS int) error {
 			wait = time.Duration(stormMS) * time.Millisecond
 		}
 		time.Sleep(wait)
-		if err := child.Process.Signal(syscall.SIGKILL); err != nil {
-			return fmt.Errorf("loop %d: SIGKILL: %w", loop, err)
-		}
+		// Stop the storm on EVERY path — a failed SIGKILL must not return
+		// with 16 workers still hammering a dead port on a leaked context.
+		killErr := child.Process.Signal(syscall.SIGKILL)
 		_ = child.Wait()
 		stopStorm()
 		wg.Wait()
+		if killErr != nil {
+			return fmt.Errorf("loop %d: SIGKILL: %w", loop, killErr)
+		}
 		fmt.Printf("[torture] loop %d/%d: killed mid-storm (journal %d acked, %d uncommitted)\n",
 			loop+1, loops, len(j.acked), len(j.uncommitted))
 	}
