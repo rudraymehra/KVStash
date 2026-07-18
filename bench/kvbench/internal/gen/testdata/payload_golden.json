@@ -1,0 +1,9 @@
+{
+  "blob_bytes": 462848,
+  "blob_xxh3_64_hex": "6fff9eb7213f62e9",
+  "first64_hex": "7a87614444ed15c1f9a042146fda2f25422fb68187c3b5c8c37352d9d2f8d7d56c0168b39d1ce2b9e8487b370d5899182442bd5ec8e2a50086f081260dedc55d",
+  "key_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+  "note": "cross-language contract: chunk_j = XXH3_128('kvbench-payload-v1' || u64le(seed) || key || u64le(j)), canonical big-endian 16B, concatenated, truncated to blob_bytes. Python: xxhash.xxh3_128(P + j.to_bytes(8,'little')).digest()",
+  "seed": 1,
+  "spec": "kvbench-payload-v1"
+}
