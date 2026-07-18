@@ -82,3 +82,23 @@ full stack on `facebook/opt-125m` (CPU) at the pinned
 | No remote hits after round 2 | daemon unreachable (check `curl HOST:9442/healthz`), or a token/namespace mismatch → every op is silently a miss |
 | `connection refused` in logs, serving still works | expected during a daemon restart — the connector re-dials lazily; hits resume once it's back |
 | vLLM won't build on macOS arm64 | known upstream flakiness — the CI gate (ubuntu) is authoritative; on Mac, run the connector unit suite (`pytest python/lmcache_kvblockd/tests`) which exercises every line of the adapter against a real daemon without vLLM |
+
+## Next connectors (status: reserved, not shipped)
+
+The strategy is fixed: kvblockd is reached through the connectors people
+already run, in this order — nothing here is speculative enough to promise a
+date, and nothing ships half-working.
+
+| Connector | Status | Reserved path |
+|---|---|---|
+| LMCache → vLLM | **shipped** (above) | `python/lmcache_kvblockd/` |
+| vLLM native connector | next | `adapters/vllm/` (created when work starts) |
+| NIXL plugin | planned | `adapters/nixl/` |
+| SGLang HiCache backend | planned | `adapters/sglang/` (created when work starts) |
+
+Version-compatibility policy: each shipped connector pins the upstream
+releases it is tested against (the support matrix above); when an upstream
+release breaks the interface, the tripwire workflow goes red, the matrix in
+this file states the last supported pin, and the fix lands as a patch
+release — the answer to "does it work with X?" is always this table, never
+a guess.

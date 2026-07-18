@@ -35,6 +35,30 @@ Format: Keep a Changelog (https://keepachangelog.com), SemVer after v0.1.0.
 - Transport: startup tripwire logging if the connection is ever not a bare
   `*net.TCPConn` (golang/go#21676 — a wrapped conn silently loses the writev
   fast path, one Write syscall per buffer).
+- `internal/store/dram`: the real DRAM tier — GC-invisible mmap arena
+  (optional hugepages), OffsetAllocator port, sharded index, lease/pin/TTL
+  ladder, refcounted zero-copy reads, per-namespace pinned-bytes accounting.
+- `internal/eviction`: S3-FIFO (+ sampled-LRU) behind a pluggable Policy
+  interface; watermark evictor; scrape-time eviction counters.
+- `internal/store/modeltest`: model-based correctness harness (rapid) — the
+  permanent oracle every tier must pass, incl. crash/recovery + resurrection
+  semantics.
+- `python/kvblockd` + `python/lmcache_kvblockd`: the Python wire client and
+  the LMCache RemoteConnector backend (Go↔Python key-hash parity pinned by
+  golden vectors); no-GPU CPU e2e recipe + CI.
+- `internal/store/nvme` + tiered orchestrator: log-structured NVMe warm tier
+  (256 MiB sealed segments, group-commit fdatasync ledger, checkpointed
+  crash recovery), DRAM→NVMe demotion / second-hit promotion, and the
+  kill -9 torture harness (`test/crash/`) enforcing the crash contract.
+- `bench/kvbench`: the benchmark harness — coordinated-omission-safe
+  open-loop scheduler, HDR histograms, four target drivers, deterministic
+  payloads, `.kvops` trace converters (count-exact), adaptive replay where
+  hit rate is an output, and a one-command loopback acceptance gate.
+- Release engineering: `--version` stamping, goreleaser v2 static matrix
+  (linux amd64/arm64 + darwin arm64), `test/release/assert_static.sh`
+  (statically linked + <20 MB + scratch-boot gates), SBOMs, `FROM scratch`
+  Docker image, `deploy/kvblockd.service`, `scripts/install.sh`, and the
+  tag-driven release workflow.
 
 ### Changed
 - Transport writes are windowed at `write_chunk_bytes` (~1 MiB) per writev
