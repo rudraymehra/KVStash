@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -22,6 +23,10 @@ import (
 	"github.com/kvstash/kvblockd/internal/store/nvme"
 )
 
+// version is stamped by the release build (-ldflags "-X main.version=…");
+// "dev" means a non-release build.
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "kvblockd:", err)
@@ -33,7 +38,12 @@ func run() error {
 	cfgPath := flag.String("config", "", "path to config YAML (empty = built-in defaults)")
 	listen := flag.String("listen", "", "override listen_addr")
 	namespaces := flag.String("namespaces", "", "override namespaces_path")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("kvblockd %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+		return nil
+	}
 
 	var ov config.Overrides
 	if *listen != "" {

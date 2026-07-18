@@ -23,10 +23,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/kvstash/kvblockd/pkg/client"
 )
+
+// version is stamped by the release build (-ldflags "-X main.version=…");
+// "dev" means a non-release build.
+var version = "dev"
 
 // common holds the flags every subcommand shares.
 type common struct {
@@ -79,6 +84,7 @@ Usage:
   kvbctl put    [flags] KEY <FILE|->    store one block (stdin with -)
   kvbctl delete [flags] [-force] KEY... remove blocks
   kvbctl stats  [flags]                 server stats JSON
+  kvbctl version                        print version
 
 Shared flags: -addr -token -ns -timeout -hex   (see 'kvbctl CMD -h')
 `)
@@ -101,6 +107,8 @@ func main() {
 		code = cmdDelete(os.Args[2:])
 	case "stats":
 		code = cmdStats(os.Args[2:])
+	case "-version", "--version", "version":
+		fmt.Printf("kvbctl %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
 	case "-h", "--help", "help":
 		usage()
 	default:
