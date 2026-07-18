@@ -36,14 +36,38 @@ type mBlock struct {
 	soft, hard bool
 	heldRefs   int  // live GetRef holds the machine keeps open
 	maybeGone  bool // a pressure pass may have taken it; reconcile on sight
+	// anyOf is set on a resurrected ghost whose exact surviving content is
+	// unknown until the first byte-carrying observation: the block must
+	// match ONE of these historical contents (see model.resolveBytes).
+	anyOf []histRec
 }
 
 // model is the reference: plain maps, no tiers, no eviction of its own.
+//
+// Resurrection (the tiered machine's crash semantics, a ladder finding):
+// an NVMe DELETE is not crash-durable — recovery replays footers and
+// checkpoints, so a deleted key whose bytes ever reached a segment may
+// come BACK after a crash, carrying any content that was ever legitimately
+// committed under it. The model therefore keeps a per-key HISTORY of every
+// committed content and an epoch-stamped ghost set: after a crash
+// (epoch++), an observation of a key the model thinks absent is legal iff
+// the key was deleted in an earlier epoch and the served bytes match some
+// historical content (I1 still binds byte-identity — resurrection may
+// never invent bytes).
 type model struct {
 	now       int64
 	blocks    map[eviction.Key]*mBlock
 	pinned    map[uint32]int64 // mirrors the per-ns pinned-bytes ledger
 	pinnedCap int64
+
+	epoch   int                        // crash counter
+	ghosts  map[eviction.Key]int       // deleted keys → epoch of deletion
+	history map[eviction.Key][]histRec // every content ever committed under the key
+}
+
+type histRec struct {
+	data []byte
+	xxh3 uint64
 }
 
 func newModel(startNanos, pinnedCap int64) *model {
@@ -52,7 +76,64 @@ func newModel(startNanos, pinnedCap int64) *model {
 		blocks:    make(map[eviction.Key]*mBlock),
 		pinned:    make(map[uint32]int64),
 		pinnedCap: pinnedCap,
+		ghosts:    make(map[eviction.Key]int),
+		history:   make(map[eviction.Key][]histRec),
 	}
+}
+
+// noteDeleted records a successful DELETE: the key may resurrect after a
+// LATER crash (never before one — index removal is immediate).
+func (m *model) noteDeleted(k eviction.Key) {
+	delete(m.blocks, k)
+	m.ghosts[k] = m.epoch
+}
+
+// crashed bumps the epoch (called by simulate_crash).
+func (m *model) crashed() { m.epoch++ }
+
+// resurrectable reports whether an observation of the model-absent key k is
+// explainable as post-crash resurrection.
+func (m *model) resurrectable(k eviction.Key) bool {
+	e, ok := m.ghosts[k]
+	return ok && e < m.epoch
+}
+
+// materializeGhost re-admits a resurrected key with as-yet-unknown content:
+// the block carries the key's full history as candidates (anyOf); the next
+// byte-carrying observation (GET) pins it down. Protection state starts
+// clean — it died with the process.
+func (m *model) materializeGhost(k eviction.Key) *mBlock {
+	b := &mBlock{anyOf: m.history[k], maybeGone: true}
+	m.blocks[k] = b
+	return b
+}
+
+// resolveBytes checks served bytes against the block: a pinned-down block
+// demands ITS content; an anyOf block accepts any historical content and
+// pins down to it. Returns false on an I1 violation.
+func (m *model) resolveBytes(b *mBlock, data []byte, sum uint64) bool {
+	if b.anyOf == nil {
+		return sum == b.xxh3 && bytesEqual(data, b.data)
+	}
+	for _, h := range b.anyOf {
+		if sum == h.xxh3 && bytesEqual(data, h.data) {
+			b.data, b.xxh3, b.anyOf = h.data, h.xxh3, nil
+			return true
+		}
+	}
+	return false
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // protected mirrors the evictor's gate from the model's side: blocks the
@@ -87,9 +168,16 @@ func (m *model) reconcileMiss(k eviction.Key) bool {
 }
 
 // insert replaces the model block for k (fresh publish: all protection
-// state resets — the store built a brand-new BlockRef).
+// state resets — the store built a brand-new BlockRef) and records the
+// content in the key's resurrection history.
 func (m *model) insert(k eviction.Key, data []byte, sum uint64) {
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	m.blocks[k] = &mBlock{data: cp, xxh3: sum}
+	for _, h := range m.history[k] {
+		if h.xxh3 == sum && bytesEqual(h.data, cp) {
+			return // content already on record
+		}
+	}
+	m.history[k] = append(m.history[k], histRec{data: cp, xxh3: sum})
 }

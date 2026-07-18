@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -13,7 +14,9 @@ import (
 
 	"github.com/kvstash/kvblockd/internal/eviction"
 	"github.com/kvstash/kvblockd/internal/protocol"
+	"github.com/kvstash/kvblockd/internal/store"
 	"github.com/kvstash/kvblockd/internal/store/dram"
+	"github.com/kvstash/kvblockd/internal/store/nvme"
 )
 
 const (
@@ -23,7 +26,28 @@ const (
 	pinnedCap      = 1 << 20
 	startNanos     = int64(1_700_000_000_000_000_000)
 	junkSize       = 256 << 10
+
+	// Two-tier machine geometry: 1 MiB segments so a handful of demotions
+	// rotate + seal + checkpoint; a generous volume budget so reclaim fires
+	// occasionally (cache-legal loss) without dominating the walk.
+	segBytes   = 1 << 20
+	volMax     = 64 << 20
+	maxBlobLen = 512 << 10
 )
+
+// sutStore is what both kinds under test satisfy (the model is tier-blind).
+type sutStore interface {
+	ExistsPrefix(ns uint32, keys [][32]byte, withBitmap bool) (uint32, []protocol.Status)
+	Get(ns uint32, key [32]byte) ([]byte, uint64, bool)
+	GetRef(ns uint32, key [32]byte) ([]byte, uint64, func(), bool)
+	Put(ns uint32, key [32]byte, data []byte, xxh3 uint64) protocol.Status
+	Contains(ns uint32, key [32]byte) bool
+	Delete(ns uint32, key [32]byte, force bool) protocol.Status
+	TouchLease(ns uint32, key [32]byte, sub uint8, ttlMS uint32) protocol.Status
+	PinOp(ns uint32, key [32]byte, sub uint8) protocol.Status
+	Stats() []byte
+	Close() error
+}
 
 // poolHash returns the i'th pooled key hash. The pool is SHARED across
 // namespaces (same hash, different ns, different payloads) — I4's teeth.
@@ -52,36 +76,93 @@ type heldRef struct {
 }
 
 type storeStats struct {
-	Blocks         int              `json:"blocks"`
+	Blocks         int              `json:"blocks"` // DRAM-resident (the top-level doc IS the dram tier)
 	Bytes          int64            `json:"bytes"`
 	ArenaBytes     int64            `json:"arena_bytes"`
 	ArenaFreeBytes int64            `json:"arena_free_bytes"`
 	PinnedBytes    map[string]int64 `json:"pinned_bytes"`
 	EvictionsTotal uint64           `json:"evictions_total"`
 	LiveAllocs     int64            `json:"live_allocs"`
+	Nvme           *struct {
+		Blocks int   `json:"blocks"`
+		Bytes  int64 `json:"bytes"`
+	} `json:"nvme"` // present only on the tiered machine
 }
 
-// TestStoreModel is the harness: the real tier vs the reference model over
-// a randomized op stream, invariants after every step, both policies drawn.
+// residentBlocks/residentBytes are the store's whole-cache view across tiers.
+func (d *storeStats) residentBlocks() int {
+	if d.Nvme != nil {
+		return d.Blocks + d.Nvme.Blocks
+	}
+	return d.Blocks
+}
+
+func (d *storeStats) residentBytes() int64 {
+	if d.Nvme != nil {
+		return d.Bytes + d.Nvme.Bytes
+	}
+	return d.Bytes
+}
+
+// TestStoreModel is the harness: the real store vs the reference model over
+// a randomized op stream, invariants after every step. Both policies AND
+// both store kinds are drawn — "dram" is the single-tier machine, "tiered"
+// stacks a real NVMe volume underneath and adds crash/recovery (I6).
 func TestStoreModel(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		policyName := rapid.SampledFrom([]string{"s3fifo", "sampled-lru"}).Draw(rt, "policy")
-		pol, err := eviction.New(policyName, 8192)
-		if err != nil {
-			rt.Fatal(err)
-		}
+		kind := rapid.SampledFrom([]string{"dram", "tiered"}).Draw(rt, "kind")
 		cur := startNanos
-		arena, err := dram.NewArena(arenaBytes, false)
+
+		volDir, err := os.MkdirTemp("", "kvb-modeltest-*")
 		if err != nil {
 			rt.Fatal(err)
 		}
-		s := dram.New(arena, dram.Params{
-			LeaseDefaultMS: leaseDefaultMS,
-			LeaseMaxMS:     leaseMaxMS,
-			PinnedBytesCap: pinnedCap,
-			Now:            func() int64 { return cur },
-		})
-		s.AttachPolicy(pol) // evictor NOT started: eviction only via the explicit pressure op
+		defer func() { _ = os.RemoveAll(volDir) }()
+
+		// mkSUT builds a fresh store over volDir — called once at start and
+		// again after every simulate_crash (recovery is the point).
+		var s sutStore
+		var ds *dram.Store
+		var tt *store.Tiered
+		mkSUT := func() {
+			pol, perr := eviction.New(policyName, 8192)
+			if perr != nil {
+				rt.Fatal(perr)
+			}
+			arena, aerr := dram.NewArena(arenaBytes, false)
+			if aerr != nil {
+				rt.Fatal(aerr)
+			}
+			ds = dram.New(arena, dram.Params{
+				LeaseDefaultMS: leaseDefaultMS,
+				LeaseMaxMS:     leaseMaxMS,
+				PinnedBytesCap: pinnedCap,
+				Now:            func() int64 { return cur },
+			})
+			ds.AttachPolicy(pol) // evictor NOT started: pressure only via the explicit op
+			if kind == "dram" {
+				s, tt = ds, nil
+				return
+			}
+			vol, _, ents, verr := nvme.OpenVolume(nvme.VolumeParams{
+				Dir: volDir, SegmentBytes: segBytes, MaxBytes: volMax,
+				ReadWorkers: 2, CkptEverySegs: 2, MaxBlobLen: maxBlobLen,
+				Now: func() int64 { return cur },
+			})
+			if verr != nil {
+				rt.Fatal(verr)
+			}
+			tt = store.NewTiered(ds, pol, []*nvme.Volume{vol}, nil,
+				[][]nvme.RecoveredEntry{ents}, store.Params{
+					LeaseDefaultMS: leaseDefaultMS, LeaseMaxMS: leaseMaxMS,
+					PromoteWindow: time.Hour, // wide window; promotions happen via GETs (no background loops started)
+					Now:           func() int64 { return cur },
+				})
+			s = tt
+		}
+		mkSUT()
+
 		m := newModel(startNanos, pinnedCap)
 		var held []heldRef
 		junkSeq := 0
@@ -106,6 +187,18 @@ func TestStoreModel(t *testing.T) {
 					map[bool]string{true: "PROTECTED", false: "un-marked"}[m.protected(m.blocks[k])])
 			}
 		}
+		// ghostOrFatal resolves a store observation of a key the model thinks
+		// absent: legal ONLY as post-crash resurrection of a deleted key
+		// (NVMe DELETE is not crash-durable — recovery may replay it; the
+		// ladder's confirmed model/store divergence). Returns the
+		// materialized block, or fails the run.
+		ghostOrFatal := func(k eviction.Key, what string) *mBlock {
+			if !m.resurrectable(k) {
+				rt.Fatalf("%s hit for a key the model never stored: %v", what, k)
+				return nil
+			}
+			return m.materializeGhost(k)
+		}
 		// grantLease mirrors the store's §3.3 auto-lease on every OK read —
 		// MONOTONIC, like the store's extendLease: a 5s auto-grant never
 		// truncates a live longer lease (the divergence here was the deep
@@ -128,10 +221,23 @@ func TestStoreModel(t *testing.T) {
 				e := m.blocks[k]
 				switch {
 				case e == nil:
-					switch st {
-					case protocol.StatusOK:
+					switch {
+					case st == protocol.StatusOK:
 						m.insert(k, data, sum)
-					case protocol.StatusErrQuotaBytes: // full arena, no evictor: legal
+					case st == protocol.StatusErrQuotaBytes: // full arena, no evictor: legal
+					case st == protocol.StatusOKExists && m.resurrectable(k):
+						// A crash resurrected the deleted key with OUR sum:
+						// the resident content is (xxh3-)identical to this put.
+						b := m.materializeGhost(k)
+						if !m.resolveBytes(b, data, sum) {
+							rt.Fatalf("put resurrected-dup: OK_EXISTS but %v matches no history", k)
+						}
+						b.maybeGone = false
+					case st == protocol.StatusErrImmutableConflict && m.resurrectable(k):
+						// Resurrected with some OTHER historical content —
+						// the write-once alarm is correct; content pins down
+						// at the next GET.
+						m.materializeGhost(k).maybeGone = false
 					default:
 						rt.Fatalf("put fresh: %s", st)
 					}
@@ -166,12 +272,13 @@ func TestStoreModel(t *testing.T) {
 				}
 				e := m.blocks[k]
 				if e == nil {
-					rt.Fatalf("GET hit for a key the model never stored: %v", k)
-					return
+					e = ghostOrFatal(k, "GET")
 				}
-				// I1: byte-identical, right checksum, never cross-key/stale.
-				if sum != e.xxh3 || !bytes.Equal(data, e.data) {
-					rt.Fatalf("I1: GET bytes/sum mismatch for %v (len got %d want %d)", k, len(data), len(e.data))
+				// I1: byte-identical (to the block's content, or to ONE
+				// historical content for a resurrected ghost), right
+				// checksum, never cross-key/stale/invented.
+				if !m.resolveBytes(e, data, sum) {
+					rt.Fatalf("I1: GET bytes/sum mismatch for %v (%d bytes served)", k, len(data))
 				}
 				e.maybeGone = false // byte-verified present
 				grantLease(e)
@@ -188,10 +295,9 @@ func TestStoreModel(t *testing.T) {
 				}
 				e := m.blocks[k]
 				if e == nil {
-					rt.Fatalf("GETREF hit for unknown key %v", k)
-					return
+					e = ghostOrFatal(k, "GETREF")
 				}
-				if sum != e.xxh3 || !bytes.Equal(view, e.data) {
+				if !m.resolveBytes(e, view, sum) {
 					rt.Fatalf("I1: GETREF view mismatch for %v", k)
 				}
 				e.maybeGone = false
@@ -225,12 +331,12 @@ func TestStoreModel(t *testing.T) {
 				}
 				e := m.blocks[k]
 				if e == nil {
-					rt.Fatalf("EXISTS hit for unknown key %v", k)
-					return
+					e = ghostOrFatal(k, "EXISTS")
 				}
 				// Presence proven at this instant: an un-marked block that
 				// later vanishes without pressure is a store bug (the
-				// sticky-maybeGone hole the review closed).
+				// sticky-maybeGone hole the review closed). A resurrected
+				// ghost keeps anyOf until bytes pin it down.
 				e.maybeGone = false
 			},
 			"pin": func(rt *rapid.T) {
@@ -243,10 +349,12 @@ func TestStoreModel(t *testing.T) {
 					return
 				}
 				if e == nil {
-					rt.Fatalf("PIN %d answered %s for unknown key", sub, st)
-					return
+					e = ghostOrFatal(k, "PIN")
 				}
 				e.maybeGone = false // the pin op reached a resident block
+				if tt != nil && sub == protocol.PinHard && st == protocol.StatusErrBusy {
+					return // NVMe-resident hard pin promotes first; a full arena refuses (retryable) — pin unapplied
+				}
 				sz := int64(len(e.data))
 				switch sub {
 				case protocol.PinSoft:
@@ -295,8 +403,7 @@ func TestStoreModel(t *testing.T) {
 				}
 				e := m.blocks[k]
 				if e == nil {
-					rt.Fatalf("TOUCH_LEASE %s for unknown key", st)
-					return
+					e = ghostOrFatal(k, "TOUCH_LEASE")
 				}
 				if st != protocol.StatusOK {
 					rt.Fatalf("touch_lease sub %d: %s", sub, st)
@@ -328,10 +435,12 @@ func TestStoreModel(t *testing.T) {
 				st := s.Delete(ns, h, force)
 				e := m.blocks[k]
 				if e == nil {
-					if st != protocol.StatusNotFound {
-						rt.Fatalf("delete absent: %s", st)
+					if st == protocol.StatusNotFound {
+						return
 					}
-					return
+					// A non-NotFound answer for a model-absent key: legal
+					// only as a resurrected ghost (post-crash replay).
+					e = ghostOrFatal(k, "DELETE")
 				}
 				if st == protocol.StatusNotFound {
 					mustReconcileMiss(k, "DELETE")
@@ -356,7 +465,7 @@ func TestStoreModel(t *testing.T) {
 						st, want, e.hard, e.soft, e.leaseUntil > m.now, force)
 				}
 				if st == protocol.StatusOK {
-					delete(m.blocks, k) // soft pins carried no charge; hard never deletes
+					m.noteDeleted(k) // soft pins carried no charge; hard never deletes; a later CRASH may resurrect
 				} else {
 					e.maybeGone = false // the gate answered: the block is resident
 				}
@@ -367,7 +476,11 @@ func TestStoreModel(t *testing.T) {
 				m.now = cur
 			},
 			"pressure": func(rt *rapid.T) {
-				// Junk-fill toward the wall, then one deterministic pass.
+				// Junk-fill toward the wall, then one deterministic pass:
+				// eviction on the dram machine; demotion + reclaim + eviction
+				// on the tiered one (the same lossy-cache posture — the model
+				// marks unprotected blocks maybeGone either way; demoted
+				// blocks simply KEEP answering from the other tier).
 				for i := 0; i < 40; i++ {
 					h := junkHash(junkSeq)
 					junkSeq++
@@ -383,7 +496,10 @@ func TestStoreModel(t *testing.T) {
 					}
 					break
 				}
-				s.EvictNow()
+				if tt != nil {
+					tt.DemoteNow() // demote pass + reclaim pass, synchronous
+				}
+				ds.EvictNow()
 				m.markPressure()
 				// I2 probe: every protected block must still be resident.
 				for k, b := range m.blocks {
@@ -391,6 +507,33 @@ func TestStoreModel(t *testing.T) {
 						rt.Fatalf("I2: protected block %v gone after pressure (hard=%v leased=%v held=%d)",
 							k, b.hard, b.leaseUntil > m.now, b.heldRefs)
 					}
+				}
+			},
+			"simulate_crash": func(rt *rapid.T) {
+				if tt == nil {
+					return // single-tier machine has no crash story (nothing persists)
+				}
+				if len(held) > 0 {
+					return // a crash with live reader views is the harness's own UB, not the store's
+				}
+				tt.CrashForTest() // volumes drop fds mid-flight, arena unmapped — SIGKILL semantics
+				mkSUT()           // reopen the SAME volume dir: real recovery runs
+				m.crashed()       // deleted-key ghosts become resurrectable from here on
+				// The model after a crash: DRAM contents vanished, protection
+				// state (leases/pins — memory-only) vanished, and any block
+				// may or may not have made it to a recoverable NVMe record.
+				// Byte-identical-or-NOT_FOUND (I1) is the whole contract.
+				for _, b := range m.blocks {
+					b.maybeGone = true
+					b.leaseUntil = 0
+					b.ttlUntil = 0
+					b.soft, b.hard = false, false
+				}
+				m.pinned = map[uint32]int64{}
+				// I6: the recovered index matches storage — every entry the
+				// store still vouches for must read back checksum-clean.
+				if bad := tt.Scrub(); bad != 0 {
+					rt.Fatalf("I6: post-recovery scrub found %d unservable indexed blocks", bad)
 				}
 			},
 			"": func(rt *rapid.T) {
@@ -408,11 +551,18 @@ func TestStoreModel(t *testing.T) {
 						definiteBytes += int64(len(b.data))
 					}
 				}
-				if doc.Blocks < definite || doc.Blocks > total {
-					rt.Fatalf("I3: store blocks=%d outside model [%d, %d]", doc.Blocks, definite, total)
+				// Dual residency (a promoted block counted in BOTH tiers) can
+				// push the resident count past the model's key count — the
+				// upper bound doubles on the tiered machine, honestly.
+				maxResident := total
+				if doc.Nvme != nil {
+					maxResident = 2 * total
 				}
-				if doc.Bytes < definiteBytes {
-					rt.Fatalf("I3: store bytes=%d < model definite %d", doc.Bytes, definiteBytes)
+				if got := doc.residentBlocks(); got < definite || got > maxResident {
+					rt.Fatalf("I3: store blocks=%d outside model [%d, %d]", got, definite, maxResident)
+				}
+				if got := doc.residentBytes(); got < definiteBytes {
+					rt.Fatalf("I3: store bytes=%d < model definite %d", got, definiteBytes)
 				}
 				if doc.ArenaFreeBytes < 0 || doc.ArenaFreeBytes > doc.ArenaBytes {
 					rt.Fatalf("I3: arena accounting: %+v", doc)
@@ -448,7 +598,10 @@ func TestStoreModel(t *testing.T) {
 					var present []eviction.Key
 					for _, ns := range []uint32{1, 2, 3} {
 						k := eviction.Key{NS: ns, Hash: h}
-						if b := m.blocks[k]; b != nil && !b.maybeGone {
+						// Only byte-verified, pinned-down copies participate —
+						// an unresolved resurrected ghost has no bytes to
+						// compare yet.
+						if b := m.blocks[k]; b != nil && !b.maybeGone && b.anyOf == nil {
 							present = append(present, k)
 						}
 					}
