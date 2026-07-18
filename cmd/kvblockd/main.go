@@ -1,6 +1,6 @@
 // Command kvblockd is the single-binary KV-cache block store daemon: config →
-// arena-backed DRAM tier → server. The NVMe and S3 tiers stack underneath the
-// DRAM tier later.
+// arena-backed DRAM tier (→ log-structured NVMe tier when nvme_paths is set)
+// → server. The S3 tier stacks underneath later.
 package main
 
 import (
@@ -17,7 +17,9 @@ import (
 	"github.com/kvstash/kvblockd/internal/eviction"
 	"github.com/kvstash/kvblockd/internal/metrics"
 	"github.com/kvstash/kvblockd/internal/server"
+	"github.com/kvstash/kvblockd/internal/store"
 	"github.com/kvstash/kvblockd/internal/store/dram"
+	"github.com/kvstash/kvblockd/internal/store/nvme"
 )
 
 func main() {
@@ -54,21 +56,20 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("dram arena: %w", err)
 	}
-	store := dram.New(arena, dram.Params{
+	dstore := dram.New(arena, dram.Params{
 		LeaseDefaultMS: cfg.LeaseDefaultMS,
 		LeaseMaxMS:     cfg.LeaseMaxMS,
 		PinnedBytesCap: cfg.PinnedBytesCap,
 	})
 
-	srv := server.New(cfg, store, ns)
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// Eviction: policy attach + the watermark goroutine. stopEvict must run
-	// before EVERY store.Close (and on the drain-timeout path too) so no
+	// before EVERY store close (and on the drain-timeout path too) so no
 	// eviction free races the arena unmap; it is safe to call repeatedly.
 	stopEvict := func() {}
+	var pol eviction.Policy
 	if cfg.EvictionPolicy != "none" {
 		ghost := cfg.EvictionGhostEntries
 		if ghost == 0 {
@@ -76,13 +77,14 @@ func run() error {
 			// (arena / 64 KiB) — the policy itself stays arena-ignorant.
 			ghost = int(cfg.DramArenaBytes >> 16)
 		}
-		pol, perr := eviction.New(cfg.EvictionPolicy, ghost)
+		var perr error
+		pol, perr = eviction.New(cfg.EvictionPolicy, ghost)
 		if perr != nil {
-			_ = store.Close()
+			_ = dstore.Close()
 			return perr
 		}
-		store.AttachPolicy(pol)
-		stopOnce := store.StartEvictor(ctx, dram.EvictorConfig{
+		dstore.AttachPolicy(pol)
+		stopOnce := dstore.StartEvictor(ctx, dram.EvictorConfig{
 			WatermarkPct: cfg.EvictionWatermarkPct,
 			BatchPct:     cfg.EvictionBatchPct,
 		})
@@ -98,7 +100,72 @@ func run() error {
 			"watermark", cfg.EvictionWatermarkPct, "batch", cfg.EvictionBatchPct)
 	}
 
-	set := metrics.New(store.Stats)
+	// NVMe tier (nvme_paths set): open every volume — recovery (checkpoint +
+	// footer scan + tail truncation) runs inside OpenVolume — then stack the
+	// tiered orchestrator on top. The server sees ONE store either way.
+	var srvStore server.Store = dstore
+	statsFn := dstore.Stats
+	closeStore := dstore.Close
+	stopTier := func() {}
+	if len(cfg.NvmePaths) > 0 {
+		vols := make([]*nvme.Volume, 0, len(cfg.NvmePaths))
+		reports := make([]*nvme.RecoveryReport, 0, len(cfg.NvmePaths))
+		recovered := make([][]nvme.RecoveredEntry, 0, len(cfg.NvmePaths))
+		perVol := cfg.NvmeMaxBytes / int64(len(cfg.NvmePaths))
+		closeVols := func() {
+			for _, v := range vols {
+				_ = v.Close()
+			}
+		}
+		for _, dir := range cfg.NvmePaths {
+			v, rep, ents, verr := nvme.OpenVolume(nvme.VolumeParams{
+				Dir:            dir,
+				SegmentBytes:   cfg.NvmeSegmentBytes,
+				MaxBytes:       perVol,
+				SyncEveryBytes: cfg.NvmeSyncEveryBytes,
+				ReadWorkers:    cfg.NvmeReadWorkers,
+				CkptEverySegs:  cfg.NvmeCkptEverySegments,
+				MaxBlobLen:     cfg.MaxBlobLen,
+			})
+			if verr != nil {
+				closeVols()
+				stopEvict()
+				_ = dstore.Close()
+				return fmt.Errorf("nvme volume %s: %w", dir, verr)
+			}
+			fmt.Fprintf(os.Stderr, "kvblockd: nvme volume %s recovered: %d segments scanned, %d blocks, %d bytes truncated, %s\n",
+				dir, rep.SegmentsScanned, rep.BlocksRecovered, rep.BytesTruncated, rep.Duration)
+			vols = append(vols, v)
+			reports = append(reports, rep)
+			recovered = append(recovered, ents)
+		}
+		tiered := store.NewTiered(dstore, pol, vols, reports, recovered, store.Params{
+			DemoteWatermarkPct: cfg.NvmeDemoteWatermarkPct,
+			DemoteBatchPct:     cfg.NvmeDemoteBatchPct,
+			AdmitMinHits:       cfg.NvmeAdmitMinHits,
+			// 0 stays 0 = promotion disabled; the 60s default lives in the
+			// config layer where the operator can see it.
+			PromoteWindow:  time.Duration(cfg.NvmePromoteWindowMS) * time.Millisecond,
+			LeaseDefaultMS: cfg.LeaseDefaultMS,
+			LeaseMaxMS:     cfg.LeaseMaxMS,
+		})
+		stopT := tiered.Start(ctx)
+		var tierStopped bool
+		stopTier = func() {
+			if !tierStopped {
+				tierStopped = true
+				stopT()
+			}
+		}
+		defer stopTier()
+		srvStore, statsFn, closeStore = tiered, tiered.Stats, tiered.Close
+		fmt.Fprintln(os.Stderr, "kvblockd: nvme tier on", len(vols), "volume(s),",
+			cfg.NvmeMaxBytes, "bytes budget, demote at", cfg.NvmeDemoteWatermarkPct, "%")
+	}
+
+	srv := server.New(cfg, srvStore, ns)
+
+	set := metrics.New(statsFn)
 	srv.SetRecorder(set)
 	if cfg.MetricsAddr != "" {
 		if host, _, herr := net.SplitHostPort(cfg.MetricsAddr); herr == nil {
@@ -109,8 +176,9 @@ func run() error {
 		}
 		bound, wait, err := set.Serve(ctx, cfg.MetricsAddr)
 		if err != nil {
+			stopTier()
 			stopEvict()
-			_ = store.Close()
+			_ = closeStore()
 			return fmt.Errorf("metrics endpoint: %w", err)
 		}
 		// Defers run LIFO: cancel the signal ctx BEFORE blocking on the ops
@@ -121,8 +189,9 @@ func run() error {
 	}
 
 	if _, err := srv.Start(ctx); err != nil {
+		stopTier()
 		stopEvict()
-		_ = store.Close()
+		_ = closeStore()
 		return err
 	}
 	set.SetReady() // arena prefaulted (NewArena) and listener accepting
@@ -133,14 +202,17 @@ func run() error {
 	if !srv.Drain(drainCtx) {
 		// A writer may still hold arena views (a peer that stopped reading).
 		// Unmapping now could send unrelated process memory to that peer —
-		// skip the unmap; the process exit reclaims everything anyway.
+		// skip the unmap; the process exit reclaims everything anyway (open
+		// segment fds included; kill -9 is the recovery path's whole job).
 		fmt.Fprintln(os.Stderr, "kvblockd: drain timed out — leaving the arena mapped for process exit")
+		stopTier()
 		stopEvict()
 		return nil
 	}
-	// Strictly AFTER a SUCCESSFUL Drain (and a stopped evictor): every
-	// conn's writer has flushed and no eviction pass is mid-free, so the
-	// arena unmaps with no live views.
+	// Strictly AFTER a SUCCESSFUL Drain: stop the tier movers (the demoter
+	// releases its arena holds), then the evictor, then close — volumes
+	// first (writer drain + final sync), dram arena last.
+	stopTier()
 	stopEvict()
-	return store.Close()
+	return closeStore()
 }

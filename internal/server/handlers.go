@@ -113,6 +113,9 @@ func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []by
 	// Zero-copy stores hand out per-block release callbacks that must fire
 	// after the kernel accepts THIS frame's writev (the §12 hold-until-written
 	// rule); heap stores (ramstub) don't implement refGetter and release nil.
+	// Tiered stores additionally report the serving tier + a per-key status
+	// (NVMe saturation → ERR_BUSY descriptor).
+	tg, hasTier := s.srv.store.(tierRefGetter)
 	rg, hasRefs := s.srv.store.(refGetter)
 
 	maxFrame := int(s.limits.MaxFrameLen)
@@ -125,7 +128,8 @@ func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []by
 		s.writeRespFlags(c, h, protocol.FlagResp, net.Buffers{region}, nil)
 		return
 	}
-	var nHits, nMisses, bytesOut int
+	var nMisses, nBusy int
+	var dramHits, nvmeHits, dramBytes, nvmeBytes int
 	for i := 0; i < total; {
 		// descScratch is reused across frames and requests: AppendGetRespHeader
 		// (below) serializes it into the region bytes synchronously, so it is
@@ -141,19 +145,32 @@ func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []by
 		for j < total {
 			var data []byte
 			var sum uint64
-			var hit bool
+			var hit, busy bool
 			var rel func()
-			if hasRefs {
+			tier := "dram"
+			switch {
+			case hasTier:
+				var st protocol.Status
+				data, sum, rel, tier, st = tg.GetRefTier(s.ns, keys[j])
+				hit = st == protocol.StatusOK
+				busy = st == protocol.StatusErrBusy
+			case hasRefs:
 				data, sum, rel, hit = rg.GetRef(s.ns, keys[j])
-			} else {
+			default:
 				data, sum, hit = s.srv.store.Get(s.ns, keys[j])
 			}
 			blen := 0
 			var d protocol.Desc
-			if hit {
+			switch {
+			case hit:
 				blen = len(data)
 				d = protocol.Desc{Status: protocol.StatusOK, Len: uint32(blen), XXH3: sum} //nolint:gosec // G115: block sizes << MaxUint32
-			} else {
+			case busy:
+				// §3 descriptors carry per-key outcomes: a saturated device
+				// reader answers ERR_BUSY for THIS key (retryable), payload-
+				// free — the batch and the connection sail on.
+				d = protocol.Desc{Status: protocol.StatusErrBusy}
+			default:
 				d = protocol.Desc{Status: protocol.StatusNotFound}
 			}
 			// Would adding this descriptor+payload overflow the frame? Always
@@ -166,17 +183,25 @@ func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []by
 				break
 			}
 			descs = append(descs, d)
-			if hit {
+			switch {
+			case hit:
 				if blen > 0 { // a zero-length block is descriptor-only (§3.4)
 					bufs = append(bufs, data)
 					payloadBytes += blen
 				}
-				nHits++
-				bytesOut += blen
+				if tier == "nvme" {
+					nvmeHits++
+					nvmeBytes += blen
+				} else {
+					dramHits++
+					dramBytes += blen
+				}
 				if rel != nil {
 					releases = append(releases, rel)
 				}
-			} else {
+			case busy:
+				nBusy++
+			default:
 				nMisses++
 				if rel != nil {
 					rel() // defensive: a miss never hands out a release
@@ -206,7 +231,13 @@ func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []by
 		i = j
 	}
 	if r := s.srv.rec; r != nil {
-		r.GetResult(s.ns, nHits, nMisses, bytesOut)
+		r.GetResult(s.ns, "dram", dramHits, nMisses, dramBytes)
+		if nvmeHits > 0 {
+			r.GetResult(s.ns, "nvme", nvmeHits, 0, nvmeBytes)
+		}
+		if nBusy > 0 {
+			r.GetBusy(s.ns, nBusy)
+		}
 	}
 }
 

@@ -12,11 +12,14 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/kvstash/kvblockd/internal/protocol"
+	"github.com/kvstash/kvblockd/internal/store/nvme"
 )
 
 // Config is the daemon configuration. Byte sizes are plain integers (no size
@@ -82,6 +85,38 @@ type Config struct {
 	// EvictionGhostEntries caps each tenant's S3-FIFO ghost ring;
 	// 0 = auto (arena-derived: one fingerprint per conceivable block).
 	EvictionGhostEntries int `yaml:"eviction_ghost_entries"`
+
+	// NvmePaths lists the NVMe tier's volume directories (one per device is
+	// the intended shape); empty = DRAM-only, byte-for-byte the pre-tiering
+	// behavior. Blocks are placed across volumes by key hash.
+	NvmePaths []string `yaml:"nvme_paths"`
+	// NvmeMaxBytes is the total NVMe budget across volumes (split evenly);
+	// REQUIRED > 0 when nvme_paths is set — reclaim needs a reference.
+	NvmeMaxBytes int64 `yaml:"nvme_max_bytes"`
+	// NvmeSegmentBytes is the fixed fallocated size of every segment file
+	// (256 MiB default; [4 MiB, 4 GiB), multiple of 4096, and large enough
+	// for one max_blob_len record plus the seal footer).
+	NvmeSegmentBytes int64 `yaml:"nvme_segment_bytes"`
+	// NvmeReadWorkers bounds each volume's device-read pool (saturation
+	// answers per-key ERR_BUSY, never a hang).
+	NvmeReadWorkers int `yaml:"nvme_read_workers"`
+	// NvmeDemoteWatermarkPct triggers demotion at this DRAM occupancy —
+	// strictly below eviction_watermark_pct so demotion normally beats
+	// eviction to the punch; NvmeDemoteBatchPct is how far below it one
+	// pass demotes.
+	NvmeDemoteWatermarkPct int `yaml:"nvme_demote_watermark_pct"`
+	NvmeDemoteBatchPct     int `yaml:"nvme_demote_batch_pct"`
+	// NvmeAdmitMinHits: blocks with fewer lifetime GETs are evicted rather
+	// than written to flash (SSD endurance).
+	NvmeAdmitMinHits uint32 `yaml:"nvme_admit_min_hits"`
+	// NvmePromoteWindowMS: a 2nd NVMe hit within this window promotes the
+	// block back to DRAM; 0 disables promotion.
+	NvmePromoteWindowMS uint32 `yaml:"nvme_promote_window_ms"`
+	// NvmeSyncEveryBytes is the group-commit cadence (fdatasync ledger).
+	NvmeSyncEveryBytes int64 `yaml:"nvme_sync_every_bytes"`
+	// NvmeCkptEverySegments writes an index checkpoint every N seals
+	// (0 = never; recovery falls back to footer scans).
+	NvmeCkptEverySegments int `yaml:"nvme_ckpt_every_segments"`
 }
 
 // Overrides are the command-line flags an operator actually needs at launch;
@@ -117,6 +152,17 @@ func Default() Config {
 		EvictionPolicy:       "s3fifo",
 		EvictionWatermarkPct: 95, // Mooncake numbers: evict at 95%…
 		EvictionBatchPct:     5,  // …freeing 5% per batch
+
+		// NVMe tier defaults (inert until nvme_paths is set).
+		NvmePaths:              []string{}, // non-nil so `nvme_paths: []` in YAML round-trips to the default
+		NvmeSegmentBytes:       256 << 20,  // CacheLib-Navy-informed geometry
+		NvmeReadWorkers:        16,
+		NvmeDemoteWatermarkPct: 90,
+		NvmeDemoteBatchPct:     5,
+		NvmeAdmitMinHits:       1,
+		NvmePromoteWindowMS:    60000,
+		NvmeSyncEveryBytes:     8 << 20,
+		NvmeCkptEverySegments:  8,
 	}
 }
 
@@ -159,6 +205,23 @@ var envTable = []struct {
 			return fmt.Errorf("KVBLOCKD_PINNED_BYTES_CAP: %w", err)
 		}
 		c.PinnedBytesCap = n
+		return nil
+	}},
+	{"KVBLOCKD_NVME_PATHS", func(c *Config, v string) error {
+		c.NvmePaths = c.NvmePaths[:0]
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				c.NvmePaths = append(c.NvmePaths, p)
+			}
+		}
+		return nil
+	}},
+	{"KVBLOCKD_NVME_MAX_BYTES", func(c *Config, v string) error {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("KVBLOCKD_NVME_MAX_BYTES: %w", err)
+		}
+		c.NvmeMaxBytes = n
 		return nil
 	}},
 }
@@ -273,6 +336,58 @@ func (c Config) Validate() error {
 	check(c.EvictionBatchPct >= 1 && c.EvictionBatchPct < c.EvictionWatermarkPct,
 		"eviction_batch_pct %d: must be in [1, eviction_watermark_pct %d)", c.EvictionBatchPct, c.EvictionWatermarkPct)
 	check(c.EvictionGhostEntries >= 0, "eviction_ghost_entries %d: must be >= 0 (0 = auto)", c.EvictionGhostEntries)
+
+	if len(c.NvmePaths) > 0 {
+		// Paths are compared NORMALIZED: "/a" vs "/a/" (or "./x" vs "x")
+		// naming the same directory would put two volumes on one segment
+		// log — interleaved appends destroy the data (ladder finding).
+		// Nested paths are rejected for the same reason. Symlink aliases
+		// remain the operator's responsibility (documented; paths may not
+		// exist yet at validation time). NOTE also that key→volume
+		// placement is positional: reordering or removing entries reroutes
+		// every key (mass invalidation) — append only.
+		cleaned := make([]string, 0, len(c.NvmePaths))
+		seen := map[string]bool{}
+		for _, p := range c.NvmePaths {
+			check(p != "", "nvme_paths: empty path entry")
+			cp := filepath.Clean(p)
+			check(!seen[cp], "nvme_paths: duplicate path %q (normalized %q)", p, cp)
+			seen[cp] = true
+			cleaned = append(cleaned, cp)
+		}
+		for i := range cleaned {
+			for j := range cleaned {
+				if i != j && strings.HasPrefix(cleaned[i], cleaned[j]+string(filepath.Separator)) {
+					errs = append(errs, fmt.Errorf("nvme_paths: %q is nested inside %q — volumes must not overlap", cleaned[i], cleaned[j]))
+				}
+			}
+		}
+		nVols := int64(len(c.NvmePaths))
+		// The EXACT bound OpenVolume enforces — the ladder caught the two
+		// layers computing slightly different minima (a config in the gap
+		// validated, then failed at startup).
+		minSeg := nvme.MinSegmentBytes(c.MaxBlobLen)
+		check(c.NvmeSegmentBytes >= minSeg && c.NvmeSegmentBytes%4096 == 0 && c.NvmeSegmentBytes < int64(^uint32(0)),
+			"nvme_segment_bytes %d: must be a 4096-multiple in [%d (one max_blob_len record + footer), 4 GiB)",
+			c.NvmeSegmentBytes, minSeg)
+		check(c.NvmeMaxBytes > 2*c.NvmeSegmentBytes*nVols,
+			"nvme_max_bytes %d: must exceed 2 segments per volume (%d) — reclaim needs headroom",
+			c.NvmeMaxBytes, 2*c.NvmeSegmentBytes*nVols)
+		check(c.NvmeReadWorkers >= 1 && c.NvmeReadWorkers <= 1024,
+			"nvme_read_workers %d: must be in [1, 1024]", c.NvmeReadWorkers)
+		check(c.NvmeDemoteWatermarkPct >= 50 && c.NvmeDemoteWatermarkPct < c.EvictionWatermarkPct,
+			"nvme_demote_watermark_pct %d: must be in [50, eviction_watermark_pct %d) — demotion runs below eviction",
+			c.NvmeDemoteWatermarkPct, c.EvictionWatermarkPct)
+		check(c.NvmeDemoteBatchPct >= 1 && c.NvmeDemoteBatchPct < c.NvmeDemoteWatermarkPct,
+			"nvme_demote_batch_pct %d: must be in [1, nvme_demote_watermark_pct %d)",
+			c.NvmeDemoteBatchPct, c.NvmeDemoteWatermarkPct)
+		check(c.NvmeSyncEveryBytes > 0,
+			"nvme_sync_every_bytes %d: must be > 0 (the group-commit ledger)", c.NvmeSyncEveryBytes)
+		check(c.NvmeCkptEverySegments >= 0,
+			"nvme_ckpt_every_segments %d: must be >= 0 (0 = never)", c.NvmeCkptEverySegments)
+		check(c.EvictionPolicy != "none",
+			"nvme_paths set with eviction_policy \"none\": the demoter needs a policy to nominate victims")
+	}
 
 	return errors.Join(errs...)
 }

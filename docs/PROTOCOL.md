@@ -90,6 +90,13 @@ fields and per-key regions shown in §3.1–3.8 appear only on success.
 ```
 status u8 | reserved u8[3] | len u32 | xxh3_64 u64
 ```
+A descriptor's `status` may be ANY per-key code — including retryable
+backpressure (`ERR_BUSY`, e.g. a saturated device-reader pool on a tiered
+server) — with the batch-level status still OK; payload bytes follow only
+for OK descriptors. Clients must treat unknown/non-OK descriptor statuses
+as payload-free per-key outcomes. *(Clarification note, 2026-07-18: this
+was always the §3/§9 design — spelled out here when the NVMe tier became
+the first server to emit a non-NOT_FOUND miss code.)*
 `xxh3_64` (`github.com/zeebo/xxh3` in Go) is the payload checksum computed by
 the writer at PUT COMMIT, stored with the block, echoed on every GET — clients
 verify after `recv_into`, giving end-to-end integrity across DRAM→NVMe→S3

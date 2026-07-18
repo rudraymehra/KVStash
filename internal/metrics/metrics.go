@@ -37,6 +37,7 @@ type Set struct {
 	hits      *prometheus.CounterVec
 	misses    *prometheus.CounterVec
 	bytes     *prometheus.CounterVec
+	getBusy   *prometheus.CounterVec
 }
 
 // New builds the registry. stats, when non-nil, is the store's Stats()
@@ -65,8 +66,12 @@ func New(stats func() []byte) *Set {
 			Name: "kvb_bytes_total",
 			Help: "Block payload bytes by direction (in = committed PUTs, out = served GETs) and namespace id.",
 		}, []string{"dir", "ns"}),
+		getBusy: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "kvb_get_busy_total",
+			Help: "BATCH_GET per-key ERR_BUSY descriptors (NVMe reader saturation; retryable).",
+		}, []string{"ns"}),
 	}
-	s.reg.MustRegister(s.opSeconds, s.hits, s.misses, s.bytes)
+	s.reg.MustRegister(s.opSeconds, s.hits, s.misses, s.bytes, s.getBusy)
 	s.reg.MustRegister(collectors.NewGoCollector()) // GC pause/heap — the launch-day GC defense reads these
 	if stats != nil {
 		s.reg.MustRegister(&storeCollector{stats: stats})
@@ -106,20 +111,27 @@ func (s *Set) Op(op protocol.Opcode, seconds float64) {
 	s.opSeconds.WithLabelValues(opName(op)).Observe(seconds)
 }
 
-// GetResult records one BATCH_GET's per-key outcomes and payload bytes out.
-// The tier label is fixed to "dram" for now: the Recorder seam carries no
-// tier and neither does refGetter — when NVMe/S3 GETs land (ruling #4), the
-// seam gains a tier argument or hits from those tiers would mislabel.
-func (s *Set) GetResult(ns uint32, hits, misses, bytesOut int) {
+// GetResult records one tier's share of a BATCH_GET's per-key outcomes and
+// payload bytes out (the seam gained the tier argument when NVMe GETs
+// landed — hits from that tier no longer mislabel as "dram").
+func (s *Set) GetResult(ns uint32, tier string, hits, misses, bytesOut int) {
 	nsl := nsLabel(ns)
 	if hits > 0 {
-		s.hits.WithLabelValues("dram", nsl).Add(float64(hits))
+		s.hits.WithLabelValues(tier, nsl).Add(float64(hits))
 	}
 	if misses > 0 {
 		s.misses.WithLabelValues(nsl).Add(float64(misses))
 	}
 	if bytesOut > 0 {
 		s.bytes.WithLabelValues("out", nsl).Add(float64(bytesOut))
+	}
+}
+
+// GetBusy counts per-key ERR_BUSY GET descriptors (NVMe reader saturation —
+// the retryable backpressure signal).
+func (s *Set) GetBusy(ns uint32, n int) {
+	if n > 0 {
+		s.getBusy.WithLabelValues(nsLabel(ns)).Add(float64(n))
 	}
 }
 
@@ -150,6 +162,37 @@ var (
 		"Live arena extents (the allocator node-pool watermark numerator).", []string{"tier"}, nil)
 	descMaxAllocs = prometheus.NewDesc("kvb_max_allocs",
 		"Allocator node-pool capacity (live extents ceiling).", []string{"tier"}, nil)
+
+	// NVMe tier scrape-time metrics, fed from the "nvme" sub-document a
+	// tiered store adds to its Stats() JSON. A DRAM-only store has no such
+	// sub-document and emits none of these — scrape output is byte-identical
+	// to the pre-tiering daemon.
+	descNvmeSegments = prometheus.NewDesc("kvb_nvme_segments",
+		"Live NVMe segment files across volumes.", nil, nil)
+	descNvmeUsed = prometheus.NewDesc("kvb_nvme_used_bytes",
+		"Fallocated bytes across live NVMe segments.", nil, nil)
+	descNvmeMax = prometheus.NewDesc("kvb_nvme_max_bytes",
+		"Configured NVMe capacity across volumes.", nil, nil)
+	descNvmeDemotions = prometheus.NewDesc("kvb_nvme_demotions_total",
+		"Blocks demoted DRAM→NVMe (bytes written and index moved).", nil, nil)
+	descNvmeDemoteDrops = prometheus.NewDesc("kvb_nvme_demote_drops_total",
+		"Demotions dropped (queue full, write failure, or gate refusal).", nil, nil)
+	descNvmeDedup = prometheus.NewDesc("kvb_nvme_dedup_skips_total",
+		"Demotions completed WITHOUT an SSD write (bytes already resident).", nil, nil)
+	descNvmePromotions = prometheus.NewDesc("kvb_nvme_promotions_total",
+		"Blocks promoted NVMe→DRAM (2nd hit in window or hard pin).", nil, nil)
+	descNvmeReclaims = prometheus.NewDesc("kvb_nvme_reclaims_total",
+		"Whole segments reclaimed (FIFO).", nil, nil)
+	descNvmeReclaimSkips = prometheus.NewDesc("kvb_nvme_reclaim_skips_total",
+		"Reclaim rounds that skipped a segment holding protected blocks.", nil, nil)
+	descNvmeReadBusy = prometheus.NewDesc("kvb_nvme_read_busy_total",
+		"Device reads refused by reader-pool saturation (per-key ERR_BUSY).", nil, nil)
+	descNvmeChecksumErrs = prometheus.NewDesc("kvb_nvme_checksum_errors_total",
+		"Device reads that failed verification and self-healed the index (never served).", nil, nil)
+	descNvmeRecovered = prometheus.NewDesc("kvb_nvme_recovered_blocks",
+		"Blocks recovered at the last startup (checkpoint + footer + tail scan).", nil, nil)
+	descNvmeRecoverySecs = prometheus.NewDesc("kvb_nvme_recovery_seconds",
+		"Wall time of the last startup recovery across volumes.", nil, nil)
 )
 
 // storeCollector decodes the store's Stats() JSON at scrape time. A document
@@ -167,6 +210,19 @@ func (c *storeCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descEvictions
 	ch <- descLiveAllocs
 	ch <- descMaxAllocs
+	ch <- descNvmeSegments
+	ch <- descNvmeUsed
+	ch <- descNvmeMax
+	ch <- descNvmeDemotions
+	ch <- descNvmeDemoteDrops
+	ch <- descNvmeDedup
+	ch <- descNvmePromotions
+	ch <- descNvmeReclaims
+	ch <- descNvmeReclaimSkips
+	ch <- descNvmeReadBusy
+	ch <- descNvmeChecksumErrs
+	ch <- descNvmeRecovered
+	ch <- descNvmeRecoverySecs
 }
 
 func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
@@ -181,6 +237,25 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 		EvictionsTotal   float64            `json:"evictions_total"`
 		LiveAllocs       float64            `json:"live_allocs"`
 		MaxAllocs        float64            `json:"max_allocs"`
+		// Present only on a tiered store (nil otherwise — a DRAM-only
+		// scrape stays byte-identical).
+		Nvme *struct {
+			Blocks        float64 `json:"blocks"`
+			Bytes         float64 `json:"bytes"`
+			Segments      float64 `json:"segments"`
+			UsedBytes     float64 `json:"used_bytes"`
+			MaxBytes      float64 `json:"max_bytes"`
+			Demotions     float64 `json:"demotions_total"`
+			DemoteDrops   float64 `json:"demote_drops_total"`
+			DedupSkips    float64 `json:"dedup_skips_total"`
+			Promotions    float64 `json:"promotions_total"`
+			Reclaims      float64 `json:"reclaims_total"`
+			ReclaimSkips  float64 `json:"reclaim_skips_total"`
+			ReadBusy      float64 `json:"read_busy_total"`
+			ChecksumErrs  float64 `json:"checksum_errors_total"`
+			RecoveredBlks float64 `json:"recovered_blocks"`
+			RecoverySecs  float64 `json:"recovery_seconds"`
+		} `json:"nvme"`
 	}
 	if err := json.Unmarshal(c.stats(), &doc); err != nil {
 		return
@@ -203,6 +278,23 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 	if doc.MaxAllocs > 0 {
 		ch <- prometheus.MustNewConstMetric(descLiveAllocs, prometheus.GaugeValue, doc.LiveAllocs, tier)
 		ch <- prometheus.MustNewConstMetric(descMaxAllocs, prometheus.GaugeValue, doc.MaxAllocs, tier)
+	}
+	if nv := doc.Nvme; nv != nil {
+		ch <- prometheus.MustNewConstMetric(descBlocks, prometheus.GaugeValue, nv.Blocks, "nvme")
+		ch <- prometheus.MustNewConstMetric(descStoreBytes, prometheus.GaugeValue, nv.Bytes, "nvme")
+		ch <- prometheus.MustNewConstMetric(descNvmeSegments, prometheus.GaugeValue, nv.Segments)
+		ch <- prometheus.MustNewConstMetric(descNvmeUsed, prometheus.GaugeValue, nv.UsedBytes)
+		ch <- prometheus.MustNewConstMetric(descNvmeMax, prometheus.GaugeValue, nv.MaxBytes)
+		ch <- prometheus.MustNewConstMetric(descNvmeDemotions, prometheus.CounterValue, nv.Demotions)
+		ch <- prometheus.MustNewConstMetric(descNvmeDemoteDrops, prometheus.CounterValue, nv.DemoteDrops)
+		ch <- prometheus.MustNewConstMetric(descNvmeDedup, prometheus.CounterValue, nv.DedupSkips)
+		ch <- prometheus.MustNewConstMetric(descNvmePromotions, prometheus.CounterValue, nv.Promotions)
+		ch <- prometheus.MustNewConstMetric(descNvmeReclaims, prometheus.CounterValue, nv.Reclaims)
+		ch <- prometheus.MustNewConstMetric(descNvmeReclaimSkips, prometheus.CounterValue, nv.ReclaimSkips)
+		ch <- prometheus.MustNewConstMetric(descNvmeReadBusy, prometheus.CounterValue, nv.ReadBusy)
+		ch <- prometheus.MustNewConstMetric(descNvmeChecksumErrs, prometheus.CounterValue, nv.ChecksumErrs)
+		ch <- prometheus.MustNewConstMetric(descNvmeRecovered, prometheus.GaugeValue, nv.RecoveredBlks)
+		ch <- prometheus.MustNewConstMetric(descNvmeRecoverySecs, prometheus.GaugeValue, nv.RecoverySecs)
 	}
 }
 

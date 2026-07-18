@@ -39,3 +39,16 @@ eviction_policy: "s3fifo"     # s3fifo | sampled-lru | none (none = Week-3 hard 
 eviction_watermark_pct: 95    # trigger an eviction batch at 95% arena occupancy
 eviction_batch_pct: 5         # each batch frees down to 90% (95 - 5)
 eviction_ghost_entries: 0     # per-tenant S3-FIFO ghost cap; 0 = auto (arena-derived)
+
+# NVMe tier (log-structured warm tier; inert while nvme_paths is empty —
+# a DRAM-only daemon behaves byte-for-byte as before).
+nvme_paths: []                # volume dirs, one per device: ["/mnt/nvme0/kvb", "/mnt/nvme1/kvb"]
+nvme_max_bytes: 0             # total budget across volumes; REQUIRED > 0 when paths set (e.g. 3.4 TB: 3400000000000)
+nvme_segment_bytes: 268435456 # 256 MiB append-only segments (4 KiB-aligned records, sealed footer)
+nvme_read_workers: 16         # per-volume device-read pool; saturation → per-key ERR_BUSY, never a hang
+nvme_demote_watermark_pct: 90 # demote at 90% DRAM occupancy — strictly below eviction_watermark_pct
+nvme_demote_batch_pct: 5      # each pass demotes down to 85% (90 - 5)
+nvme_admit_min_hits: 1        # never-read blocks are evicted, not written to flash (SSD endurance)
+nvme_promote_window_ms: 60000 # 2nd NVMe hit within 60s promotes back to DRAM; 0 = never promote
+nvme_sync_every_bytes: 8388608 # 8 MiB group-commit fdatasync ledger
+nvme_ckpt_every_segments: 8   # index checkpoint every 8 seals (0 = never; footer scans cover recovery)

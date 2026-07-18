@@ -52,6 +52,14 @@ type quotaChecker interface {
 	CanStore(n uint32) bool
 }
 
+// tierRefGetter is the tiered zero-copy extension: like refGetter but the
+// store reports WHICH tier served the hit (metrics honesty) and a per-key
+// status — StatusOK, StatusNotFound, or StatusErrBusy when a bounded device
+// reader is saturated (retryable; rides the descriptor, no wire change).
+type tierRefGetter interface {
+	GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, release func(), tier string, st protocol.Status)
+}
+
 // Recorder observes served requests (the metrics seam, satisfied structurally
 // by internal/metrics — this package never imports Prometheus). A nil
 // recorder costs one branch per event.
@@ -59,8 +67,12 @@ type Recorder interface {
 	// Op is one served request's handling time: decode + store + queue-to-
 	// writer, not the socket flush.
 	Op(op protocol.Opcode, seconds float64)
-	// GetResult is one BATCH_GET's per-key outcomes and payload bytes out.
-	GetResult(ns uint32, hits, misses, bytesOut int)
+	// GetResult is one BATCH_GET's per-key outcomes and payload bytes out
+	// for ONE tier; a batch that hit both tiers reports twice (misses ride
+	// the dram call — the routing always ends there).
+	GetResult(ns uint32, tier string, hits, misses, bytesOut int)
+	// GetBusy counts per-key ERR_BUSY descriptors (NVMe reader saturation).
+	GetBusy(ns uint32, n int)
 	// PutCommitted is one committed block's payload bytes in.
 	PutCommitted(ns uint32, n int)
 }

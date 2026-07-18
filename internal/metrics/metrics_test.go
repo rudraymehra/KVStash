@@ -23,7 +23,9 @@ func fakeStats() []byte {
 func TestEndpointAndReadiness(t *testing.T) {
 	set := New(fakeStats)
 	set.Op(protocol.OpBatchGet, 0.0004)
-	set.GetResult(7, 5, 1, 5<<20)
+	set.GetResult(7, "dram", 5, 1, 5<<20)
+	set.GetResult(7, "nvme", 2, 0, 2<<20)
+	set.GetBusy(7, 3)
 	set.PutCommitted(7, 1<<20)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -46,8 +48,10 @@ func TestEndpointAndReadiness(t *testing.T) {
 	body := httpBody(t, addr, "/metrics")
 	for _, want := range []string{
 		`kvb_hits_total{ns="7",tier="dram"} 5`,
+		`kvb_hits_total{ns="7",tier="nvme"} 2`,
+		`kvb_get_busy_total{ns="7"} 3`,
 		`kvb_misses_total{ns="7"} 1`,
-		`kvb_bytes_total{dir="out",ns="7"} 5.24288e+06`,
+		`kvb_bytes_total{dir="out",ns="7"} 7.340032e+06`, // 5 MiB dram + 2 MiB nvme
 		`kvb_bytes_total{dir="in",ns="7"} 1.048576e+06`,
 		`kvb_evictions_total{tier="dram"} 12`,
 		`kvb_live_allocs{tier="dram"} 3`,
@@ -64,9 +68,59 @@ func TestEndpointAndReadiness(t *testing.T) {
 		}
 	}
 
+	// A DRAM-only stats document must emit NO kvb_nvme_* scrape families
+	// (the tier="nvme" hits counter above is request-driven, not scrape-
+	// driven — it only exists because this test recorded tiered GETs).
+	if strings.Contains(body, "kvb_nvme_") {
+		t.Error("DRAM-only scrape leaked nvme families")
+	}
+
 	// /debug/pprof reachable (the zero-alloc proof's capture point).
 	if code := httpCode(t, addr, "/debug/pprof/"); code != http.StatusOK {
 		t.Fatalf("pprof index: %d", code)
+	}
+}
+
+// TestNvmeSubdocScrape: a tiered store's "nvme" sub-document surfaces the
+// full kvb_nvme_* family plus the tier="nvme" splits.
+func TestNvmeSubdocScrape(t *testing.T) {
+	tiered := func() []byte {
+		return []byte(`{"schema":1,"store":"dram","blocks":3,"bytes":3145728,` +
+			`"arena_bytes":67108864,"arena_free_bytes":63963136,` +
+			`"largest_free_region_bytes":63963136,"hugepages":false,` +
+			`"pinned_bytes":{},"evictions_total":0,"live_allocs":3,"max_allocs":131072,` +
+			`"nvme":{"blocks":40,"bytes":41943040,"segments":5,"used_bytes":1342177280,` +
+			`"max_bytes":10737418240,"demotions_total":40,"demote_drops_total":2,` +
+			`"dedup_skips_total":1,"promotions_total":3,"reclaims_total":1,` +
+			`"reclaim_skips_total":0,"read_busy_total":7,"checksum_errors_total":0,` +
+			`"recovered_blocks":40,"recovery_seconds":0.42}}`)
+	}
+	set := New(tiered)
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, wait, err := set.Serve(ctx, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); wait() }()
+	body := httpBody(t, addr, "/metrics")
+	for _, want := range []string{
+		`kvb_blocks{tier="nvme"} 40`,
+		`kvb_store_bytes{tier="nvme"} 4.194304e+07`,
+		`kvb_nvme_segments 5`,
+		`kvb_nvme_used_bytes 1.34217728e+09`,
+		`kvb_nvme_max_bytes 1.073741824e+10`,
+		`kvb_nvme_demotions_total 40`,
+		`kvb_nvme_demote_drops_total 2`,
+		`kvb_nvme_dedup_skips_total 1`,
+		`kvb_nvme_promotions_total 3`,
+		`kvb_nvme_reclaims_total 1`,
+		`kvb_nvme_read_busy_total 7`,
+		`kvb_nvme_recovered_blocks 40`,
+		`kvb_nvme_recovery_seconds 0.42`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("tiered scrape missing %q", want)
+		}
 	}
 }
 
