@@ -41,3 +41,6 @@ python/**/dist/
 # mutation-testing artifacts
 report.json
 bench/rigs/*/.rig-state
+
+# locally built bench binaries
+/kvbench
