@@ -1,0 +1,26 @@
+# kvblockd quickstart config — DRAM-only, works on any machine.
+#
+# Every field is optional; an empty file runs with built-in defaults. The
+# full annotated reference (NVMe tier, eviction knobs, socket tuning, spec
+# ceilings) lives at internal/config/example.yaml and in
+# docs/deployment-guide.md.
+
+listen_addr: ":9440"           # data plane (KVB1 frames)
+metrics_addr: "127.0.0.1:9442" # /metrics, /healthz, /debug/pprof
+
+# The hot tier: one mmap'd arena outside the Go heap. Size it to the KV
+# blocks you want resident; 1 GiB is a laptop demo, production runs 10s-100s
+# of GiB. On Linux, set dram_hugepages: true after reserving vm.nr_hugepages
+# (see docs/deployment-guide.md).
+dram_arena_bytes: 1073741824 # 1 GiB
+dram_hugepages: false
+
+# Identity is structural: every connection authenticates into a namespace
+# at HELLO, and a daemon with NO namespaces file accepts no one (secure by
+# default). The quickstart tenant lives in config/namespaces.yaml — change
+# or remove it before exposing the daemon.
+namespaces_path: "config/namespaces.yaml"
+
+# The warm tier stays inert until you list NVMe volume dirs here — a
+# DRAM-only daemon is the recommended first run.
+nvme_paths: []

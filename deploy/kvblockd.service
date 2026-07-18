@@ -1,0 +1,57 @@
+# kvblockd systemd unit. Install:
+#   sudo cp kvblockd /usr/local/bin/
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin kvblockd
+#   sudo mkdir -p /etc/kvblockd
+#   sudo cp config/example.yaml /etc/kvblockd/config.yaml
+#   sudo cp config/namespaces.yaml /etc/kvblockd/namespaces.yaml
+#   # namespaces_path is cwd-relative in the daemon — make it absolute here:
+#   sudo sed -i 's|^namespaces_path:.*|namespaces_path: "/etc/kvblockd/namespaces.yaml"|' /etc/kvblockd/config.yaml
+#   sudo cp deploy/kvblockd.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now kvblockd
+#
+# Hugepages (optional, recommended for large arenas): reserve pages FIRST —
+#   echo 8192 | sudo tee /proc/sys/vm/nr_hugepages     # 8192 × 2MiB = 16 GiB
+# then set dram_hugepages: true in the config. LimitMEMLOCK below is
+# generous so mlock'd arenas never trip RLIMIT_MEMLOCK.
+#
+# Stopping: SIGTERM starts a graceful drain (in-flight frames finish, the
+# listener closes, then the arena unmaps). TimeoutStopSec must exceed the
+# daemon's drain budget or systemd SIGKILLs a healthy drain.
+
+[Unit]
+Description=kvblockd — KV-cache block store daemon
+Documentation=https://github.com/kvstash/kvblockd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kvblockd
+Group=kvblockd
+ExecStart=/usr/local/bin/kvblockd --config /etc/kvblockd/config.yaml
+Restart=on-failure
+RestartSec=2
+
+# Memory: allow mlock/hugepage arenas; never let the OOM killer pick us
+# lightly (the arena is the working set, not a leak).
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+OOMScoreAdjust=-500
+
+# Hardening (the daemon needs the network + its data dirs, nothing else).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# NVMe tier volumes: list every nvme_paths dir here so ProtectSystem=strict
+# still lets the daemon write its segments.
+ReadWritePaths=/var/lib/kvblockd
+StateDirectory=kvblockd
+
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

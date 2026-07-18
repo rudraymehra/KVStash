@@ -1,0 +1,15 @@
+# kvblockd namespaces — multi-tenant identity + bearer tokens.
+#
+# Point the daemon at this file with `namespaces_path` (or --namespaces).
+# Each namespace gets its own key space and pinned-bytes quota accounting;
+# a client presents the token at HELLO and lives inside its namespace for
+# the connection's lifetime (structural isolation, not per-request checks).
+#
+# ids are operator-assigned, nonzero, and stable across restarts (they key
+# on-disk ownership); never reuse an id for a different tenant.
+
+namespaces:
+  # The quickstart tenant — CHANGE OR REMOVE before exposing the daemon.
+  - { name: demo, id: 1, token: "demo-token" }
+  # - { name: team-a, id: 2, token: "a-real-secret" }
+  # - { name: team-b, id: 3, token: "another-real-secret" }
