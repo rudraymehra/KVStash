@@ -73,6 +73,10 @@ func New(stats func() []byte) *Set {
 	}
 	s.reg.MustRegister(s.opSeconds, s.hits, s.misses, s.bytes, s.getBusy)
 	s.reg.MustRegister(collectors.NewGoCollector()) // GC pause/heap — the launch-day GC defense reads these
+	// process_cpu_seconds_total / process_resident_memory_bytes — the ONLY
+	// cross-host way a benchmark client (on node A) reads the daemon's CPU
+	// (node B). client_golang emits these on both Linux and darwin.
+	s.reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	if stats != nil {
 		s.reg.MustRegister(&storeCollector{stats: stats})
 	}
