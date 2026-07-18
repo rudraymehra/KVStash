@@ -193,6 +193,7 @@ func (s *Store) GetRef(ns uint32, key [32]byte) (data []byte, xxh3 uint64, relea
 		return nil, 0, nil, false
 	}
 	now := s.life.GrantReadLease(ref) // §3.3 auto-lease on every OK GET
+	ref.hits.Add(1)                   // demotion admission input (relaxed count)
 	if p := s.policy; p != nil {
 		p.Touch(eviction.Key{NS: ns, Hash: key}, now) // no lock held here; Touch is a leaf + zero-alloc
 	}

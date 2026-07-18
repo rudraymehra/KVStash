@@ -48,6 +48,12 @@ type BlockRef struct {
 	TTLUntil   atomic.Int64
 	LastAccess atomic.Int64
 	Refcount   atomic.Int32
+
+	// hits counts OK GETs over the block's lifetime (relaxed; approximate
+	// under contention is fine). The demotion admission filter reads it:
+	// never-read blocks are evicted rather than written to NVMe (SSD
+	// endurance — the KVBM freq-filter idea).
+	hits atomic.Uint32
 }
 
 // Acquire takes a reader reference. It FAILS (returns false) when the count
