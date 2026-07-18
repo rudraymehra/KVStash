@@ -1,0 +1,105 @@
+# goreleaser v2 — the release matrix for the single-binary claim.
+#
+# Everything here serves one sentence in the README: "one static binary,
+# no dependencies." CGO is off, the linux binaries must survive
+# test/release/assert_static.sh (statically linked, ldd fails, <20MB,
+# boots in a scratch container), and the Docker image is FROM scratch.
+#
+# Local dry run:  goreleaser release --snapshot --clean
+# Real release:   push a v* tag → .github/workflows/release.yml
+version: 2
+
+project_name: kvblockd
+
+builds:
+  - id: kvblockd
+    main: ./cmd/kvblockd
+    binary: kvblockd
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: darwin
+        goarch: amd64
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{.Version}}"]
+    hooks:
+      post:
+        - test/release/assert_static.sh {{ .Path }} {{ .Os }} {{ .Arch }}
+
+  - id: kvbctl
+    main: ./cmd/kvbctl
+    binary: kvbctl
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: darwin
+        goarch: amd64
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{.Version}}"]
+    hooks:
+      post:
+        - test/release/assert_static.sh {{ .Path }} {{ .Os }} {{ .Arch }}
+
+archives:
+  - id: default
+    ids: [kvblockd, kvbctl]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - config/example.yaml
+      - config/namespaces.yaml
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+sboms:
+  - artifacts: archive # syft must be on PATH (release.yml installs it)
+
+# GHCR_OWNER: a workflow GITHUB_TOKEN can only push packages under the
+# repo's OWN owner — release.yml sets this to github.repository_owner.
+# The kvstash default is the canonical post-org-transfer name (local
+# snapshots don't push, so the default is never exercised against ghcr).
+dockers:
+  - ids: [kvblockd]
+    goos: linux
+    goarch: amd64
+    dockerfile: deploy/Dockerfile
+    image_templates:
+      - ghcr.io/{{ envOrDefault "GHCR_OWNER" "kvstash" }}/kvblockd:{{ .Version }}-amd64
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/amd64
+  - ids: [kvblockd]
+    goos: linux
+    goarch: arm64
+    dockerfile: deploy/Dockerfile
+    image_templates:
+      - ghcr.io/{{ envOrDefault "GHCR_OWNER" "kvstash" }}/kvblockd:{{ .Version }}-arm64
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/arm64
+
+docker_manifests:
+  - name_template: ghcr.io/{{ envOrDefault "GHCR_OWNER" "kvstash" }}/kvblockd:{{ .Version }}
+    image_templates:
+      - ghcr.io/{{ envOrDefault "GHCR_OWNER" "kvstash" }}/kvblockd:{{ .Version }}-amd64
+      - ghcr.io/{{ envOrDefault "GHCR_OWNER" "kvstash" }}/kvblockd:{{ .Version }}-arm64
+  - name_template: ghcr.io/{{ envOrDefault "GHCR_OWNER" "kvstash" }}/kvblockd:latest
+    skip_push: auto # never move :latest to a prerelease
+    image_templates:
+      - ghcr.io/{{ envOrDefault "GHCR_OWNER" "kvstash" }}/kvblockd:{{ .Version }}-amd64
+      - ghcr.io/{{ envOrDefault "GHCR_OWNER" "kvstash" }}/kvblockd:{{ .Version }}-arm64
+
+release:
+  prerelease: auto # v0.1.0-rc1 → GitHub prerelease automatically
+  draft: false
+
+changelog:
+  use: git
+  filters:
+    exclude: ["^docs:", "^test:", "^ci:", "^review:"]

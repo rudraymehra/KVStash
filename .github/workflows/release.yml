@@ -1,0 +1,53 @@
+# Tag-driven release: v* tag → tests → goreleaser (static matrix, checksums,
+# SBOM, scratch image). Never ships untested — the test step gates the build.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write # ghcr.io image push
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # goreleaser reads full history for the changelog
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: test before shipping
+        run: go test -race -short ./...
+
+      - name: install syft (SBOM)
+        uses: anchore/sbom-action/download-syft@v0
+
+      - uses: docker/setup-qemu-action@v3 # arm64 image leg
+      - uses: docker/setup-buildx-action@v3
+
+      - name: ghcr login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: goreleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          # pinned minor: dockers/docker_manifests are deprecated upstream —
+          # a floating "~> v2" could drop them at tag time with zero repo
+          # changes. Bump deliberately (with a local `goreleaser check`).
+          version: "~> v2.17"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN can only push packages under the repo owner.
+          GHCR_OWNER: ${{ github.repository_owner }}
