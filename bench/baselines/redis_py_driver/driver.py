@@ -149,6 +149,7 @@ def main():
         gbps, took = getbench(client, args.blob_bytes, args.streams, args.secs, args.pool)
         rec = {
             "schema_version": 1, "kind": "sweep", "store": "redis-py",
+            "redis_py": redis.__version__, "python": sys.version.split()[0],
             "goos": sys.platform, "goarch": "python", "seed": 0,
             "cell": {"blob_bytes": args.blob_bytes, "streams": args.streams,
                      "mode": "closed", "mix": "get", "resp": 2 if args.resp2 else 3},
@@ -187,6 +188,7 @@ def main():
     keys_total = hits + misses
     rec = {
         "schema_version": 1, "kind": "replay", "store": "redis-py",
+        "redis_py": redis.__version__, "python": sys.version.split()[0],
         "goos": sys.platform, "goarch": "python", "seed": 0,
         "cell": {"blob_bytes": blob_bytes, "streams": args.streams, "mode": "asap",
                  "resp": 2 if args.resp2 else 3},

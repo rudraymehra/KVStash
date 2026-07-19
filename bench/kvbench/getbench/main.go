@@ -27,6 +27,7 @@ func main() {
 	nBlocks := flag.Int("blocks", 32, "blocks per BATCH_GET")
 	blockKiB := flag.Int("block-kib", 1024, "block size KiB")
 	pool := flag.Int("pool", 0, "distinct block pool to draw batches from (0 = blocks; larger pool = colder DRAM, isolates working-set from batch size)")
+	fillMBps := flag.Int("fill-mbps", 0, "throttle the pool fill to N MiB/s (0 = unthrottled). On a tiered daemon a loopback fill outruns NVMe demotion bandwidth and the arena evicts the pool instead of demoting it — cap the fill below the device write ceiling")
 	sockbuf := flag.Int("sockbuf", 0, "client socket buffer bytes (0=OS default)")
 	noverify := flag.Bool("noverify", false, "skip client-side xxh3 verification (isolates verification cost)")
 	flag.Parse()
@@ -52,6 +53,7 @@ func main() {
 	// re-read (realistic large-store shape), isolating working-set effects
 	// from the per-batch response size.
 	pkeys := make([][32]byte, poolN)
+	fillStart := time.Now()
 	for i := range pkeys {
 		binary.LittleEndian.PutUint32(pkeys[i][:], uint32(i)+1) //nolint:gosec // G115: bench index
 		blob := make([]byte, sz)
@@ -62,6 +64,13 @@ func main() {
 			fmt.Fprintf(os.Stderr, "put %d: %v\n", i, err)
 			c.Close()
 			os.Exit(1) //nolint:gocritic // pool closed above; nothing else to release
+		}
+		if *fillMBps > 0 {
+			// Pacing: bytes written so far may not outrun rate*elapsed (MiB/s).
+			ahead := time.Duration(int64(i+1)*int64(sz)*1000/(int64(*fillMBps)<<20)) * time.Millisecond
+			if lead := ahead - time.Since(fillStart); lead > 0 {
+				time.Sleep(lead)
+			}
 		}
 	}
 
@@ -76,6 +85,14 @@ func main() {
 		probe := make([][]byte, 1)
 		if _, err := c.BatchGet(ctx, pkeys[:1], probe); err != nil {
 			fmt.Fprintln(os.Stderr, "probe get:", err)
+			c.Close()
+			os.Exit(1) //nolint:gocritic
+		}
+		if len(probe[0]) == 0 {
+			fmt.Fprintln(os.Stderr, "probe: key 0 is GONE right after the fill — the store evicted or refused it."+
+				" Disambiguate via kvb_nvme_admit_refusals_total: nonzero = the min-hits endurance gate deleted the"+
+				" pure-PUT pool (set nvme_admit_min_hits: 0); zero = the fill outran demotion and eviction ate it"+
+				" (throttle with -fill-mbps below the device write ceiling)")
 			c.Close()
 			os.Exit(1) //nolint:gocritic
 		}

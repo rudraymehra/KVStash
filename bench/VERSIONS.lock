@@ -20,7 +20,7 @@ etcd     = quay.io/coreos/etcd:v3.5.17@sha256:PENDING   # Mooncake metadata stor
 mooncake = kvcache-ai/mooncake:LATEST-TAG@sha256:PENDING  # protocol="tcp"; every non-default knob documented in baselines/mooncake/
 
 ## Baseline clients
-redis-py = 8.0.1     # the client LMCache actually ships (RESP3 default; we report RESP2 & RESP3 if they differ >5%)
+redis-py = 8.0.1     # the client LMCache actually ships (RESP3 default; we report RESP2 & RESP3 if they differ >5%). 8.0.1 requires Python >=3.10 — AL2023's default python3.9 pip does NOT see it (its `pip index` shows 7.0.1 max); the rig installs python3.11 and runs the driver with it. A mid-session note here briefly claimed 8.0.1 didn't exist on PyPI — that was the 3.9 filter, corrected 2026-07-19.
 
 ## GPU stack (Rig E, AWS g5.xlarge — A10G)
 vllm    = 0.25.1     # matches the CPU e2e recipe pin (bench/e2e/cpu)
