@@ -52,6 +52,12 @@ type quotaChecker interface {
 	CanStore(n uint32) bool
 }
 
+// nsQuotaChecker is the tenant-aware variant: capacity AND the connection's
+// namespace headroom. Preferred over quotaChecker when the store offers it.
+type nsQuotaChecker interface {
+	CanStoreNS(ns uint32, n uint32) bool
+}
+
 // tierRefGetter is the tiered zero-copy extension: like refGetter but the
 // store reports WHICH tier served the hit (metrics honesty) and a per-key
 // status — StatusOK, StatusNotFound, or StatusErrBusy when a bounded device

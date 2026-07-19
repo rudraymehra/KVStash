@@ -103,8 +103,15 @@ func (s *session) putBegin(c *transport.Conn, h protocol.Header, body []byte) {
 	}
 	// §3.4/§5: the quota check lives at BEGIN. Advisory (no arena bytes are
 	// reserved — staging stays lazy per the DoS posture): a yes can still
-	// lose the commit race, which maps to a retryable ERR_BUSY there.
-	if qc, ok := s.srv.store.(quotaChecker); ok && !qc.CanStore(b.TotalLen) {
+	// lose the commit race, which maps to a retryable ERR_BUSY there. The
+	// tenant-aware probe folds in this namespace's quota headroom.
+	beginOK := true
+	if nqc, ok := s.srv.store.(nsQuotaChecker); ok {
+		beginOK = nqc.CanStoreNS(s.ns, b.TotalLen)
+	} else if qc, ok := s.srv.store.(quotaChecker); ok {
+		beginOK = qc.CanStore(b.TotalLen)
+	}
+	if !beginOK {
 		s.tombstone(h.RequestID, h.Key)
 		s.respondStatus(c, h, protocol.StatusErrQuotaBytes)
 		return

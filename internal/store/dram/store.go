@@ -8,6 +8,7 @@ import (
 
 	"github.com/kvstash/kvblockd/internal/eviction"
 	"github.com/kvstash/kvblockd/internal/protocol"
+	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
 // Params configures the DRAM tier around an Arena the caller owns.
@@ -19,6 +20,11 @@ type Params struct {
 	// seam: modeltest drives lease/TTL expiry deterministically through it,
 	// and the evictor draws every eligibility decision from the same source.
 	Now func() int64
+	// Quotas is the per-(namespace, tier) byte accountant; nil = quotas
+	// disabled (single-tenant bring-up, tests). Charged at publish, refunded
+	// at every index-removal seam — the invariant is usage ≤ quota + one
+	// in-flight block (I3).
+	Quotas *tenant.Quotas
 }
 
 // Store is the DRAM tier: arena bytes + O(1) allocator + 256-shard index +
@@ -41,10 +47,11 @@ type Store struct {
 	// without synchronization after; its methods are leaf-locked and are
 	// NEVER called while a shard lock or allocMu is held (the lock story).
 	policy     eviction.Policy
-	evict      *evictor      // nil until StartEvictor (modeltest never starts it)
-	evictMu    sync.Mutex    // singleflight: one eviction pass at a time
-	evictions  atomic.Uint64 // total blocks evicted (Stats → kvb_evictions_total)
-	liveAllocs atomic.Int64  // live extents; the node-pool watermark numerator
+	quotas     *tenant.Quotas // nil-guarded, set once at New
+	evict      *evictor       // nil until StartEvictor (modeltest never starts it)
+	evictMu    sync.Mutex     // singleflight: one eviction pass at a time
+	evictions  atomic.Uint64  // total blocks evicted (Stats → kvb_evictions_total)
+	liveAllocs atomic.Int64   // live extents; the node-pool watermark numerator
 
 	// Pass scratch, guarded by evictMu (an eviction pass under sustained
 	// pressure runs at BEGIN cadence — per-pass allocations would be GC
@@ -77,11 +84,21 @@ func New(arena *Arena, p Params) *Store {
 		now = func() int64 { return time.Now().UnixNano() }
 	}
 	return &Store{
-		arena: arena,
-		index: NewIndex(),
-		life:  newLifecycle(p.LeaseDefaultMS, p.LeaseMaxMS, p.PinnedBytesCap, now),
-		now:   now,
-		alloc: NewAllocatorMax(units, maxAllocs),
+		arena:  arena,
+		index:  NewIndex(),
+		life:   newLifecycle(p.LeaseDefaultMS, p.LeaseMaxMS, p.PinnedBytesCap, now),
+		now:    now,
+		alloc:  NewAllocatorMax(units, maxAllocs),
+		quotas: p.Quotas,
+	}
+}
+
+// refundQuota returns a removed block's bytes to its tenant's DRAM quota —
+// called at EVERY index-removal seam except demotion completion (a tier
+// MOVE transfers there instead of refunding).
+func (s *Store) refundQuota(ref *BlockRef) {
+	if s.quotas != nil && ref != nil && ref.Len > 0 {
+		s.quotas.Refund(ref.NamespaceID, tenant.TierDRAM, int64(ref.Len))
 	}
 }
 
@@ -108,6 +125,16 @@ func (s *Store) free(ref *BlockRef) {
 	s.allocMu.Lock()
 	s.alloc.Free(Allocation{Offset: ref.Offset, Meta: ref.allocMeta})
 	s.allocMu.Unlock()
+}
+
+// CanStoreNS is the tenant-aware BEGIN probe: the capacity answer AND the
+// tenant's DRAM headroom (advisory — the binding charge is at publish).
+func (s *Store) CanStoreNS(ns uint32, n uint32) bool {
+	if s.quotas != nil && s.quotas.WouldExceed(ns, tenant.TierDRAM, int64(n)) {
+		s.kickEvictor() // over-quota-first pass may free THIS tenant's cold blocks
+		return false
+	}
+	return s.CanStore(n)
 }
 
 // CanStore is the server's advisory BEGIN-time capacity probe (§3.4 answers
@@ -250,6 +277,22 @@ func (s *Store) Put(ns uint32, key [32]byte, data []byte, xxh3 uint64) protocol.
 		copy(s.arena.Bytes(uint64(al.Offset)<<AllocUnitShift, uint32(len(data))), data) //nolint:gosec // G115: len ≤ max_blob_len
 	}
 
+	// Tenant admission (the BINDING charge; BEGIN's probe was advisory).
+	// Refused → free the extent and answer ERR_QUOTA_BYTES, which the
+	// server's commit path maps to the spec-legal retryable ERR_BUSY. The
+	// evictor nudge matters: the over-quota-first pass reclaims THIS
+	// tenant's cold blocks.
+	if s.quotas != nil && len(data) > 0 {
+		if s.quotas.Charge(ns, tenant.TierDRAM, int64(len(data))) != nil {
+			s.allocMu.Lock()
+			s.alloc.Free(al)
+			s.allocMu.Unlock()
+			s.liveAllocs.Add(-1)
+			s.kickEvictor()
+			return protocol.StatusErrQuotaBytes
+		}
+	}
+
 	ref := &BlockRef{
 		Offset:      al.Offset,         // UNITS (see BlockRef doc)
 		Len:         uint32(len(data)), //nolint:gosec // G115: len ≤ max_blob_len
@@ -261,12 +304,14 @@ func (s *Store) Put(ns uint32, key [32]byte, data []byte, xxh3 uint64) protocol.
 	ref.Refcount.Store(1) // the index's own reference
 	if existing, inserted := s.index.Put(k, ref); !inserted {
 		// Lost the publish race: free our extent (none for a zero-length
-		// block), defer to the winner (who also owns the policy Admit).
+		// block), refund our charge, defer to the winner (who also owns the
+		// policy Admit).
 		if len(data) > 0 {
 			s.allocMu.Lock()
 			s.alloc.Free(al)
 			s.allocMu.Unlock()
 			s.liveAllocs.Add(-1)
+			s.refundQuota(ref)
 		}
 		return putExistsStatus(existing, xxh3)
 	}
@@ -325,6 +370,7 @@ func (s *Store) Delete(ns uint32, key [32]byte, force bool) protocol.Status {
 		return st
 	}
 	s.life.noteTTLGone(ref)
+	s.refundQuota(ref)
 	if ref.Release() { // drop the index ref OUTSIDE the shard lock; zero → free
 		s.free(ref)
 	}

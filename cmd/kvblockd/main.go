@@ -21,6 +21,7 @@ import (
 	"github.com/kvstash/kvblockd/internal/store"
 	"github.com/kvstash/kvblockd/internal/store/dram"
 	"github.com/kvstash/kvblockd/internal/store/nvme"
+	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
 // version is stamped by the release build (-ldflags "-X main.version=…");
@@ -61,6 +62,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// One accountant instance spans both tiers — dram charges/refunds its
+	// side, the tiered orchestrator transfers/refunds the NVMe side.
+	quotas := tenant.NewQuotas(ns.Registry())
 
 	arena, err := dram.NewArena(cfg.DramArenaBytes, cfg.DramHugepages)
 	if err != nil {
@@ -70,6 +74,7 @@ func run() error {
 		LeaseDefaultMS: cfg.LeaseDefaultMS,
 		LeaseMaxMS:     cfg.LeaseMaxMS,
 		PinnedBytesCap: cfg.PinnedBytesCap,
+		Quotas:         quotas,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -158,6 +163,7 @@ func run() error {
 			PromoteWindow:  time.Duration(cfg.NvmePromoteWindowMS) * time.Millisecond,
 			LeaseDefaultMS: cfg.LeaseDefaultMS,
 			LeaseMaxMS:     cfg.LeaseMaxMS,
+			Quotas:         quotas,
 		})
 		stopT := tiered.Start(ctx)
 		var tierStopped bool
@@ -176,7 +182,22 @@ func run() error {
 	srv := server.New(cfg, srvStore, ns)
 
 	set := metrics.New(statsFn)
+	set.SetTenants(ns.Registry(), quotas)
 	srv.SetRecorder(set)
+
+	// Admin surface (loopback-enforced): namespace add / quota set / list.
+	if cfg.AdminAddr != "" {
+		admin := server.NewAdminServer(ns.Registry(), quotas)
+		aBound, aWait, aErr := admin.Serve(ctx, cfg.AdminAddr)
+		if aErr != nil {
+			stopTier()
+			stopEvict()
+			_ = closeStore()
+			return fmt.Errorf("admin endpoint: %w", aErr)
+		}
+		defer func() { stop(); aWait() }()
+		fmt.Fprintln(os.Stderr, "kvblockd: admin on", aBound)
+	}
 	if cfg.MetricsAddr != "" {
 		if host, _, herr := net.SplitHostPort(cfg.MetricsAddr); herr == nil {
 			if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {

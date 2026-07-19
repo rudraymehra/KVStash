@@ -12,6 +12,7 @@ import (
 	"github.com/kvstash/kvblockd/internal/protocol"
 	"github.com/kvstash/kvblockd/internal/store/dram"
 	"github.com/kvstash/kvblockd/internal/store/nvme"
+	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
 // Params tunes the tier orchestration.
@@ -28,6 +29,11 @@ type Params struct {
 	LeaseDefaultMS uint32        // mirrors dram.Params — NVMe hits auto-lease with the same clamp
 	LeaseMaxMS     uint32
 	Now            func() int64 // unix nanos; nil = real time (the fake-clock seam)
+	// Quotas: the SAME accountant instance dram.Params carries. The tiered
+	// orchestrator owns the NVMe side of it — Transfer at demotion publish,
+	// Refund at every nvme-entry removal (delete verb, reclaim retire,
+	// corrupt-entry self-heal). nil = quotas disabled.
+	Quotas *tenant.Quotas
 }
 
 func (p Params) withDefaults() Params {
@@ -179,6 +185,16 @@ func (t *Tiered) volumeFor(key [32]byte) *nvme.Volume {
 // ---------------------------------------------------------------------------
 // The server Store surface.
 
+// refundNvmeQuota returns a removed nvme entry's bytes to its tenant.
+func (t *Tiered) refundNvmeQuota(ns uint32, ref *nvmeRef) {
+	if t.p.Quotas != nil && ref != nil && ref.Len > 0 {
+		t.p.Quotas.Refund(ns, tenant.TierNVMe, int64(ref.Len))
+	}
+}
+
+// CanStoreNS is the tenant-aware BEGIN probe, delegated to the write tier.
+func (t *Tiered) CanStoreNS(ns uint32, n uint32) bool { return t.d.CanStoreNS(ns, n) }
+
 // ExistsPrefix merges both indexes — pure map lookups, NO device I/O ever
 // (the spy test enforces it): the EXISTS p99 contract survives tiering.
 func (t *Tiered) ExistsPrefix(ns uint32, keys [][32]byte, withBitmap bool) (uint32, []protocol.Status) {
@@ -254,12 +270,13 @@ func (t *Tiered) GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, 
 		// Device rot: self-heal the entry (identity-gated) and miss. The
 		// block is never served unverified.
 		t.checksumErrs.Add(1)
-		_, _ = t.idx.deleteIf(k, func(ref *nvmeRef) protocol.Status {
+		healed, _ := t.idx.deleteIf(k, func(ref *nvmeRef) protocol.Status {
 			if ref == e {
 				return protocol.StatusOK
 			}
 			return protocol.StatusErrBusy // a newer entry replaced it — keep
 		})
+		t.refundNvmeQuota(k.NS, healed)
 		return nil, 0, nil, "", protocol.StatusNotFound
 	}
 
@@ -355,6 +372,7 @@ func (t *Tiered) deleteNvme(k dram.Key, force bool) (removed bool, st protocol.S
 	ref, st := t.idx.deleteIf(k, func(ref *nvmeRef) protocol.Status {
 		return t.canDeleteNvme(ref, force)
 	})
+	t.refundNvmeQuota(k.NS, ref)
 	return ref != nil, st
 }
 

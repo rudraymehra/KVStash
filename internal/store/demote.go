@@ -7,6 +7,7 @@ import (
 	"github.com/kvstash/kvblockd/internal/protocol"
 	"github.com/kvstash/kvblockd/internal/store/dram"
 	"github.com/kvstash/kvblockd/internal/store/nvme"
+	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
 // Demotion / promotion / reclaim — the tier movement machinery.
@@ -114,6 +115,11 @@ func (t *Tiered) demoteOne(k dram.Key, size int64, now int64, wg *sync.WaitGroup
 		rel()
 		if t.d.CompleteDemotion(k.NS, k.Hash, sum, func(*dram.BlockRef) {}) {
 			t.dedupSkips.Add(1)
+			// Dual-residency collapse: the DRAM copy is gone, the NVMe
+			// charge already exists from the first demotion — refund DRAM.
+			if t.p.Quotas != nil {
+				t.p.Quotas.Refund(k.NS, tenant.TierDRAM, size)
+			}
 			return size
 		}
 		t.pol.Admit(eviction.Key{NS: k.NS, Hash: k.Hash}, size, now)
@@ -130,6 +136,9 @@ func (t *Tiered) demoteOne(k dram.Key, size int64, now int64, wg *sync.WaitGroup
 			// watching a pure-PUT fill melt away deserves a metric, and a
 			// silent variant of this branch once ate a 20 GiB rig fill.
 			t.admitRefusals.Add(1)
+			if t.p.Quotas != nil {
+				t.p.Quotas.Refund(k.NS, tenant.TierDRAM, size)
+			}
 			return size
 		}
 		t.pol.Admit(eviction.Key{NS: k.NS, Hash: k.Hash}, size, now)
@@ -165,6 +174,13 @@ func (t *Tiered) demoteOne(k dram.Key, size int64, now int64, wg *sync.WaitGroup
 				return
 			}
 			t.demotions.Add(1)
+			// The tier MOVE: NVMe gains the bytes, DRAM refunds. Transfer
+			// never fails — refusing a demotion for destination quota would
+			// wedge the memory ladder; the evictor's over-quota-first pass
+			// corrects the destination on its next cycle.
+			if t.p.Quotas != nil {
+				t.p.Quotas.Transfer(k.NS, tenant.TierDRAM, tenant.TierNVMe, size)
+			}
 		},
 	})
 	if !accepted {
@@ -266,7 +282,7 @@ func (t *Tiered) reclaimSegment(vol *nvme.Volume) bool {
 	}
 	for i := range entries {
 		k := dram.Key{NS: entries[i].NS, Hash: entries[i].Key}
-		_, st := t.idx.deleteIf(k, func(ref *nvmeRef) protocol.Status {
+		removed, st := t.idx.deleteIf(k, func(ref *nvmeRef) protocol.Status {
 			if ref.Loc.SegmentID != id {
 				return protocol.StatusErrBusy // newer home elsewhere — keep the entry
 			}
@@ -275,6 +291,7 @@ func (t *Tiered) reclaimSegment(vol *nvme.Volume) bool {
 			}
 			return protocol.StatusOK
 		})
+		t.refundNvmeQuota(k.NS, removed)
 		if st == protocol.StatusErrLeased {
 			vol.RetireAbort(id) // reads resume; already-removed entries were unprotected (legal evictions)
 			t.reclaimSkips.Add(1)

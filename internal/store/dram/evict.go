@@ -6,6 +6,7 @@ import (
 
 	"github.com/kvstash/kvblockd/internal/eviction"
 	"github.com/kvstash/kvblockd/internal/protocol"
+	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
 // The eviction execution engine. The POLICY (internal/eviction) decides who
@@ -222,6 +223,7 @@ func (s *Store) evictOne(k Key, emergency bool) (freed int64, outcome int) {
 	}
 	s.life.noteTTLGone(ref)
 	s.evictions.Add(1)
+	s.refundQuota(ref)
 	freed = int64(ref.Len)
 	if ref.Release() { // index ref drop OUTSIDE the shard lock — the one free story
 		s.free(ref)
@@ -297,9 +299,40 @@ func (s *Store) policyPass(now int64, need int64) int64 {
 			}
 		}
 	}
+	// Round 0 — over-quota tenants FIRST, worst usage/quota ratio first:
+	// under shared pressure the tenant breaking its own budget pays before
+	// any within-budget tenant loses a block. Only meaningful with quotas
+	// attached; ratios are integer thousandths (allocation-free sort of a
+	// handful of tenants).
+	if q := s.quotas; q != nil {
+		for freed < need {
+			worstNS, worstRatio := uint32(0), int64(1000)
+			for _, u := range usages {
+				if r := q.OverRatio(u.NS, tenant.TierDRAM); r > worstRatio {
+					worstNS, worstRatio = u.NS, r
+				}
+			}
+			if worstRatio <= 1000 {
+				break // nobody over quota
+			}
+			over := q.Usage(worstNS, tenant.TierDRAM) - q.Limit(worstNS, tenant.TierDRAM)
+			if want := min(over, need-freed); want > 0 {
+				before := freed
+				harvest(worstNS, want)
+				if freed == before {
+					break // everything protected — fall through to the fair rounds
+				}
+			} else {
+				break
+			}
+		}
+	}
 	// Round 1: proportional-to-resident-bytes (float math — the int64
 	// product need×bytes overflows at multi-GiB arenas).
 	for _, u := range usages {
+		if freed >= need {
+			break
+		}
 		share := int64(float64(need) * float64(u.Bytes) / float64(totalBytes))
 		if share <= 0 {
 			continue

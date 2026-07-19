@@ -12,6 +12,7 @@ import (
 	"github.com/kvstash/kvblockd/internal/eviction"
 	"github.com/kvstash/kvblockd/internal/protocol"
 	"github.com/kvstash/kvblockd/internal/store/dram"
+	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
 // evictStore boots a tier with a fake clock and an attached (but not
@@ -369,5 +370,63 @@ func TestZeroLenFloodBounded(t *testing.T) {
 	after := statsDoc(t, s)["live_allocs"].(float64)
 	if after >= before {
 		t.Fatalf("zero-len flood not reclaimed: live_allocs %v -> %v", before, after)
+	}
+}
+
+// TestOverQuotaTenantEvictedFirst: A at 120% of its DRAM quota, B within
+// budget — under watermark pressure every victim until A is back inside
+// its quota must be A's, and B's blocks all survive the pass.
+func TestOverQuotaTenantEvictedFirst(t *testing.T) {
+	cur := int64(1_000_000_000_000)
+	// 9 x 64 KiB blocks on a 600 KiB arena = ~96% occupancy: over the 95%
+	// watermark, so EvictNow's pass genuinely runs; the pass frees to the
+	// 90% floor (~36 KiB), all of which must come from the over-quota
+	// tenant.
+	arena, err := dram.NewArena(600<<10, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol, err := eviction.New("s3fifo", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := tenant.NewRegistry("a", 1, "ta")
+	if err := reg.Add(&tenant.Namespace{ID: 2, Name: "b", TokenHash: [32]byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	reg.SetQuota("a", tenant.TierDRAM, 5*64<<10) // A's quota: 5 blocks
+	q := tenant.NewQuotas(reg)
+	s := dram.New(arena, dram.Params{
+		LeaseDefaultMS: 100, LeaseMaxMS: 60000,
+		Now: func() int64 { return cur }, Quotas: q,
+	})
+	s.AttachPolicy(pol)
+	t.Cleanup(func() { _ = s.Close() })
+
+	// A stores 5 blocks inside quota; B stores 4 (unlimited). Then A's
+	// quota is TIGHTENED to 2 blocks — A is now at 250%, no eviction ran.
+	blk := 64 << 10
+	for i := 0; i < 5; i++ {
+		evPut(t, s, 1, evKey(byte(0x10+i)), blk)
+	}
+	for i := 0; i < 4; i++ {
+		evPut(t, s, 2, evKey(byte(0x40+i)), blk)
+	}
+	cur += int64(200 * time.Millisecond) // auto-leases lapse: everything evictable
+	reg.SetQuota("a", tenant.TierDRAM, int64(2*blk))
+	q.Reload()
+
+	before := q.Usage(1, tenant.TierDRAM)
+	s.EvictNow()
+
+	// The pass only needs ~36 KiB to reach the floor — but every byte of
+	// it must be A's (the over-quota-first round), so A shrinks...
+	if got := q.Usage(1, tenant.TierDRAM); got >= before {
+		t.Fatalf("over-quota tenant A lost nothing: %d -> %d", before, got)
+	}
+	for i := 0; i < 4; i++ {
+		if !s.Contains(2, evKey(byte(0x40+i))) {
+			t.Fatalf("within-budget tenant B lost block %d while A was over quota", i)
+		}
 	}
 }

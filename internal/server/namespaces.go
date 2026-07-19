@@ -1,79 +1,43 @@
 package server
 
 import (
-	"crypto/subtle"
-	"fmt"
-	"os"
-
-	"gopkg.in/yaml.v3"
+	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
-// Namespaces maps a (namespace, bearer-token) pair to a numeric namespace id
-// for the connection's lifetime. Auth is connection-scoped (one HELLO), never
-// per-request (PROTOCOL.md §3.1). The full tenant system (quotas, QoS) is
-// later; this is the minimum: name→id + constant-time token compare.
+// Namespaces is the server's view of the tenant registry: (name, token) →
+// namespace id at HELLO, connection-scoped, never per-request (PROTOCOL.md
+// §3.1). It is a thin adapter — identity, hashed tokens, and per-tier
+// quotas live in internal/tenant.
 type Namespaces struct {
-	byName map[string]nsEntry
+	reg *tenant.Registry
 }
 
-type nsEntry struct {
-	id    uint32
-	token string
-}
-
-// nsFile is the on-disk schema (namespaces.yaml).
-type nsFile struct {
-	Namespaces []struct {
-		Name  string `yaml:"name"`
-		ID    uint32 `yaml:"id"`
-		Token string `yaml:"token"`
-	} `yaml:"namespaces"`
-}
-
-// LoadNamespaces reads the namespaces/tokens file. An empty path yields an
-// empty table (every HELLO then fails auth — a server with no tenants).
+// LoadNamespaces reads the namespaces/tokens file (see tenant.LoadRegistry
+// for the schema: plaintext `token` is hashed at load; `token_sha256` keeps
+// credentials out of the file). An empty path yields an empty table — every
+// HELLO then fails auth (a server with no tenants; secure by default).
 func LoadNamespaces(path string) (*Namespaces, error) {
-	ns := &Namespaces{byName: make(map[string]nsEntry)}
-	if path == "" {
-		return ns, nil
-	}
-	b, err := os.ReadFile(path) //nolint:gosec // G304: operator-supplied config path
+	reg, err := tenant.LoadRegistry(path)
 	if err != nil {
-		return nil, fmt.Errorf("namespaces: %w", err)
+		return nil, err
 	}
-	var f nsFile
-	if err := yaml.Unmarshal(b, &f); err != nil {
-		return nil, fmt.Errorf("namespaces %s: %w", path, err)
-	}
-	for _, e := range f.Namespaces {
-		if e.Name == "" || e.ID == 0 {
-			return nil, fmt.Errorf("namespaces %s: entry %q needs a non-empty name and a nonzero id", path, e.Name)
-		}
-		if _, dup := ns.byName[e.Name]; dup {
-			return nil, fmt.Errorf("namespaces %s: duplicate namespace %q", path, e.Name)
-		}
-		ns.byName[e.Name] = nsEntry{id: e.ID, token: e.Token}
-	}
-	return ns, nil
+	return &Namespaces{reg: reg}, nil
 }
 
-// NewNamespaces builds a table in memory (tests, single-tenant bring-up).
+// NewNamespaces builds a single-tenant table in memory (tests, bring-up).
 func NewNamespaces(name string, id uint32, token string) *Namespaces {
-	return &Namespaces{byName: map[string]nsEntry{name: {id: id, token: token}}}
+	return &Namespaces{reg: tenant.NewRegistry(name, id, token)}
 }
 
-// Authenticate resolves (name, token) to a namespace id. The token compare is
-// constant-time so a timing side channel can't probe valid tokens; an unknown
-// namespace runs a dummy compare so its timing matches a bad-token reject.
+// FromRegistry wraps an already-built registry (main.go shares one instance
+// between auth, quotas, and the admin surface).
+func FromRegistry(reg *tenant.Registry) *Namespaces { return &Namespaces{reg: reg} }
+
+// Registry exposes the underlying tenant registry (quota wiring, admin).
+func (n *Namespaces) Registry() *tenant.Registry { return n.reg }
+
+// Authenticate resolves (name, token) to a namespace id — constant-time
+// over SHA-256 digests, uniform timing for unknown names.
 func (n *Namespaces) Authenticate(name string, token []byte) (id uint32, ok bool) {
-	e, found := n.byName[name]
-	want := e.token
-	if !found {
-		want = "" // still run a compare below to keep timing uniform
-	}
-	match := subtle.ConstantTimeCompare(token, []byte(want)) == 1
-	if !found || !match {
-		return 0, false
-	}
-	return e.id, true
+	return n.reg.Authenticate(name, token)
 }
