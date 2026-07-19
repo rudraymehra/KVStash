@@ -45,3 +45,5 @@ bench/rigs/*/.rig-state
 # locally built bench binaries
 /kvbench
 /crash
+/getbench
+bench/results/
