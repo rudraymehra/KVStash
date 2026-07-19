@@ -46,3 +46,4 @@ bench/rigs/*/.rig-state
 /kvbench
 /crash
 /getbench
+internal/store/modeltest/testdata/rapid/
