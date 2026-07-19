@@ -280,22 +280,47 @@ func (t *Tiered) reclaimSegment(vol *nvme.Volume) bool {
 	if !vol.RetireBegin(id) {
 		return false
 	}
-	for i := range entries {
-		k := dram.Key{NS: entries[i].NS, Hash: entries[i].Key}
-		removed, st := t.idx.deleteIf(k, func(ref *nvmeRef) protocol.Status {
-			if ref.Loc.SegmentID != id {
-				return protocol.StatusErrBusy // newer home elsewhere — keep the entry
+	if t.p.Spill != nil && vol.IsSpilled(id) {
+		// The FLIP: this segment's bytes live on S3 byte-identically, so
+		// retiring the local file loses nothing — entries stay in the index
+		// (Loc now addresses the object), the tenant charge moves
+		// NVMe→S3, and cold reads route through the restorer. Protection
+		// still holds: leased/pinned entries abort the retire exactly as
+		// the delete path does (a hard-pinned block never becomes s3-only).
+		for i := range entries {
+			k := dram.Key{NS: entries[i].NS, Hash: entries[i].Key}
+			protected := false
+			t.idx.withShardLock(k, func(e *nvmeRef) {
+				if e == nil || e.Loc.SegmentID != id {
+					return
+				}
+				protected = e.leased(t.now()) || e.pinned()
+			})
+			if protected {
+				vol.RetireAbort(id)
+				t.reclaimSkips.Add(1)
+				return false
 			}
-			if ref.leased(t.now()) || ref.pinned() {
-				return protocol.StatusErrLeased // protection landed mid-retire
+		}
+		t.s3FlipRetired(vol, id)
+	} else {
+		for i := range entries {
+			k := dram.Key{NS: entries[i].NS, Hash: entries[i].Key}
+			removed, st := t.idx.deleteIf(k, func(ref *nvmeRef) protocol.Status {
+				if ref.Loc.SegmentID != id {
+					return protocol.StatusErrBusy // newer home elsewhere — keep the entry
+				}
+				if ref.leased(t.now()) || ref.pinned() {
+					return protocol.StatusErrLeased // protection landed mid-retire
+				}
+				return protocol.StatusOK
+			})
+			t.refundNvmeQuota(k.NS, removed)
+			if st == protocol.StatusErrLeased {
+				vol.RetireAbort(id) // reads resume; already-removed entries were unprotected (legal evictions)
+				t.reclaimSkips.Add(1)
+				return false
 			}
-			return protocol.StatusOK
-		})
-		t.refundNvmeQuota(k.NS, removed)
-		if st == protocol.StatusErrLeased {
-			vol.RetireAbort(id) // reads resume; already-removed entries were unprotected (legal evictions)
-			t.reclaimSkips.Add(1)
-			return false
 		}
 	}
 	if err := vol.RetireFinish(id); err != nil {

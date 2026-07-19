@@ -34,6 +34,12 @@ type Params struct {
 	// Refund at every nvme-entry removal (delete verb, reclaim retire,
 	// corrupt-entry self-heal). nil = quotas disabled.
 	Quotas *tenant.Quotas
+	// Spill / Restore: the S3 cold-tier backends (implemented by
+	// internal/store/s3spill; structural — this package never imports the
+	// SDK). nil = no cold tier, byte-for-byte the two-tier daemon.
+	Spill         SpillBackend
+	Restore       RestoreBackend
+	S3ReadTimeout time.Duration // cold ranged-GET deadline (0 = 2s)
 }
 
 func (p Params) withDefaults() Params {
@@ -87,12 +93,17 @@ type Tiered struct {
 	// Pass scratch (single demoter goroutine — same rationale as dram's).
 	scUsages []eviction.DomainUsage
 	scCands  []eviction.Candidate
+	scSegs   []nvme.SegmentInfo
+
+	spillInflight sync.Map // segID → queued-or-uploading (spillPass vs onUp)
 
 	demotions     atomic.Uint64
 	demoteDrops   atomic.Uint64 // queue-full / write-failed / publish-gate-refused demotions
 	dedupSkips    atomic.Uint64 // dual-resident: bytes already on NVMe, append skipped
 	admitRefusals atomic.Uint64 // blocks under the min-hits endurance gate, DELETED instead of demoted
 	promotions    atomic.Uint64
+	s3Hits        atomic.Uint64 // cold ranged GETs served (verified)
+	s3ReadErrs    atomic.Uint64 // cold read failures (deadline, transport)
 	reclaims      atomic.Uint64
 	reclaimSkips  atomic.Uint64
 	readBusy      atomic.Uint64
@@ -160,6 +171,7 @@ func (t *Tiered) Start(ctx context.Context) (stop func()) {
 			case <-t.kick:
 			}
 			t.demotePass(false)
+			t.spillPass()
 			t.reclaimPass()
 		}
 	}()
@@ -268,8 +280,14 @@ func (t *Tiered) GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, 
 		t.readBusy.Add(1)
 		return nil, 0, nil, "", protocol.StatusErrBusy
 	case nvme.ReadGone:
-		// Segment retired under us — the retire already removed (or will
-		// remove) the entries; a plain miss keeps the index self-consistent.
+		// Segment retired locally. If a spilled copy exists this is the
+		// COLD path: one ranged GetObject, verified before a byte escapes.
+		if data, rel, ok := t.readS3(e, ns, key); ok {
+			extendNvmeLease(e, t.now()+int64(t.clampLeaseMS(0))*int64(time.Millisecond))
+			return data, e.XXH3, rel, "s3", protocol.StatusOK
+		}
+		// No S3 copy (or the cold read failed its deadline): a plain miss
+		// keeps the index self-consistent.
 		return nil, 0, nil, "", protocol.StatusNotFound
 	case nvme.ReadCorrupt:
 		// Device rot: self-heal the entry (identity-gated) and miss. The

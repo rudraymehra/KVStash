@@ -58,6 +58,7 @@ type segment struct {
 	path    string
 	size    int64
 	sealed  bool
+	spilled bool          // an S3 copy exists (in-memory only — restarts re-spill, idempotently)
 	dataEnd uint32        // bytes of record region (writer-owned until sealed)
 	entries []footerEntry // sealed: the footer table; active: accumulated so far
 	dying   atomic.Bool   // reclaim in progress — new reads refused

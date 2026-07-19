@@ -20,6 +20,10 @@ type nvmeRef struct {
 	Loc  nvme.Loc
 	Len  uint32
 	XXH3 uint64
+	// S3 marks that a byte-identical copy of this block's SEGMENT lives on
+	// the cold tier (spill-ack). Loc addresses both: the local file while
+	// it exists, the S3 object after reclaim retires the local copy.
+	S3 atomic.Bool
 
 	LeaseUntil atomic.Int64
 	TTLUntil   atomic.Int64
