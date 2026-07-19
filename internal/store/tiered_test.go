@@ -39,6 +39,16 @@ type fixture struct {
 // and the demoter, fake clock.
 func newFixture(t *testing.T, volMaxBytes int64, backend nvme.IOBackend) *fixture {
 	t.Helper()
+	return newFixtureAdmit(t, volMaxBytes, backend, 1) // production default (config layer)
+}
+
+// newFixtureAdmit passes AdmitMinHits through NewTiered — the CONSTRUCTOR
+// path, where the zero-vs-default clamp bug lived. Regression tests must
+// use this, never a post-construction t.p write (which bypasses
+// withDefaults entirely — two reviewers proved the bypassed form passes
+// against the buggy code).
+func newFixtureAdmit(t *testing.T, volMaxBytes int64, backend nvme.IOBackend, admitMinHits uint32) *fixture {
+	t.Helper()
 	cur := &atomic.Int64{}
 	cur.Store(1)
 	arena, err := dram.NewArena(8<<20, false)
@@ -61,7 +71,7 @@ func newFixture(t *testing.T, volMaxBytes int64, backend nvme.IOBackend) *fixtur
 	}
 	tt := NewTiered(d, pol, []*nvme.Volume{vol}, []*nvme.RecoveryReport{rep},
 		[][]nvme.RecoveredEntry{ents}, Params{
-			LeaseDefaultMS: 100, LeaseMaxMS: 60000,
+			LeaseDefaultMS: 100, LeaseMaxMS: 60000, AdmitMinHits: admitMinHits,
 			PromoteWindow: time.Minute, Now: cur.Load,
 		})
 	fx := &fixture{t: tt, cur: cur, stop: func() {}}
@@ -379,5 +389,79 @@ func TestNvmeLifecycleVerbs(t *testing.T) {
 	}
 	if fx.t.Contains(1, k) {
 		t.Fatal("deleted nvme block still visible")
+	}
+}
+
+// putColdRange PUTs n never-read blocks (zero lifetime GETs) — the shape a
+// pure ingest fill has, and exactly what the SSD-endurance admission gate
+// judges.
+func (fx *fixture) putColdRange(t *testing.T, start, n, sz int) {
+	t.Helper()
+	for j := 0; j < n; j++ {
+		i := start + j
+		b := tblob(i, sz)
+		if st := fx.t.Put(1, tk(i), b, xxh3.Hash(b)); st != protocol.StatusOK {
+			t.Fatalf("put %d: %s", i, st)
+		}
+	}
+	fx.cur.Add(500 * msNanos)
+}
+
+// The zero-vs-default regression (rig-caught): an explicit AdmitMinHits 0
+// must genuinely admit never-read blocks — a withDefaults clamp silently
+// turned 0 into 1, and a pure-PUT fill was then DELETED at the demote
+// watermark with no counter (the 20 GiB rig fill vanished; the probe
+// caught it). Same trap class as the PromoteWindow ladder finding.
+func TestAdmitMinHitsZeroAdmitsColdFill(t *testing.T) {
+	// The clamp lived in withDefaults — pin it directly, forever.
+	if got := (Params{AdmitMinHits: 0}).withDefaults().AdmitMinHits; got != 0 {
+		t.Fatalf("withDefaults clamped explicit AdmitMinHits 0 to %d", got)
+	}
+	// And through the constructor path (NOT a post-construction t.p write,
+	// which would bypass withDefaults and pass against the buggy code).
+	fx := newFixtureAdmit(t, 64<<20, nil, 0)
+
+	fx.putColdRange(t, 0, fillN, 60<<10)
+	if fx.t.DemoteNow() == 0 {
+		t.Fatal("demotion pass moved nothing at 90% occupancy")
+	}
+	if got := fx.t.demotions.Load(); got == 0 {
+		t.Fatal("AdmitMinHits=0 must WRITE never-read blocks to NVMe; zero demotions completed")
+	}
+	if got := fx.t.admitRefusals.Load(); got != 0 {
+		t.Fatalf("AdmitMinHits=0 refused %d blocks", got)
+	}
+	// The demoted cold blocks still answer byte-identical from NVMe.
+	nvmeHits := 0
+	for i := 0; i < fillN; i++ {
+		data, _, rel, tier, st := fx.t.GetRefTier(1, tk(i))
+		if st != protocol.StatusOK {
+			continue // eviction overlap is cache-legal; misses allowed
+		}
+		if !bytes.Equal(data, tblob(i, 60<<10)) {
+			t.Fatalf("block %d corrupted across the tier move", i)
+		}
+		if tier == "nvme" {
+			nvmeHits++
+		}
+		rel()
+	}
+	if nvmeHits == 0 {
+		t.Fatal("no cold block is servable from NVMe after an admit-all demotion pass")
+	}
+}
+
+// The gate's intended behavior stays: min-hits 1 deletes never-read blocks
+// instead of writing them to flash — but VISIBLY (admit_refusals_total).
+func TestAdmitMinHitsOneRefusesColdFillCounted(t *testing.T) {
+	fx := newFixtureAdmit(t, 64<<20, nil, 1)
+
+	fx.putColdRange(t, 0, fillN, 60<<10)
+	fx.t.DemoteNow()
+	if fx.t.demotions.Load() != 0 {
+		t.Fatal("never-read blocks must not reach flash at min-hits 1")
+	}
+	if fx.t.admitRefusals.Load() == 0 {
+		t.Fatal("the endurance gate deleted blocks with no admit_refusals_total accounting")
 	}
 }

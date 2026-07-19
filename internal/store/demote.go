@@ -125,6 +125,11 @@ func (t *Tiered) demoteOne(k dram.Key, size int64, now int64, wg *sync.WaitGroup
 	if hits < t.p.AdmitMinHits {
 		rel()
 		if t.d.CompleteDemotion(k.NS, k.Hash, sum, nil) {
+			// The block is GONE (deleted, not moved) — SSD endurance says a
+			// never-read block isn't flash-worthy. Count it: an operator
+			// watching a pure-PUT fill melt away deserves a metric, and a
+			// silent variant of this branch once ate a 20 GiB rig fill.
+			t.admitRefusals.Add(1)
 			return size
 		}
 		t.pol.Admit(eviction.Key{NS: k.NS, Hash: k.Hash}, size, now)

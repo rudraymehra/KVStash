@@ -18,7 +18,7 @@ import (
 type Params struct {
 	DemoteWatermarkPct int    // demote at DRAM used ≥ this % (default 90 — below the evictor's 95)
 	DemoteBatchPct     int    // demote down to (watermark − batch)% (default 5)
-	AdmitMinHits       uint32 // blocks with fewer lifetime GETs are evicted, not written to NVMe (default 1)
+	AdmitMinHits       uint32 // blocks with fewer than this many lifetime GETs are DELETED at the demote watermark, not written to NVMe. 0 = admit everything; the operator-facing default (1) is applied by the config layer, never here
 	// PromoteWindow: a 2nd NVMe hit within this window promotes the block
 	// back to DRAM. ≤0 = promotion DISABLED — zero genuinely means never
 	// (the ladder caught withDefaults silently turning 0 into a minute;
@@ -37,9 +37,12 @@ func (p Params) withDefaults() Params {
 	if p.DemoteBatchPct == 0 {
 		p.DemoteBatchPct = 5
 	}
-	if p.AdmitMinHits == 0 {
-		p.AdmitMinHits = 1
-	}
+	// AdmitMinHits 0 genuinely means "admit everything" — the SAME
+	// zero-vs-default trap PromoteWindow already documented below: a
+	// withDefaults clamp here made the operator's explicit 0 silently
+	// behave as 1, and under a pure-PUT fill "demotion" then DELETED every
+	// cold block (nothing has hits yet) with no counter. The operator
+	// default (1) lives in the config layer, where it is visible.
 	// PromoteWindow deliberately has NO default: ≤0 = never promote.
 	if p.Interval == 0 {
 		p.Interval = 100 * time.Millisecond
@@ -79,14 +82,15 @@ type Tiered struct {
 	scUsages []eviction.DomainUsage
 	scCands  []eviction.Candidate
 
-	demotions    atomic.Uint64
-	demoteDrops  atomic.Uint64 // queue-full / write-failed / gate-refused demotions
-	dedupSkips   atomic.Uint64 // dual-resident: bytes already on NVMe, append skipped
-	promotions   atomic.Uint64
-	reclaims     atomic.Uint64
-	reclaimSkips atomic.Uint64
-	readBusy     atomic.Uint64
-	checksumErrs atomic.Uint64
+	demotions     atomic.Uint64
+	demoteDrops   atomic.Uint64 // queue-full / write-failed / publish-gate-refused demotions
+	dedupSkips    atomic.Uint64 // dual-resident: bytes already on NVMe, append skipped
+	admitRefusals atomic.Uint64 // blocks under the min-hits endurance gate, DELETED instead of demoted
+	promotions    atomic.Uint64
+	reclaims      atomic.Uint64
+	reclaimSkips  atomic.Uint64
+	readBusy      atomic.Uint64
+	checksumErrs  atomic.Uint64
 
 	recoveredBlocks int
 	recoverySecs    float64
@@ -503,12 +507,13 @@ func (t *Tiered) Stats() []byte {
 		v.StatsInto(volStats)
 	}
 	nv := map[string]any{
-		"blocks":             blocks,
-		"bytes":              bytes,
-		"demotions_total":    t.demotions.Load(),
-		"demote_drops_total": t.demoteDrops.Load(),
-		"dedup_skips_total":  t.dedupSkips.Load(),
-		"promotions_total":   t.promotions.Load(),
+		"blocks":               blocks,
+		"bytes":                bytes,
+		"demotions_total":      t.demotions.Load(),
+		"demote_drops_total":   t.demoteDrops.Load(),
+		"dedup_skips_total":    t.dedupSkips.Load(),
+		"admit_refusals_total": t.admitRefusals.Load(),
+		"promotions_total":     t.promotions.Load(),
 		// reclaims_total comes from the volume merge below — the tiered
 		// counter counted the SAME events and silently shadowed it (ladder
 		// finding); t.reclaims stays for internal assertions only.
