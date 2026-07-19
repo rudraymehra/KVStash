@@ -106,8 +106,12 @@ type Config struct {
 	// pass demotes.
 	NvmeDemoteWatermarkPct int `yaml:"nvme_demote_watermark_pct"`
 	NvmeDemoteBatchPct     int `yaml:"nvme_demote_batch_pct"`
-	// NvmeAdmitMinHits: blocks with fewer lifetime GETs are evicted rather
-	// than written to flash (SSD endurance).
+	// NvmeAdmitMinHits: blocks with fewer than this many lifetime GETs are
+	// DELETED at the demote watermark (90% by default — BEFORE the evictor's
+	// 95%) rather than written to flash (SSD endurance). A pure-ingest
+	// workload's never-read blocks melt under the default — set 0 to admit
+	// everything, and watch kvb_nvme_admit_refusals_total either way. The
+	// default (1) lives HERE; explicit 0 is honored end-to-end.
 	NvmeAdmitMinHits uint32 `yaml:"nvme_admit_min_hits"`
 	// NvmePromoteWindowMS: a 2nd NVMe hit within this window promotes the
 	// block back to DRAM; 0 disables promotion.

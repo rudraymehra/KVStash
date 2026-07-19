@@ -91,6 +91,7 @@ func TestNvmeSubdocScrape(t *testing.T) {
 			`"pinned_bytes":{},"evictions_total":0,"live_allocs":3,"max_allocs":131072,` +
 			`"nvme":{"blocks":40,"bytes":41943040,"segments":5,"used_bytes":1342177280,` +
 			`"max_bytes":10737418240,"demotions_total":40,"demote_drops_total":2,` +
+			`"admit_refusals_total":6,` +
 			`"dedup_skips_total":1,"promotions_total":3,"reclaims_total":1,` +
 			`"reclaim_skips_total":0,"read_busy_total":7,"checksum_errors_total":0,` +
 			`"recovered_blocks":40,"recovery_seconds":0.42}}`)
@@ -111,6 +112,7 @@ func TestNvmeSubdocScrape(t *testing.T) {
 		`kvb_nvme_max_bytes 1.073741824e+10`,
 		`kvb_nvme_demotions_total 40`,
 		`kvb_nvme_demote_drops_total 2`,
+		`kvb_nvme_admit_refusals_total 6`,
 		`kvb_nvme_dedup_skips_total 1`,
 		`kvb_nvme_promotions_total 3`,
 		`kvb_nvme_reclaims_total 1`,

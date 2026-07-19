@@ -190,3 +190,35 @@ func TestNvmePathsEnv(t *testing.T) {
 		t.Fatalf("env max bytes: %d", c.NvmeMaxBytes)
 	}
 }
+
+// The zero-vs-default chain, pinned end to end: an explicit
+// `nvme_admit_min_hits: 0` must survive YAML→Config as 0 (admit
+// everything), while an ABSENT key stays at the operator default (1).
+// The original bug lived one layer down (a store-side clamp), but the
+// failure users hit chained through THIS layer — pin the whole chain.
+func TestAdmitMinHitsExplicitZeroSurvivesLoad(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "zero.yaml")
+	if err := os.WriteFile(p, []byte("nvme_admit_min_hits: 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(p, Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.NvmeAdmitMinHits != 0 {
+		t.Fatalf("explicit nvme_admit_min_hits: 0 loaded as %d", c.NvmeAdmitMinHits)
+	}
+
+	p2 := filepath.Join(dir, "absent.yaml")
+	if err := os.WriteFile(p2, []byte("listen_addr: \":9440\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := Load(p2, Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.NvmeAdmitMinHits != 1 {
+		t.Fatalf("absent nvme_admit_min_hits defaulted to %d, want 1", c2.NvmeAdmitMinHits)
+	}
+}

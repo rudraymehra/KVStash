@@ -48,7 +48,7 @@ nvme_segment_bytes: 268435456 # 256 MiB append-only segments (4 KiB-aligned reco
 nvme_read_workers: 16         # per-volume device-read pool; saturation → per-key ERR_BUSY, never a hang
 nvme_demote_watermark_pct: 90 # demote at 90% DRAM occupancy — strictly below eviction_watermark_pct
 nvme_demote_batch_pct: 5      # each pass demotes down to 85% (90 - 5)
-nvme_admit_min_hits: 1        # never-read blocks are evicted, not written to flash (SSD endurance)
+nvme_admit_min_hits: 1        # blocks with fewer lifetime GETs are DELETED at the demote watermark, not written to flash (SSD endurance); 0 = admit everything (pure-ingest workloads); watch kvb_nvme_admit_refusals_total
 nvme_promote_window_ms: 60000 # 2nd NVMe hit within 60s promotes back to DRAM; 0 = never promote
 nvme_sync_every_bytes: 8388608 # 8 MiB group-commit fdatasync ledger
 nvme_ckpt_every_segments: 8   # index checkpoint every 8 seals (0 = never; footer scans cover recovery)

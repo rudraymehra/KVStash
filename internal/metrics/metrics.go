@@ -180,7 +180,9 @@ var (
 	descNvmeDemotions = prometheus.NewDesc("kvb_nvme_demotions_total",
 		"Blocks demoted DRAM→NVMe (bytes written and index moved).", nil, nil)
 	descNvmeDemoteDrops = prometheus.NewDesc("kvb_nvme_demote_drops_total",
-		"Demotions dropped (queue full, write failure, or gate refusal).", nil, nil)
+		"Demotions dropped (queue full, write failure, or publish-gate refusal). Endurance-gate deletions are counted separately in kvb_nvme_admit_refusals_total.", nil, nil)
+	descNvmeAdmitRefusals = prometheus.NewDesc("kvb_nvme_admit_refusals_total",
+		"Blocks with fewer than nvme_admit_min_hits lifetime GETs, DELETED at the demote watermark instead of written to flash (SSD endurance).", nil, nil)
 	descNvmeDedup = prometheus.NewDesc("kvb_nvme_dedup_skips_total",
 		"Demotions completed WITHOUT an SSD write (bytes already resident).", nil, nil)
 	descNvmePromotions = prometheus.NewDesc("kvb_nvme_promotions_total",
@@ -219,6 +221,7 @@ func (c *storeCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descNvmeMax
 	ch <- descNvmeDemotions
 	ch <- descNvmeDemoteDrops
+	ch <- descNvmeAdmitRefusals
 	ch <- descNvmeDedup
 	ch <- descNvmePromotions
 	ch <- descNvmeReclaims
@@ -251,6 +254,7 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 			MaxBytes      float64 `json:"max_bytes"`
 			Demotions     float64 `json:"demotions_total"`
 			DemoteDrops   float64 `json:"demote_drops_total"`
+			AdmitRefusals float64 `json:"admit_refusals_total"`
 			DedupSkips    float64 `json:"dedup_skips_total"`
 			Promotions    float64 `json:"promotions_total"`
 			Reclaims      float64 `json:"reclaims_total"`
@@ -291,6 +295,7 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(descNvmeMax, prometheus.GaugeValue, nv.MaxBytes)
 		ch <- prometheus.MustNewConstMetric(descNvmeDemotions, prometheus.CounterValue, nv.Demotions)
 		ch <- prometheus.MustNewConstMetric(descNvmeDemoteDrops, prometheus.CounterValue, nv.DemoteDrops)
+		ch <- prometheus.MustNewConstMetric(descNvmeAdmitRefusals, prometheus.CounterValue, nv.AdmitRefusals)
 		ch <- prometheus.MustNewConstMetric(descNvmeDedup, prometheus.CounterValue, nv.DedupSkips)
 		ch <- prometheus.MustNewConstMetric(descNvmePromotions, prometheus.CounterValue, nv.Promotions)
 		ch <- prometheus.MustNewConstMetric(descNvmeReclaims, prometheus.CounterValue, nv.Reclaims)
