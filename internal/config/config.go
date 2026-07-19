@@ -119,6 +119,17 @@ type Config struct {
 	NvmePromoteWindowMS uint32 `yaml:"nvme_promote_window_ms"`
 	// NvmeSyncEveryBytes is the group-commit cadence (fdatasync ledger).
 	NvmeSyncEveryBytes int64 `yaml:"nvme_sync_every_bytes"`
+	// S3 cold tier (inert until s3_bucket is set; needs the NVMe tier).
+	// Credentials come from the ambient AWS chain (env/shared-config/IMDS) —
+	// never from this file.
+	S3Bucket           string `yaml:"s3_bucket"`
+	S3Region           string `yaml:"s3_region"`
+	S3NodeID           string `yaml:"s3_node_id"`           // namespaces object keys; REQUIRED with s3_bucket
+	S3EndpointOverride string `yaml:"s3_endpoint_override"` // MinIO-compatible targets
+	S3PathStyle        bool   `yaml:"s3_path_style"`
+	S3SpillQueue       int    `yaml:"s3_spill_queue"`     // bounded write-back depth (0 = 8)
+	S3ReadTimeoutMS    uint32 `yaml:"s3_read_timeout_ms"` // cold ranged-GET deadline (0 = 2000)
+
 	// NvmeCkptEverySegments writes an index checkpoint every N seals
 	// (0 = never; recovery falls back to footer scans).
 	NvmeCkptEverySegments int `yaml:"nvme_ckpt_every_segments"`
@@ -342,6 +353,12 @@ func (c Config) Validate() error {
 		"eviction_batch_pct %d: must be in [1, eviction_watermark_pct %d)", c.EvictionBatchPct, c.EvictionWatermarkPct)
 	check(c.EvictionGhostEntries >= 0, "eviction_ghost_entries %d: must be >= 0 (0 = auto)", c.EvictionGhostEntries)
 
+	if c.S3Bucket != "" {
+		check(len(c.NvmePaths) > 0,
+			"s3_bucket set but nvme_paths empty — the cold tier spills SEALED NVMe segments")
+		check(c.S3NodeID != "",
+			"s3_bucket set but s3_node_id empty — object keys must be node-namespaced")
+	}
 	if len(c.NvmePaths) > 0 {
 		// Paths are compared NORMALIZED: "/a" vs "/a/" (or "./x" vs "x")
 		// naming the same directory would put two volumes on one segment

@@ -21,6 +21,7 @@ import (
 	"github.com/kvstash/kvblockd/internal/store"
 	"github.com/kvstash/kvblockd/internal/store/dram"
 	"github.com/kvstash/kvblockd/internal/store/nvme"
+	"github.com/kvstash/kvblockd/internal/store/s3spill"
 	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
@@ -154,6 +155,25 @@ func run() error {
 			reports = append(reports, rep)
 			recovered = append(recovered, ents)
 		}
+		var spillB store.SpillBackend
+		var restoreB store.RestoreBackend
+		if cfg.S3Bucket != "" {
+			s3cfg := s3spill.Config{
+				Bucket: cfg.S3Bucket, Region: cfg.S3Region, NodeID: cfg.S3NodeID,
+				EndpointOverride: cfg.S3EndpointOverride, PathStyle: cfg.S3PathStyle,
+			}
+			api, aerr := s3spill.NewClient(ctx, s3cfg)
+			if aerr != nil {
+				closeVols()
+				stopEvict()
+				_ = dstore.Close()
+				return fmt.Errorf("s3 tier: %w", aerr)
+			}
+			sp := s3spill.NewSpiller(api, s3cfg, cfg.S3SpillQueue)
+			defer sp.Close()
+			spillB, restoreB = sp, s3spill.NewRestorer(api, s3cfg)
+			fmt.Fprintln(os.Stderr, "kvblockd: s3 tier on", cfg.S3Bucket, "node", cfg.S3NodeID)
+		}
 		tiered := store.NewTiered(dstore, pol, vols, reports, recovered, store.Params{
 			DemoteWatermarkPct: cfg.NvmeDemoteWatermarkPct,
 			DemoteBatchPct:     cfg.NvmeDemoteBatchPct,
@@ -164,6 +184,9 @@ func run() error {
 			LeaseDefaultMS: cfg.LeaseDefaultMS,
 			LeaseMaxMS:     cfg.LeaseMaxMS,
 			Quotas:         quotas,
+			Spill:          spillB,
+			Restore:        restoreB,
+			S3ReadTimeout:  time.Duration(cfg.S3ReadTimeoutMS) * time.Millisecond,
 		})
 		stopT := tiered.Start(ctx)
 		var tierStopped bool
