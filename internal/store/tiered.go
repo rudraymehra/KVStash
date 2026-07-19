@@ -653,9 +653,12 @@ func (t *Tiered) Scrub() (bad int) {
 
 // DemoteNow runs one synchronous demotion pass (modeltest's deterministic
 // pressure handle) — it WAITS for every accepted append's completion, then
-// runs a reclaim pass.
+// runs the spill pass (a synchronous backend completes flips inline; the
+// real async spiller just enqueues, exactly like the ticker) and a reclaim
+// pass.
 func (t *Tiered) DemoteNow() int {
 	n := t.demotePass(true)
+	t.spillPass()
 	t.reclaimPass()
 	return n
 }

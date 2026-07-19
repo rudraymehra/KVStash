@@ -208,17 +208,29 @@ func (t *Tiered) promoteOne(req promoteReq) {
 
 // promoteSync is the synchronous promotion core (also the PIN_HARD path).
 func (t *Tiered) promoteSync(k dram.Key, e *nvmeRef) protocol.Status {
+	var heap []byte
 	blob, rel, st := t.volumeFor(k.Hash).Read(e.Loc, k.NS, k.Hash, e.XXH3)
 	switch st {
 	case nvme.ReadOK:
+		heap = make([]byte, len(blob))
+		copy(heap, blob)
+		rel()
 	case nvme.ReadBusy:
 		return protocol.StatusErrBusy
-	case nvme.ReadGone, nvme.ReadCorrupt:
+	case nvme.ReadGone:
+		// Retired locally but s3-resident: promotion (and PIN_HARD's "must
+		// survive" = DRAM residency) must work from the cold tier too — a
+		// GET serves this block, so a pin refusing NOT_FOUND would be a lie.
+		// readS3 verifies before a byte escapes and hands us a heap buffer.
+		data, crel, ok := t.readS3(e, k.NS, k.Hash)
+		if !ok {
+			return protocol.StatusNotFound
+		}
+		heap = data
+		crel()
+	case nvme.ReadCorrupt:
 		return protocol.StatusNotFound
 	}
-	heap := make([]byte, len(blob))
-	copy(heap, blob)
-	rel()
 	switch pst := t.d.Put(k.NS, k.Hash, heap, e.XXH3); pst {
 	case protocol.StatusOK:
 		t.promotions.Add(1)

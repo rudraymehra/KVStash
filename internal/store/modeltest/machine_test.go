@@ -2,9 +2,11 @@ package modeltest
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -34,7 +36,76 @@ const (
 	segBytes   = 1 << 20
 	volMax     = 64 << 20
 	maxBlobLen = 512 << 10
+	// Three-tier machine: a TIGHT volume budget so reclaim retires spilled
+	// segments constantly — the retire-flip and cold-read paths carry real
+	// traffic instead of firing once per walk.
+	volMaxS3 = 4 << 20
 )
+
+// fakeS3 is the deterministic cold tier: DemoteSegment uploads INLINE
+// (onUp fires before it returns — spillPass completes flips synchronously,
+// so the async queue can never race the model), and objects live in a map
+// that survives simulate_crash the way real S3 outlives the daemon process.
+// The real async spiller/restorer have their own gofakes3 wall in
+// internal/store/s3spill; the machine wants determinism, not queue coverage.
+type fakeS3 struct {
+	objects    map[uint64][]byte
+	spilled    uint64
+	putErrors  uint64
+	rangedGets uint64
+}
+
+func newFakeS3() *fakeS3 { return &fakeS3{objects: map[uint64][]byte{}} }
+
+// fakeSpill / fakeRestore split the two backend interfaces over one object
+// store (their Stats signatures differ).
+type (
+	fakeSpill   struct{ *fakeS3 }
+	fakeRestore struct{ *fakeS3 }
+)
+
+func (f fakeSpill) DemoteSegment(segID uint64, size int64, open func() (io.ReadSeekCloser, error), onUp func(uint64, bool)) bool {
+	r, err := open()
+	if err != nil {
+		f.putErrors++
+		onUp(segID, false)
+		return true
+	}
+	b, rerr := io.ReadAll(r)
+	_ = r.Close()
+	if rerr != nil || int64(len(b)) != size {
+		f.putErrors++
+		onUp(segID, false)
+		return true
+	}
+	f.objects[segID] = b // idempotent overwrite — a post-crash re-spill writes the same bytes
+	f.spilled++
+	onUp(segID, true)
+	return true
+}
+
+func (f fakeSpill) Drop(_ context.Context, segID uint64) error {
+	delete(f.objects, segID)
+	return nil
+}
+
+func (f fakeSpill) Stats() (spilled, dropped, putErrors uint64) {
+	return f.spilled, 0, f.putErrors
+}
+
+func (f fakeRestore) ReadRange(_ context.Context, segID uint64, off, n int64, dst []byte) error {
+	obj, ok := f.objects[segID]
+	if !ok || off < 0 || n < 0 || off+n > int64(len(obj)) {
+		return fmt.Errorf("fakeS3: no bytes for seg %d [%d,+%d)", segID, off, n)
+	}
+	f.rangedGets++
+	copy(dst, obj[off:off+n])
+	return nil
+}
+
+func (f fakeRestore) Stats() (rangedGets, restores uint64) {
+	return f.rangedGets, 0
+}
 
 // sutStore is what both kinds under test satisfy (the model is tier-blind).
 type sutStore interface {
@@ -88,21 +159,33 @@ type storeStats struct {
 		Blocks int   `json:"blocks"`
 		Bytes  int64 `json:"bytes"`
 	} `json:"nvme"` // present only on the tiered machine
+	S3 *struct {
+		Blocks int   `json:"blocks"`
+		Bytes  int64 `json:"bytes"`
+	} `json:"s3"` // present only on the three-tier machine
 }
 
 // residentBlocks/residentBytes are the store's whole-cache view across tiers.
 func (d *storeStats) residentBlocks() int {
+	n := d.Blocks
 	if d.Nvme != nil {
-		return d.Blocks + d.Nvme.Blocks
+		n += d.Nvme.Blocks
 	}
-	return d.Blocks
+	if d.S3 != nil {
+		n += d.S3.Blocks
+	}
+	return n
 }
 
 func (d *storeStats) residentBytes() int64 {
+	n := d.Bytes
 	if d.Nvme != nil {
-		return d.Bytes + d.Nvme.Bytes
+		n += d.Nvme.Bytes
 	}
-	return d.Bytes
+	if d.S3 != nil {
+		n += d.S3.Bytes
+	}
+	return n
 }
 
 // TestStoreModel is the harness: the real store vs the reference model over
@@ -112,8 +195,11 @@ func (d *storeStats) residentBytes() int64 {
 func TestStoreModel(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		policyName := rapid.SampledFrom([]string{"s3fifo", "sampled-lru"}).Draw(rt, "policy")
-		kind := rapid.SampledFrom([]string{"dram", "tiered"}).Draw(rt, "kind")
+		kind := rapid.SampledFrom([]string{"dram", "tiered", "s3"}).Draw(rt, "kind")
 		cur := startNanos
+		// The cold tier outlives crashes (real S3 outlives the process); one
+		// object store per walk, rebuilt stores keep pointing at it.
+		coldTier := newFakeS3()
 
 		volDir, err := os.MkdirTemp("", "kvb-modeltest-*")
 		if err != nil {
@@ -163,21 +249,38 @@ func TestStoreModel(t *testing.T) {
 				s, tt = ds, nil
 				return
 			}
+			budget := int64(volMax)
+			if kind == "s3" {
+				budget = volMaxS3 // tight: reclaim retires spilled segments constantly
+			}
 			vol, _, ents, verr := nvme.OpenVolume(nvme.VolumeParams{
-				Dir: volDir, SegmentBytes: segBytes, MaxBytes: volMax,
+				Dir: volDir, SegmentBytes: segBytes, MaxBytes: budget,
 				ReadWorkers: 2, CkptEverySegs: 2, MaxBlobLen: maxBlobLen,
 				Now: func() int64 { return cur },
 			})
 			if verr != nil {
 				rt.Fatal(verr)
 			}
+			p := store.Params{
+				LeaseDefaultMS: leaseDefaultMS, LeaseMaxMS: leaseMaxMS,
+				PromoteWindow: time.Hour, // wide window; promotions happen via GETs (no background loops started)
+				Now:           func() int64 { return cur },
+				Quotas:        quotas,
+			}
+			if kind == "s3" {
+				p.Spill = fakeSpill{coldTier}
+				p.Restore = fakeRestore{coldTier}
+				p.S3ReadTimeout = time.Second
+				// Aggressive demotion (drain the arena 50%→10% per pass): a
+				// single pressure action pushes multiple segments through
+				// seal→spill→reclaim, so retire-flips and cold reads carry
+				// real traffic inside ordinary-length walks instead of
+				// needing ~9 pressure draws to first fill the tight budget.
+				p.DemoteWatermarkPct = 50
+				p.DemoteBatchPct = 40
+			}
 			tt = store.NewTiered(ds, pol, []*nvme.Volume{vol}, nil,
-				[][]nvme.RecoveredEntry{ents}, store.Params{
-					LeaseDefaultMS: leaseDefaultMS, LeaseMaxMS: leaseMaxMS,
-					PromoteWindow: time.Hour, // wide window; promotions happen via GETs (no background loops started)
-					Now:           func() int64 { return cur },
-					Quotas:        quotas,
-				})
+				[][]nvme.RecoveredEntry{ents}, p)
 			s = tt
 		}
 		mkSUT()
@@ -315,6 +418,32 @@ func TestStoreModel(t *testing.T) {
 					rt.Fatalf("I1: GET bytes/sum mismatch for %v (%d bytes served)", k, len(data))
 				}
 				e.maybeGone = false // byte-verified present
+				grantLease(e)
+			},
+			"get_junk": func(rt *rapid.T) {
+				// The junk fill is what actually sinks through the tiers (it
+				// dominates demoted bytes, so flipped segments are mostly
+				// junk) — without reads against it the cold path carries no
+				// GET traffic and the s3 machine verifies nothing.
+				if junkSeq == 0 {
+					return
+				}
+				seq := rapid.IntRange(0, junkSeq-1).Draw(rt, "jseq")
+				h := junkHash(seq)
+				k := eviction.Key{NS: 9, Hash: h}
+				data, sum, ok := s.Get(9, h)
+				if !ok {
+					mustReconcileMiss(k, "GET-junk")
+					return
+				}
+				e := m.blocks[k]
+				if e == nil {
+					e = ghostOrFatal(k, "GET-junk")
+				}
+				if !m.resolveBytes(k.NS, e, data, sum) {
+					rt.Fatalf("I1: GET-junk bytes/sum mismatch for %v (%d bytes served)", k, len(data))
+				}
+				e.maybeGone = false
 				grantLease(e)
 			},
 			"getref_hold": func(rt *rapid.T) {
@@ -655,7 +784,7 @@ func TestStoreModel(t *testing.T) {
 							rt.Fatalf("I3q: ns%d dram usage %d exceeds quota %d", nsq, u, lim)
 						}
 					}
-					for _, tr := range []tenant.Tier{tenant.TierDRAM, tenant.TierNVMe} {
+					for _, tr := range []tenant.Tier{tenant.TierDRAM, tenant.TierNVMe, tenant.TierS3} {
 						if u := quotas.Usage(nsq, tr); u < 0 {
 							rt.Fatalf("I3q: ns%d %s usage negative: %d", nsq, tr, u)
 						}

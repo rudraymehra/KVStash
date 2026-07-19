@@ -45,7 +45,8 @@ func newS3Fixture(t *testing.T) *s3Fixture {
 	if err := backend.CreateBucket("kvb-tier"); err != nil {
 		t.Fatal(err)
 	}
-	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
+	awsCfg, err := awsconfig.LoadDefaultConfig(
+		context.Background(),
 		awsconfig.WithRegion("us-east-1"),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("t", "t", "")),
 	)
