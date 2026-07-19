@@ -15,7 +15,12 @@ if aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
   # Stop the driver gracefully if still running (prints the final line).
   ssh "${SSHOPTS[@]}" "ec2-user@$PUB" \
     'kill -TERM $(cat /tmp/soakout/driver.pid) 2>/dev/null || true; sleep 5; kill -TERM $(cat /tmp/soakout/daemon.pid) 2>/dev/null || true; sleep 3' || true
-  if ! scp -r "${SSHOPTS[@]}" "ec2-user@$PUB:/tmp/soakout/*" "$OUT/"; then
+  # /tmp is tmpfs on AL2023 — a dead-man stop destroys it. The on-box
+  # self-save timer copies to /var/soakout (EBS) at the 24h mark; prefer
+  # whichever exists. A STOPPED box can be started and still collected.
+  SRC="/tmp/soakout"
+  ssh "${SSHOPTS[@]}" "ec2-user@$PUB" 'test -d /var/soakout' && SRC="/var/soakout"
+  if ! scp -r "${SSHOPTS[@]}" "ec2-user@$PUB:$SRC/*" "$OUT/"; then
     # NEVER tear down on a failed pull — a transient ssh drop must not
     # destroy 24 hours of artifacts. Retry collect.sh; the 27h dead-man is
     # the only thing allowed to kill an uncollected box.
@@ -23,7 +28,16 @@ if aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
     exit 1
   fi
 else
-  echo "[collect] instance not running (dead-man fired?) — artifacts lost unless pulled earlier"
+  echo "[collect] instance not running (dead-man fired) — starting it to pull the EBS self-save"
+  aws ec2 start-instances --region "$REGION" --instance-ids "$IID" >/dev/null
+  aws ec2 wait instance-running --region "$REGION" --instance-ids "$IID"
+  PUB=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+  sleep 20 # sshd
+  if ! scp -r "${SSHOPTS[@]}" "ec2-user@$PUB:/var/soakout/*" "$OUT/"; then
+    echo "[collect] PULL FAILED post-restart — box left RUNNING; re-run collect.sh" >&2
+    exit 1
+  fi
 fi
 
 echo "[collect] terminating $IID"
