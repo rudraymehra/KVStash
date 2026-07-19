@@ -53,7 +53,7 @@ if [ -f "$OUT/gctrace.log" ]; then
   echo "--- GC pause percentiles (wall-clock STW µs, from gctrace):"
   # gctrace line shape: "gc N @Ts C%: clock1+clock2+clock3 ms ..." — the
   # three clock segments; STW are the 1st and 3rd. Extract + percentile.
-  grep '^gc ' "$OUT/gctrace.log" | awk '{split($6, a, "+"); print a[1]*1000; print a[3]*1000}' | sort -n > "$OUT/pauses-us.txt"
+  grep '^gc ' "$OUT/gctrace.log" | awk '{split($5, a, "+"); print a[1]*1000; print a[3]*1000}' | sort -n > "$OUT/pauses-us.txt"
   n=$(wc -l < "$OUT/pauses-us.txt" | tr -d ' ')
   for q in 50 99 999; do
     idx=$(( (n * q + 999) / 1000 )); [ "$q" = 50 ] && idx=$(( (n + 1) / 2 )); [ "$q" = 99 ] && idx=$(( (n * 99 + 99) / 100 ))

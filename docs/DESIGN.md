@@ -724,7 +724,12 @@ the index — matching the per-tenant ledger's tier split; the scrape side
 adds the `kvb_s3_*` families and tier="s3" to `kvb_blocks` /
 `kvb_store_bytes`.
 
-**Measured evidence.** The 24 h soak: **123.3M verified hits, 0 errors**.
+**Measured evidence.** The 24 h soak: **123.3M verified hits, 0 errors**,
+RSS flat (165→160 MB), and across 1.7M GC cycles the stop-the-world pauses
+held **p50 42 µs / p99 3.0 ms / p99.9 5.8 ms / max 13 ms** — measured on a
+4-vCPU box pinned at 100% CPU by design, which inflates the scheduler-bound
+tail; the arena keeps the block bytes themselves entirely outside the GC's
+world.
 The overnight three-tier spill soak (MinIO on-box): **17,890+ verified cold
 reads, 0 errors**. The spill-mode kill -9 torture: **25 cycles, 0 corrupt,
 0 phantom — 18/18 cold reads served mid-kill**. The end-to-end cold-tier
