@@ -32,20 +32,38 @@ repeatability gate runs on the quiet rig** (`report --check-repeat
 
 ---
 
-## Chart 1 — throughput vs the field (TO FILL from Rig T)
+## Chart 1 — throughput vs the field (measured 2026-07-19, Rig T)
 
-GET-only, batch 32, best streams per store, warmed, median of 3, on 2×
-c6in.8xlarge in a cluster placement group, with the measured iperf3 ceiling
-drawn in. Bars: kvblockd (DRAM) · kvblockd (NVMe-resident) · Mooncake TCP ·
-Valkey 8 (go-redis) · Redis 7 (go-redis) · Redis 7 (redis-py) · local NVMe-fs
-floor.
+GET-only, batch 32, closed-loop, warmed, **median of 3** at each store's
+best stream count, on 2× c6in.8xlarge (50 GbE) in a cluster placement
+group. iperf3 ceiling measured first on the same pair: **49.8 Gbit/s =
+6.225 GB/s** — drawn on the chart. Raw JSONL: `bench/results/rig-t/`;
+render: `python bench/report/plot.py chart1 --in bench/results/rig-t/*.jsonl`.
+kvblockd ran the full 7-point stream curve; baselines ran streams {8,32,64}
+(single-threaded Redis costs ~4 min/cell — median-of-3 held on every
+published cell; disclosed). xxh3 verification ON for kvblockd.
 
-| Store | 0.44 MiB GB/s | %-ceiling | cores/GB·s⁻¹ | 2.5 MiB GB/s |
+| Store | 0.44 MiB GB/s | %-ceiling | 2.5 MiB GB/s | %-ceiling |
 |---|---|---|---|---|
-| kvblockd (DRAM) | _T_ | _T_ | _T_ | _T_ |
-| … | | | | |
+| **kvblockd (DRAM)** | **6.22** | **100%** | **6.23** | **100%** |
+| Valkey 8 (go-redis zero-copy) | 2.38 | 38% | 1.83 | 29% |
+| Redis 7 (go-redis zero-copy) | 2.26 | 36% | 1.81 | 29% |
+| Redis 7 (redis-py 8.0.1, the LMCache-shipped client) | 0.88 | 14% | 0.83 | 13% |
 
-**≥10× vs redis-py gate:** _verdict from run-chart1.sh_ (median of ≥3, measured, not massaged).
+NVMe-resident bars (same-host, i7i.8xlarge tier session, 2026-07-19):
+one-volume storm **5.22 GB/s**, two-volume **10.57 GB/s** (mixed
+DRAM+NVMe pool, disclosed; fio read ceiling 4.48 GB/s/device); post-kill-9
+warm storm 10.58 GB/s. Mooncake-TCP: not run this session (timebox);
+standing re-run offer per methodology rule 4.
+
+**≥10× vs redis-py gate: 7.1× at the best comparable cell (6.22 vs 0.88),
+5.6× median-of-everything — BELOW 10× on this link, reported honestly.**
+The gate is *ceiling-limited here, not software-limited*: kvblockd sits at
+**100% of the 50 GbE wire** and cannot score higher on it, while redis-py
+uses 14% of the same wire. On the measured 100 GbE pair (c7gn session
+below, 12.67 GB/s), the same client-bound redis-py bar implies ~14× — the
+multiple is a property of the link. A full-matrix 100 GbE re-run is the
+certification path for the ≥10× headline.
 
 Prior measured transport ceilings (Weeks 1–6, this rig family):
 

@@ -100,30 +100,30 @@ echo "[chart1] === baselines: Redis 7 / Valkey 8 (go-redis zero-copy, port 6379)
 # sweep × 3 runs would be ~3h/store. Three points keep median-of-3 on every
 # PUBLISHED baseline cell (the bar + a scaling sketch); disclosed in the
 # ledger + chart conditions. kvblockd keeps the full 7-point curve.
-for svc in redis valkey; do
+for svc in ${BASELINE_SVCS:-redis valkey}; do
   A "rm -f /tmp/$svc.jsonl"
   B "cd /tmp && docker compose -f baselines/docker-compose.yml --profile $svc up -d"
   B 'for i in $(seq 1 60); do redis-cli -p 6379 ping 2>/dev/null | grep -q PONG && break; sleep 0.5; done'
   for run in 1 2 3; do
     for sp in _s8_ _s32_ _s64_; do runcell "$svc" 6379 "" "$sp"; done
   done
-  B "docker compose -f baselines/docker-compose.yml --profile $svc down"
+  B "cd /tmp && docker compose -f baselines/docker-compose.yml --profile $svc down"
 done
 
 echo "[chart1] === redis-py bar (the LMCache-shipped path, closed GET throughput) ==="
-B "docker compose -f baselines/docker-compose.yml --profile redis up -d"
+B "cd /tmp && docker compose -f baselines/docker-compose.yml --profile redis up -d"
 B 'for i in $(seq 1 60); do redis-cli -p 6379 ping 2>/dev/null | grep -q PONG && break; sleep 0.5; done'
 # python3.11: redis-py 8.0.1 (the pin LMCache users actually resolve)
 # requires Python >=3.10 — AL2023's default python3 is 3.9.
 B 'rm -f /tmp/redis-py.jsonl'
 for blob in 462848 2621440; do
   for run in 1 2 3; do
-    B "python3.11 baselines/redis_py_driver/driver.py --getbench --addr 127.0.0.1:6379 \
+    B "cd /tmp && python3.11 baselines/redis_py_driver/driver.py --getbench --addr 127.0.0.1:6379 \
         --blob-bytes $blob --streams 32 --secs 30 --out /tmp/redis-py.jsonl"
   done
 done
 scp "${SSHO[@]}" "ec2-user@$B_PUB:/tmp/redis-py.jsonl" "$RESULTS/"
-B "docker compose -f baselines/docker-compose.yml --profile redis down"
+B "cd /tmp && docker compose -f baselines/docker-compose.yml --profile redis down"
 
 echo "[chart1] === the >=10x-vs-redis-py verdict (MEDIAN of runs, rule 7) ==="
 python3 - "$RESULTS" <<'PY'

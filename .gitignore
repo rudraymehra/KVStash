@@ -46,4 +46,3 @@ bench/rigs/*/.rig-state
 /kvbench
 /crash
 /getbench
-bench/results/
