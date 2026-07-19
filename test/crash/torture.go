@@ -59,9 +59,10 @@ func main() {
 	seed := flag.Int64("seed", 1, "content PRNG seed base")
 	stormMS := flag.Int("storm-ms", 0, "fixed storm duration before the kill (0 = random 200–3000ms; the demo uses a long fixed storm)")
 	s3 := flag.Bool("s3", false, "enable the S3 tier against a parent-hosted fake (kill-9 lands mid-upload; the object store outlives every child, like real S3)")
+	s3Endpoint := flag.String("s3-endpoint", "", "use an EXTERNAL S3-compatible endpoint (e.g. a MinIO service) instead of the in-process fake; implies -s3. Credentials come from the environment; the kvbtort bucket must already exist")
 	flag.Parse()
 
-	if err := run(*loops, *dir, *bin, *seed, *stormMS, *s3); err != nil {
+	if err := run(*loops, *dir, *bin, *seed, *stormMS, *s3 || *s3Endpoint != "", *s3Endpoint); err != nil {
 		fmt.Fprintln(os.Stderr, "crash-torture: FAIL:", err)
 		os.Exit(1)
 	}
@@ -74,14 +75,15 @@ type journal struct {
 	seq         int
 }
 
-func run(loops int, dir, bin string, seed int64, stormMS int, s3 bool) error {
+func run(loops int, dir, bin string, seed int64, stormMS int, s3 bool, s3Endpoint string) error {
 	start := time.Now()
 	// The fake S3 lives in the PARENT: every kill -9 lands on a child that
 	// may be mid-upload, while the object store keeps every byte that was
 	// acked — exactly real S3's failure geometry. Spilled state is
 	// memory-only in the daemon, so each restart re-spills idempotently.
-	s3Endpoint := ""
-	if s3 {
+	// An EXTERNAL endpoint (-s3-endpoint: MinIO in CI) replaces the fake —
+	// same geometry, a real third-party implementation.
+	if s3 && s3Endpoint == "" {
 		backend := s3mem.New()
 		srv := httptest.NewServer(gofakes3.New(backend).Server())
 		defer srv.Close()
@@ -537,9 +539,14 @@ func spawn(bin, cfg string) (*exec.Cmd, error) {
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	// The daemon reads S3 credentials ONLY from the ambient chain; the fake
-	// accepts anything. Harmless without -s3 (no s3_bucket in the config).
-	cmd.Env = append(os.Environ(),
-		"AWS_ACCESS_KEY_ID=tort", "AWS_SECRET_ACCESS_KEY=tort", "AWS_REGION=us-east-1")
+	// accepts anything, so defaults suffice — but a caller-provided key (the
+	// MinIO CI leg exports real ones; MinIO refuses secrets under 8 chars)
+	// must win. Harmless without -s3 (no s3_bucket in the config).
+	cmd.Env = os.Environ()
+	if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
+		cmd.Env = append(cmd.Env,
+			"AWS_ACCESS_KEY_ID=tort", "AWS_SECRET_ACCESS_KEY=tort-secret", "AWS_REGION=us-east-1")
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
