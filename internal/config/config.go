@@ -127,8 +127,8 @@ type Config struct {
 	S3NodeID           string `yaml:"s3_node_id"`           // namespaces object keys; REQUIRED with s3_bucket
 	S3EndpointOverride string `yaml:"s3_endpoint_override"` // MinIO-compatible targets
 	S3PathStyle        bool   `yaml:"s3_path_style"`
-	S3SpillQueue       int    `yaml:"s3_spill_queue"`     // bounded write-back depth (0 = 8)
-	S3ReadTimeoutMS    uint32 `yaml:"s3_read_timeout_ms"` // cold ranged-GET deadline (0 = 2000)
+	S3SpillQueue       int    `yaml:"s3_spill_queue"`     // bounded write-back depth (default 8; explicit 0 also means 8 — a zero-depth queue is not a configuration)
+	S3ReadTimeoutMS    uint32 `yaml:"s3_read_timeout_ms"` // cold ranged-GET deadline (default 2000; explicit 0 also means 2000 — an unbounded cold read is not a configuration)
 
 	// NvmeCkptEverySegments writes an index checkpoint every N seals
 	// (0 = never; recovery falls back to footer scans).
@@ -179,6 +179,11 @@ func Default() Config {
 		NvmePromoteWindowMS:    60000,
 		NvmeSyncEveryBytes:     8 << 20,
 		NvmeCkptEverySegments:  8,
+
+		// S3 tier defaults (inert until s3_bucket is set). Visible HERE, not
+		// in a downstream clamp — the AdmitMinHits lesson.
+		S3SpillQueue:    8,
+		S3ReadTimeoutMS: 2000,
 	}
 }
 

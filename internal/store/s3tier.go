@@ -114,18 +114,25 @@ func (t *Tiered) s3ReadDeadline() time.Duration {
 
 // s3FlipRetired converts a retired-but-spilled segment's entries to
 // s3-resident: keep the index entry (Loc unchanged — it addresses the
-// OBJECT now), move the tenant charge NVMe→S3. Returns entries flipped.
+// OBJECT now), move the tenant charge NVMe→S3. Each flip runs under the
+// entry's shard lock so it linearizes against deleteNvme: a racing DELETE
+// either removes the entry first (no transfer — the refund stayed NVMe)
+// or observes S3Only and refunds the S3 side. Returns entries flipped.
 func (t *Tiered) s3FlipRetired(vol *nvme.Volume, id uint32) int {
 	flipped := 0
 	vol.SegmentEntryKeys(id, func(ns uint32, key [32]byte, _, length uint32) {
-		ref := t.idx.get(dram.Key{NS: ns, Hash: key})
-		if ref == nil || ref.Loc.SegmentID != id || !ref.S3.Load() {
-			return
-		}
-		if t.p.Quotas != nil {
-			t.p.Quotas.Transfer(ns, tenant.TierNVMe, tenant.TierS3, int64(length))
-		}
-		flipped++
+		t.idx.withShardLock(dram.Key{NS: ns, Hash: key}, func(ref *nvmeRef) {
+			if ref == nil || ref.Loc.SegmentID != id || !ref.S3.Load() || ref.S3Only.Load() {
+				return
+			}
+			if t.p.Quotas != nil {
+				t.p.Quotas.Transfer(ns, tenant.TierNVMe, tenant.TierS3, int64(length))
+			}
+			ref.S3Only.Store(true)
+			t.s3Blocks.Add(1)
+			t.s3Bytes.Add(int64(length))
+			flipped++
+		})
 	})
 	return flipped
 }

@@ -104,6 +104,8 @@ type Tiered struct {
 	promotions    atomic.Uint64
 	s3Hits        atomic.Uint64 // cold ranged GETs served (verified)
 	s3ReadErrs    atomic.Uint64 // cold read failures (deadline, transport)
+	s3Blocks      atomic.Int64  // s3-resident (retire-flipped) blocks — Int64: removals decrement
+	s3Bytes       atomic.Int64
 	reclaims      atomic.Uint64
 	reclaimSkips  atomic.Uint64
 	readBusy      atomic.Uint64
@@ -202,10 +204,22 @@ func (t *Tiered) volumeFor(key [32]byte) *nvme.Volume {
 // ---------------------------------------------------------------------------
 // The server Store surface.
 
-// refundNvmeQuota returns a removed nvme entry's bytes to its tenant.
+// refundNvmeQuota returns a removed nvme-index entry's bytes to its tenant —
+// on whichever tier holds the charge: NVMe normally, S3 after a retire-flip
+// moved it (refunding NVMe there would leak the S3 charge forever and the
+// underflow heal would hide the NVMe-side double-subtract).
 func (t *Tiered) refundNvmeQuota(ns uint32, ref *nvmeRef) {
-	if t.p.Quotas != nil && ref != nil && ref.Len > 0 {
-		t.p.Quotas.Refund(ns, tenant.TierNVMe, int64(ref.Len))
+	if ref == nil || ref.Len == 0 {
+		return
+	}
+	tier := tenant.TierNVMe
+	if ref.S3Only.Load() {
+		tier = tenant.TierS3
+		t.s3Blocks.Add(-1)
+		t.s3Bytes.Add(-int64(ref.Len))
+	}
+	if t.p.Quotas != nil {
+		t.p.Quotas.Refund(ns, tier, int64(ref.Len))
 	}
 }
 
@@ -536,13 +550,22 @@ func (t *Tiered) CanStore(n uint32) bool {
 // ---------------------------------------------------------------------------
 
 // Stats is the dram document (top level — existing assertions and the
-// scrape collector keep working) plus an "nvme" sub-document.
+// scrape collector keep working) plus an "nvme" sub-document, and — when the
+// cold tier is wired — an "s3" sub-document.
 func (t *Tiered) Stats() []byte {
 	var doc map[string]any
 	if err := json.Unmarshal(t.d.Stats(), &doc); err != nil {
 		doc = map[string]any{"schema": 1, "store": "dram", "error": "dram stats decode failed"}
 	}
 	blocks, bytes := t.idx.stats()
+	// The index holds BOTH nvme-resident and retire-flipped (s3-only)
+	// entries; report each tier's own residency so the sub-documents sum to
+	// the index, matching the per-tenant quota ledger's tier split.
+	s3Blocks, s3Bytes := t.s3Blocks.Load(), t.s3Bytes.Load()
+	if s3Blocks > 0 {
+		blocks -= int(s3Blocks)
+		bytes -= s3Bytes
+	}
 	volStats := make(map[string]int64, 8)
 	for _, v := range t.vols {
 		v.StatsInto(volStats)
@@ -568,6 +591,24 @@ func (t *Tiered) Stats() []byte {
 		nv[k] = v
 	}
 	doc["nvme"] = nv
+	if t.p.Spill != nil {
+		spilled, drops, putErrs := t.p.Spill.Stats()
+		var rangedGets, restores uint64
+		if t.p.Restore != nil {
+			rangedGets, restores = t.p.Restore.Stats()
+		}
+		doc["s3"] = map[string]any{
+			"blocks":                 s3Blocks,
+			"bytes":                  s3Bytes,
+			"spilled_segments_total": spilled,
+			"spill_drops_total":      drops,
+			"put_errors_total":       putErrs,
+			"ranged_gets_total":      rangedGets,
+			"restores_total":         restores,
+			"hits_total":             t.s3Hits.Load(),
+			"read_errors_total":      t.s3ReadErrs.Load(),
+		}
+	}
 	b, err := json.Marshal(doc)
 	if err != nil {
 		return t.d.Stats()

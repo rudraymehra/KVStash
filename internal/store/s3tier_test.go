@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
@@ -150,6 +151,7 @@ func TestS3SpillRetireFlipColdRead(t *testing.T) {
 	// Every block must still answer byte-identical from SOME tier — and at
 	// least one from "s3".
 	s3Served := 0
+	firstS3 := -1
 	for i := 0; i < total; i++ {
 		data, sum, rel, tier, st := fx.t.GetRefTier(1, s3key(i))
 		if st == protocol.StatusNotFound {
@@ -163,6 +165,9 @@ func TestS3SpillRetireFlipColdRead(t *testing.T) {
 		}
 		if tier == "s3" {
 			s3Served++
+			if firstS3 < 0 {
+				firstS3 = i
+			}
 		}
 		rel()
 	}
@@ -176,4 +181,45 @@ func TestS3SpillRetireFlipColdRead(t *testing.T) {
 	_ = n // presence is index-truth; the assertion is that it CANNOT block on S3 —
 	// enforced structurally (ExistsPrefix has no backend path) and pinned here
 	// by the fixture: a nil-Restore fixture would still answer EXISTS.
+
+	// Stats: the "s3" sub-document is live and its residency matches the
+	// quota ledger — the tier split the scrape collector consumes.
+	var doc struct {
+		S3 *struct {
+			Blocks  int64  `json:"blocks"`
+			Bytes   int64  `json:"bytes"`
+			Spilled uint64 `json:"spilled_segments_total"`
+			Hits    uint64 `json:"hits_total"`
+		} `json:"s3"`
+	}
+	if err := json.Unmarshal(fx.t.Stats(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.S3 == nil || doc.S3.Blocks == 0 || doc.S3.Spilled == 0 || doc.S3.Hits == 0 {
+		t.Fatalf("s3 stats sub-doc missing or zero: %+v", doc.S3)
+	}
+	if doc.S3.Bytes != fx.q.Usage(1, tenant.TierS3) {
+		t.Fatalf("s3 stats bytes %d != quota ledger %d", doc.S3.Bytes, fx.q.Usage(1, tenant.TierS3))
+	}
+
+	// DELETE of an s3-resident block refunds the S3 side of the ledger —
+	// refunding NVMe here would leak the S3 charge forever (and the stats
+	// residency with it). force=true: the cold read just auto-leased it.
+	preS3 := fx.q.Usage(1, tenant.TierS3)
+	preNvme := fx.q.Usage(1, tenant.TierNVMe)
+	if st := fx.t.Delete(1, s3key(firstS3), true); st != protocol.StatusOK {
+		t.Fatalf("delete s3-resident block %d: %s", firstS3, st)
+	}
+	if got := fx.q.Usage(1, tenant.TierS3); got != preS3-blk {
+		t.Fatalf("s3 usage after delete: %d, want %d", got, preS3-blk)
+	}
+	if got := fx.q.Usage(1, tenant.TierNVMe); got != preNvme {
+		t.Fatalf("nvme usage changed by an s3-resident delete: %d → %d", preNvme, got)
+	}
+	if err := json.Unmarshal(fx.t.Stats(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.S3.Bytes != preS3-blk {
+		t.Fatalf("s3 stats bytes after delete: %d, want %d", doc.S3.Bytes, preS3-blk)
+	}
 }

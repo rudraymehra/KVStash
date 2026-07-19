@@ -24,6 +24,12 @@ type nvmeRef struct {
 	// the cold tier (spill-ack). Loc addresses both: the local file while
 	// it exists, the S3 object after reclaim retires the local copy.
 	S3 atomic.Bool
+	// S3Only marks the retire-flip: the local segment is gone and the
+	// tenant charge moved NVMe→S3 — a removal must refund the S3 side.
+	// Set only inside s3FlipRetired's shard-locked walk, so it linearizes
+	// against deleteIf (a racing DELETE either sees the flip or removes
+	// the entry before the flip can charge it).
+	S3Only atomic.Bool
 
 	LeaseUntil atomic.Int64
 	TTLUntil   atomic.Int64

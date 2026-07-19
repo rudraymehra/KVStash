@@ -203,6 +203,25 @@ var (
 		"Blocks recovered at the last startup (checkpoint + footer + tail scan).", nil, nil)
 	descNvmeRecoverySecs = prometheus.NewDesc("kvb_nvme_recovery_seconds",
 		"Wall time of the last startup recovery across volumes.", nil, nil)
+
+	// S3 cold-tier scrape-time metrics, fed from the "s3" sub-document —
+	// present only when the spill backend is configured (s3_bucket set).
+	// Residency (blocks/bytes) rides the existing kvb_blocks / kvb_store_bytes
+	// families with tier="s3".
+	descS3Spilled = prometheus.NewDesc("kvb_s3_spilled_segments_total",
+		"Sealed NVMe segments landed on S3 as whole objects (spill-acks).", nil, nil)
+	descS3SpillDrops = prometheus.NewDesc("kvb_s3_spill_drops_total",
+		"Spill enqueues dropped on queue overflow (the segment stays local; retried next pass).", nil, nil)
+	descS3PutErrors = prometheus.NewDesc("kvb_s3_put_errors_total",
+		"Failed segment uploads (the segment stays local-only).", nil, nil)
+	descS3RangedGets = prometheus.NewDesc("kvb_s3_ranged_gets_total",
+		"Cold per-block ranged GetObject reads issued by the restorer.", nil, nil)
+	descS3Restores = prometheus.NewDesc("kvb_s3_restores_total",
+		"Whole-segment downloads completed (lazy restore).", nil, nil)
+	descS3Hits = prometheus.NewDesc("kvb_s3_hits_total",
+		"Cold reads served after verification (a byte never escapes unverified).", nil, nil)
+	descS3ReadErrors = prometheus.NewDesc("kvb_s3_read_errors_total",
+		"Cold reads that failed (deadline or transport) and answered NOT_FOUND.", nil, nil)
 )
 
 // storeCollector decodes the store's Stats() JSON at scrape time. A document
@@ -234,6 +253,13 @@ func (c *storeCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descNvmeChecksumErrs
 	ch <- descNvmeRecovered
 	ch <- descNvmeRecoverySecs
+	ch <- descS3Spilled
+	ch <- descS3SpillDrops
+	ch <- descS3PutErrors
+	ch <- descS3RangedGets
+	ch <- descS3Restores
+	ch <- descS3Hits
+	ch <- descS3ReadErrors
 }
 
 func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
@@ -268,6 +294,18 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 			RecoveredBlks float64 `json:"recovered_blocks"`
 			RecoverySecs  float64 `json:"recovery_seconds"`
 		} `json:"nvme"`
+		// Present only when the cold tier is configured.
+		S3 *struct {
+			Blocks     float64 `json:"blocks"`
+			Bytes      float64 `json:"bytes"`
+			Spilled    float64 `json:"spilled_segments_total"`
+			SpillDrops float64 `json:"spill_drops_total"`
+			PutErrors  float64 `json:"put_errors_total"`
+			RangedGets float64 `json:"ranged_gets_total"`
+			Restores   float64 `json:"restores_total"`
+			Hits       float64 `json:"hits_total"`
+			ReadErrors float64 `json:"read_errors_total"`
+		} `json:"s3"`
 	}
 	if err := json.Unmarshal(c.stats(), &doc); err != nil {
 		return
@@ -308,6 +346,17 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(descNvmeChecksumErrs, prometheus.CounterValue, nv.ChecksumErrs)
 		ch <- prometheus.MustNewConstMetric(descNvmeRecovered, prometheus.GaugeValue, nv.RecoveredBlks)
 		ch <- prometheus.MustNewConstMetric(descNvmeRecoverySecs, prometheus.GaugeValue, nv.RecoverySecs)
+	}
+	if s3 := doc.S3; s3 != nil {
+		ch <- prometheus.MustNewConstMetric(descBlocks, prometheus.GaugeValue, s3.Blocks, "s3")
+		ch <- prometheus.MustNewConstMetric(descStoreBytes, prometheus.GaugeValue, s3.Bytes, "s3")
+		ch <- prometheus.MustNewConstMetric(descS3Spilled, prometheus.CounterValue, s3.Spilled)
+		ch <- prometheus.MustNewConstMetric(descS3SpillDrops, prometheus.CounterValue, s3.SpillDrops)
+		ch <- prometheus.MustNewConstMetric(descS3PutErrors, prometheus.CounterValue, s3.PutErrors)
+		ch <- prometheus.MustNewConstMetric(descS3RangedGets, prometheus.CounterValue, s3.RangedGets)
+		ch <- prometheus.MustNewConstMetric(descS3Restores, prometheus.CounterValue, s3.Restores)
+		ch <- prometheus.MustNewConstMetric(descS3Hits, prometheus.CounterValue, s3.Hits)
+		ch <- prometheus.MustNewConstMetric(descS3ReadErrors, prometheus.CounterValue, s3.ReadErrors)
 	}
 }
 

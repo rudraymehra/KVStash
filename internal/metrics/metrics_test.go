@@ -46,7 +46,7 @@ func TestEndpointAndReadiness(t *testing.T) {
 	}
 
 	// /metrics: every kvb_* family present, values threaded through.
-	body := httpBody(t, addr, "/metrics")
+	body := httpBody(t, addr)
 	for _, want := range []string{
 		`kvb_hits_total{ns="7",tier="dram"} 5`,
 		`kvb_hits_total{ns="7",tier="nvme"} 2`,
@@ -104,7 +104,7 @@ func TestNvmeSubdocScrape(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { cancel(); wait() }()
-	body := httpBody(t, addr, "/metrics")
+	body := httpBody(t, addr)
 	for _, want := range []string{
 		`kvb_blocks{tier="nvme"} 40`,
 		`kvb_store_bytes{tier="nvme"} 4.194304e+07`,
@@ -123,6 +123,57 @@ func TestNvmeSubdocScrape(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("tiered scrape missing %q", want)
+		}
+	}
+
+	// No cold tier configured → no "s3" sub-document → no kvb_s3_* families
+	// and no tier="s3" splits (the same silence contract as DRAM-only/nvme).
+	if strings.Contains(body, "kvb_s3_") || strings.Contains(body, `tier="s3"`) {
+		t.Error("two-tier scrape leaked s3 families")
+	}
+}
+
+// TestS3SubdocScrape: a cold-tier store's "s3" sub-document surfaces the full
+// kvb_s3_* family plus the tier="s3" residency splits. Every tag is asserted
+// by value — a JSON-tag typo scrapes as a silent zero forever (the nvme
+// sub-doc lesson), so nothing here may be zero.
+func TestS3SubdocScrape(t *testing.T) {
+	threeTier := func() []byte {
+		return []byte(`{"schema":1,"store":"dram","blocks":3,"bytes":3145728,` +
+			`"arena_bytes":67108864,"arena_free_bytes":63963136,` +
+			`"largest_free_region_bytes":63963136,"hugepages":false,` +
+			`"pinned_bytes":{},"evictions_total":0,"live_allocs":3,"max_allocs":131072,` +
+			`"nvme":{"blocks":40,"bytes":41943040,"segments":5,"used_bytes":1342177280,` +
+			`"max_bytes":10737418240,"demotions_total":40,"demote_drops_total":2,` +
+			`"admit_refusals_total":6,` +
+			`"dedup_skips_total":1,"promotions_total":3,"reclaims_total":1,` +
+			`"reclaim_skips_total":0,"read_busy_total":7,"checksum_errors_total":0,` +
+			`"recovered_blocks":40,"recovery_seconds":0.42},` +
+			`"s3":{"blocks":12,"bytes":12582912,"spilled_segments_total":4,` +
+			`"spill_drops_total":2,"put_errors_total":1,"ranged_gets_total":9,` +
+			`"restores_total":3,"hits_total":8,"read_errors_total":5}}`)
+	}
+	set := New(threeTier)
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, wait, err := set.Serve(ctx, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); wait() }()
+	body := httpBody(t, addr)
+	for _, want := range []string{
+		`kvb_blocks{tier="s3"} 12`,
+		`kvb_store_bytes{tier="s3"} 1.2582912e+07`,
+		`kvb_s3_spilled_segments_total 4`,
+		`kvb_s3_spill_drops_total 2`,
+		`kvb_s3_put_errors_total 1`,
+		`kvb_s3_ranged_gets_total 9`,
+		`kvb_s3_restores_total 3`,
+		`kvb_s3_hits_total 8`,
+		`kvb_s3_read_errors_total 5`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("three-tier scrape missing %q", want)
 		}
 	}
 }
@@ -177,9 +228,9 @@ func httpCode(t *testing.T, addr, path string) int {
 	return resp.StatusCode
 }
 
-func httpBody(t *testing.T, addr, path string) string {
+func httpBody(t *testing.T, addr string) string { // every reader scrapes /metrics
 	t.Helper()
-	resp := httpGet(t, addr, path)
+	resp := httpGet(t, addr, "/metrics")
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -210,7 +261,7 @@ func TestTenantSeriesCardinality(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { cancel(); wait() }()
-	body := httpBody(t, addr, "/metrics")
+	body := httpBody(t, addr)
 
 	for _, want := range []string{
 		`kvb_tenant_bytes{namespace="team-a",tier="dram"} 512`,

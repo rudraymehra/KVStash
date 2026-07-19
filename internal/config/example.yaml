@@ -4,7 +4,7 @@
 # integers; the arithmetic lives in the comments.
 
 listen_addr: ":9440"          # data plane (KVB1 frames)
-admin_addr: "127.0.0.1:9441"  # accepted, not yet served by this build
+admin_addr: "127.0.0.1:9441"  # ops plane (namespace add / quota set); loopback ONLY — a non-loopback address is refused at startup
 metrics_addr: "127.0.0.1:9442" # ops endpoint: /metrics, /healthz, /debug/pprof ("" = disabled)
 
 max_conns: 1024               # global accept cap (cheap DoS floor)
@@ -52,3 +52,17 @@ nvme_admit_min_hits: 1        # blocks with fewer lifetime GETs are DELETED at t
 nvme_promote_window_ms: 60000 # 2nd NVMe hit within 60s promotes back to DRAM; 0 = never promote
 nvme_sync_every_bytes: 8388608 # 8 MiB group-commit fdatasync ledger
 nvme_ckpt_every_segments: 8   # index checkpoint every 8 seals (0 = never; footer scans cover recovery)
+
+# S3 tier (cold tier; inert while s3_bucket is empty). One sealed NVMe
+# segment = one S3 object — spill is an async COPY (reads stay local); only
+# when reclaim retires a spilled segment do its blocks become s3-resident,
+# served by single ranged GETs, checksum-verified before a byte escapes.
+# Requires nvme_paths. Credentials come ONLY from the ambient AWS chain
+# (env / shared config / IMDS role) — never from this file.
+s3_bucket: ""                 # bucket name; empty = no cold tier (default)
+s3_region: ""                 # bucket region; empty = the SDK's ambient region
+s3_node_id: ""                # REQUIRED with s3_bucket — namespaces this node's object keys (kvblockd/<node_id>/segments/...); unique per daemon or nodes overwrite each other
+s3_endpoint_override: ""      # MinIO-compatible targets: "http://minio:9000"
+s3_path_style: false          # true for MinIO/most non-AWS targets
+s3_spill_queue: 8             # bounded async write-back depth; overflow drops (segment stays local, retried; watch kvb_s3_spill_drops_total)
+s3_read_timeout_ms: 2000      # cold ranged-GET deadline; a miss answers NOT_FOUND, never a hang
