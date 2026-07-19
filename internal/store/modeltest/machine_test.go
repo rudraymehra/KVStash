@@ -288,6 +288,10 @@ func TestStoreModel(t *testing.T) {
 		m := newModel(startNanos, pinnedCap)
 		var held []heldRef
 		junkSeq := 0
+		// ONE junk pattern, shared by every junk key in the model
+		// (insertShared) — per-key copies were the harness's memory ceiling.
+		junkData := bytes.Repeat([]byte{0xEE}, junkSize)
+		junkSum := xxh3.Hash(junkData)
 		defer func() {
 			for _, h := range held {
 				h.release()
@@ -689,11 +693,9 @@ func TestStoreModel(t *testing.T) {
 				for i := 0; i < 40; i++ {
 					h := junkHash(junkSeq)
 					junkSeq++
-					data := bytes.Repeat([]byte{0xEE}, junkSize)
-					sum := xxh3.Hash(data)
-					st := s.Put(9, h, data, sum)
+					st := s.Put(9, h, junkData, junkSum)
 					if st == protocol.StatusOK {
-						m.insert(eviction.Key{NS: 9, Hash: h}, data, sum)
+						m.insertShared(eviction.Key{NS: 9, Hash: h}, junkData, junkSum)
 						continue
 					}
 					if st != protocol.StatusErrQuotaBytes {

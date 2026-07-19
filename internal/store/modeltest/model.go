@@ -203,11 +203,20 @@ func (m *model) reconcileMiss(k eviction.Key) bool {
 func (m *model) insert(k eviction.Key, data []byte, sum uint64) {
 	cp := make([]byte, len(data))
 	copy(cp, data)
-	m.blocks[k] = &mBlock{data: cp, xxh3: sum}
+	m.insertShared(k, cp, sum)
+}
+
+// insertShared is insert WITHOUT the defensive copy: the caller promises
+// data is immutable for the model's lifetime. The machine's junk fill puts
+// ONE constant pattern under thousands of monotonically-fresh keys — per-key
+// copies of it (blocks + permanent resurrection history) were the harness's
+// dominant memory cost under -race, not anything the oracle needed.
+func (m *model) insertShared(k eviction.Key, data []byte, sum uint64) {
+	m.blocks[k] = &mBlock{data: data, xxh3: sum}
 	for _, h := range m.history[k] {
-		if h.xxh3 == sum && bytesEqual(h.data, cp) {
+		if h.xxh3 == sum && bytesEqual(h.data, data) {
 			return // content already on record
 		}
 	}
-	m.history[k] = append(m.history[k], histRec{data: cp, xxh3: sum})
+	m.history[k] = append(m.history[k], histRec{data: data, xxh3: sum})
 }
