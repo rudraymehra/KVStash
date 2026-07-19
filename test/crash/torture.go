@@ -25,16 +25,21 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/johannesboyne/gofakes3"
+	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	"github.com/zeebo/xxh3"
 
 	"github.com/kvstash/kvblockd/internal/protocol"
@@ -53,9 +58,10 @@ func main() {
 	bin := flag.String("bin", "", "kvblockd binary (default: go build ./cmd/kvblockd)")
 	seed := flag.Int64("seed", 1, "content PRNG seed base")
 	stormMS := flag.Int("storm-ms", 0, "fixed storm duration before the kill (0 = random 200–3000ms; the demo uses a long fixed storm)")
+	s3 := flag.Bool("s3", false, "enable the S3 tier against a parent-hosted fake (kill-9 lands mid-upload; the object store outlives every child, like real S3)")
 	flag.Parse()
 
-	if err := run(*loops, *dir, *bin, *seed, *stormMS); err != nil {
+	if err := run(*loops, *dir, *bin, *seed, *stormMS, *s3); err != nil {
 		fmt.Fprintln(os.Stderr, "crash-torture: FAIL:", err)
 		os.Exit(1)
 	}
@@ -68,8 +74,23 @@ type journal struct {
 	seq         int
 }
 
-func run(loops int, dir, bin string, seed int64, stormMS int) error {
+func run(loops int, dir, bin string, seed int64, stormMS int, s3 bool) error {
 	start := time.Now()
+	// The fake S3 lives in the PARENT: every kill -9 lands on a child that
+	// may be mid-upload, while the object store keeps every byte that was
+	// acked — exactly real S3's failure geometry. Spilled state is
+	// memory-only in the daemon, so each restart re-spills idempotently.
+	s3Endpoint := ""
+	if s3 {
+		backend := s3mem.New()
+		srv := httptest.NewServer(gofakes3.New(backend).Server())
+		defer srv.Close()
+		if err := backend.CreateBucket("kvbtort"); err != nil {
+			return err
+		}
+		s3Endpoint = srv.URL
+		fmt.Println("[torture] s3 tier ON — parent-hosted fake at", s3Endpoint)
+	}
 	if dir == "" {
 		d, err := os.MkdirTemp("", "kvbtort-*")
 		if err != nil {
@@ -94,7 +115,7 @@ func run(loops int, dir, bin string, seed int64, stormMS int) error {
 	if err != nil {
 		return err
 	}
-	cfgPath, err := writeConfigs(dir, dataPort, metricsPort)
+	cfgPath, err := writeConfigs(dir, dataPort, metricsPort, s3Endpoint)
 	if err != nil {
 		return err
 	}
@@ -140,6 +161,24 @@ func run(loops int, dir, bin string, seed int64, stormMS int) error {
 			wait = time.Duration(stormMS) * time.Millisecond
 		}
 		time.Sleep(wait)
+		if s3 {
+			// This life's s3 counters, an instant before the kill erases
+			// them — the only window where mid-storm flips are observable.
+			// The full-journal sweep first (run UNDER the live storm): any
+			// s3-resident block MUST serve a verified cold read over the
+			// wire, and the scrape right after proves it happened. On a
+			// sweep failure the storm and child still shut down — an early
+			// return must not leak 16 workers on a live context (the same
+			// lostcancel class CI caught on the SIGKILL path).
+			if err := verify(dataPort, j, seed); err != nil {
+				_ = child.Process.Signal(syscall.SIGKILL)
+				_ = child.Wait()
+				stopStorm()
+				wg.Wait()
+				return fmt.Errorf("loop %d pre-kill sweep: %w", loop, err)
+			}
+			logS3Metrics(metricsPort)
+		}
 		// Stop the storm on EVERY path — a failed SIGKILL must not return
 		// with 16 workers still hammering a dead port on a leaked context.
 		killErr := child.Process.Signal(syscall.SIGKILL)
@@ -169,9 +208,36 @@ func run(loops int, dir, bin string, seed int64, stormMS int) error {
 	if err := verify(dataPort, j, seed); err != nil {
 		return err
 	}
+	if s3 {
+		// Evidence, not a gate (whether reclaim flipped anything depends on
+		// the storm's draw): print the daemon's own s3 counters so a run
+		// where spill never fired is VISIBLE, never silently green.
+		logS3Metrics(metricsPort)
+	}
 	fmt.Printf("[torture] PASS: %d kill -9 cycles, %d acked keys journaled, 0 corrupt reads, 0 phantom keys, %.1fs total\n",
 		loops, len(j.acked), time.Since(start).Seconds())
 	return nil
+}
+
+// logS3Metrics scrapes the final child's kvb_s3_* families (and the s3 tier
+// residency splits) as the spill-mode run's activity record.
+func logS3Metrics(metricsPort int) {
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort)) //nolint:noctx,gosec // G107: local loopback scrape
+	if err != nil {
+		fmt.Println("[torture] s3 metrics scrape failed:", err)
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println("[torture] s3 metrics read failed:", err)
+		return
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if (strings.HasPrefix(line, "kvb_s3_") || strings.Contains(line, `tier="s3"`) || strings.HasPrefix(line, "kvb_nvme_reclaim") || strings.HasPrefix(line, "kvb_nvme_demot")) && !strings.HasPrefix(line, "#") {
+			fmt.Println("[torture]", line)
+		}
+	}
 }
 
 // storm runs one worker: committed PUTs journaled after ack, ~30% raw
@@ -213,8 +279,24 @@ func storm(ctx context.Context, dataPort int, j *journal, seed int64, loop, w in
 		j.acked[key] = xxh3.Hash(data) // strictly AFTER the ack
 		j.mu.Unlock()
 
-		if rng.Intn(4) == 0 { // concurrent GET pressure (also drives demotion hits)
+		if rng.Intn(2) == 0 { // concurrent GET pressure (also drives demotion hits)
 			k := key
+			if rng.Intn(2) == 0 {
+				// Half the pressure hits a random OLD journaled key — the
+				// population that has sunk to NVMe (and, with -s3, through a
+				// retire-flip to the cold tier: this is what makes cold reads
+				// happen DURING a storm, not just at verify).
+				j.mu.Lock()
+				n := rng.Intn(len(j.acked)) // acked is never empty here — we just journaled one
+				for old := range j.acked {
+					if n == 0 {
+						k = old
+						break
+					}
+					n--
+				}
+				j.mu.Unlock()
+			}
 			if _, err := cl.BatchGet(ctx, [][32]byte{k}, make([][]byte, 1)); err != nil {
 				return
 			}
@@ -454,6 +536,10 @@ func spawn(bin, cfg string) (*exec.Cmd, error) {
 	cmd := exec.Command(bin, "-config", cfg) //nolint:gosec // G204: our own freshly built binary
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
+	// The daemon reads S3 credentials ONLY from the ambient chain; the fake
+	// accepts anything. Harmless without -s3 (no s3_bucket in the config).
+	cmd.Env = append(os.Environ(),
+		"AWS_ACCESS_KEY_ID=tort", "AWS_SECRET_ACCESS_KEY=tort", "AWS_REGION=us-east-1")
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
@@ -498,7 +584,7 @@ func freePorts() (data, metrics int, err error) {
 // dir: a small arena and an aggressive demote watermark so the storm drives
 // real demotion, small segments so seals/checkpoints/rotations all happen
 // within one loop.
-func writeConfigs(dir string, dataPort, metricsPort int) (string, error) {
+func writeConfigs(dir string, dataPort, metricsPort int, s3Endpoint string) (string, error) {
 	nsPath := filepath.Join(dir, "ns.yaml")
 	if err := os.WriteFile(nsPath, []byte(
 		"namespaces:\n  - { name: "+nsName+", id: 7, token: "+nsToken+" }\n",
@@ -506,6 +592,13 @@ func writeConfigs(dir string, dataPort, metricsPort int) (string, error) {
 		return "", err
 	}
 	nvmeDir := filepath.Join(dir, "nvme")
+	nvmeBudget := int64(2147483648) // 2 GiB scratch budget
+	if s3Endpoint != "" {
+		// Tight enough that reclaim retires spilled segments DURING the run
+		// (the flip + cold-read + re-spill machinery under kill -9), roomy
+		// enough that the storm isn't all reclaim.
+		nvmeBudget = 100663296 // 96 MiB
+	}
 	cfg := fmt.Sprintf(`listen_addr: "127.0.0.1:%d"
 metrics_addr: "127.0.0.1:%d"
 namespaces_path: %q
@@ -513,14 +606,27 @@ max_blob_len: 4194304          # 4 MiB — the torture band tops at 2.5 MiB
 dram_arena_bytes: 67108864     # 64 MiB — small so the storm hits the demote watermark fast
 pinned_bytes_cap: 16777216
 nvme_paths: [%q]
-nvme_max_bytes: 2147483648     # 2 GiB scratch budget
+nvme_max_bytes: %d
 nvme_segment_bytes: 8388608    # 8 MiB segments — rotations/seals/ckpts every loop
 nvme_read_workers: 8
 nvme_demote_watermark_pct: 60  # demote early and often
 nvme_demote_batch_pct: 10
 nvme_sync_every_bytes: 1048576 # 1 MiB group commit — tight durability windows for the kill
 nvme_ckpt_every_segments: 2
-`, dataPort, metricsPort, nsPath, nvmeDir)
+`, dataPort, metricsPort, nsPath, nvmeDir, nvmeBudget)
+	if s3Endpoint != "" {
+		// admit_min_hits 0 = the pure-ingest posture: the storm is PUT-heavy,
+		// and at the default (1) the endurance gate deletes cold blocks at
+		// the demote watermark instead of writing them — demotions_total
+		// stays 0 and nothing ever reaches flash, reclaim, or the flip.
+		cfg += fmt.Sprintf(`nvme_admit_min_hits: 0
+s3_bucket: "kvbtort"
+s3_node_id: "tort"
+s3_endpoint_override: %q
+s3_path_style: true
+s3_read_timeout_ms: 2000
+`, s3Endpoint)
+	}
 	cfgPath := filepath.Join(dir, "kvblockd.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		return "", err
