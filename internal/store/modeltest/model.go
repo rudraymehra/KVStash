@@ -40,6 +40,29 @@ type mBlock struct {
 	// unknown until the first byte-carrying observation: the block must
 	// match ONE of these historical contents (see model.resolveBytes).
 	anyOf []histRec
+	// pinCharge is what the model believes the store's pinned-bytes ledger
+	// was debited for THIS block's hard pin. For a pinned-down block it is
+	// exact (len(data)); a hard pin on an anyOf ghost charges the block's
+	// TRUE size, which the model cannot know yet — pinChargeUnknown marks
+	// it, the I3 check bounds it by the candidate size range, and the next
+	// byte-carrying observation retro-tightens the ledger (resolveBytes).
+	pinCharge        int64
+	pinChargeUnknown bool
+}
+
+// candidateSizeRange bounds a ghost's possible true size across its
+// historical candidates (I3's slack for unknown pin charges).
+func candidateSizeRange(anyOf []histRec) (lo, hi int64) {
+	for i, h := range anyOf {
+		sz := int64(len(h.data))
+		if i == 0 || sz < lo {
+			lo = sz
+		}
+		if sz > hi {
+			hi = sz
+		}
+	}
+	return lo, hi
 }
 
 // model is the reference: plain maps, no tiers, no eviction of its own.
@@ -110,14 +133,21 @@ func (m *model) materializeGhost(k eviction.Key) *mBlock {
 
 // resolveBytes checks served bytes against the block: a pinned-down block
 // demands ITS content; an anyOf block accepts any historical content and
-// pins down to it. Returns false on an I1 violation.
-func (m *model) resolveBytes(b *mBlock, data []byte, sum uint64) bool {
+// pins down to it. ns is the block's namespace — pinning down a ghost that
+// is hard-pinned with an unknown charge retro-tightens the pinned-bytes
+// ledger to the now-known true size. Returns false on an I1 violation.
+func (m *model) resolveBytes(ns uint32, b *mBlock, data []byte, sum uint64) bool {
 	if b.anyOf == nil {
 		return sum == b.xxh3 && bytesEqual(data, b.data)
 	}
 	for _, h := range b.anyOf {
 		if sum == h.xxh3 && bytesEqual(data, h.data) {
 			b.data, b.xxh3, b.anyOf = h.data, h.xxh3, nil
+			if b.hard && b.pinChargeUnknown {
+				b.pinCharge = int64(len(b.data))
+				b.pinChargeUnknown = false
+				m.pinned[ns] += b.pinCharge
+			}
 			return true
 		}
 	}

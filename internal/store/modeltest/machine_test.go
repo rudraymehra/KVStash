@@ -199,6 +199,21 @@ func TestStoreModel(t *testing.T) {
 			}
 			return m.materializeGhost(k)
 		}
+		// unknownPinRange bounds the store-ledger charge the model can't see:
+		// hard pins on resurrected ghosts whose true size hasn't pinned down
+		// yet (candidate sizes bound it). Zero/zero when none exist — the
+		// common case, where every pinned-bytes check stays exact.
+		unknownPinRange := func(ns uint32) (lo, hi int64) {
+			for kk, b := range m.blocks {
+				if kk.NS != ns || !b.hard || !b.pinChargeUnknown {
+					continue
+				}
+				l, h := candidateSizeRange(b.anyOf)
+				lo += l
+				hi += h
+			}
+			return
+		}
 		// grantLease mirrors the store's §3.3 auto-lease on every OK read —
 		// MONOTONIC, like the store's extendLease: a 5s auto-grant never
 		// truncates a live longer lease (the divergence here was the deep
@@ -229,7 +244,7 @@ func TestStoreModel(t *testing.T) {
 						// A crash resurrected the deleted key with OUR sum:
 						// the resident content is (xxh3-)identical to this put.
 						b := m.materializeGhost(k)
-						if !m.resolveBytes(b, data, sum) {
+						if !m.resolveBytes(k.NS, b, data, sum) {
 							rt.Fatalf("put resurrected-dup: OK_EXISTS but %v matches no history", k)
 						}
 						b.maybeGone = false
@@ -277,7 +292,7 @@ func TestStoreModel(t *testing.T) {
 				// I1: byte-identical (to the block's content, or to ONE
 				// historical content for a resurrected ghost), right
 				// checksum, never cross-key/stale/invented.
-				if !m.resolveBytes(e, data, sum) {
+				if !m.resolveBytes(k.NS, e, data, sum) {
 					rt.Fatalf("I1: GET bytes/sum mismatch for %v (%d bytes served)", k, len(data))
 				}
 				e.maybeGone = false // byte-verified present
@@ -297,7 +312,7 @@ func TestStoreModel(t *testing.T) {
 				if e == nil {
 					e = ghostOrFatal(k, "GETREF")
 				}
-				if !m.resolveBytes(e, view, sum) {
+				if !m.resolveBytes(k.NS, e, view, sum) {
 					rt.Fatalf("I1: GETREF view mismatch for %v", k)
 				}
 				e.maybeGone = false
@@ -355,15 +370,29 @@ func TestStoreModel(t *testing.T) {
 				if tt != nil && sub == protocol.PinHard && st == protocol.StatusErrBusy {
 					return // NVMe-resident hard pin promotes first; a full arena refuses (retryable) — pin unapplied
 				}
+				// refundHard returns a hard pin's charge to the ledger. An
+				// unknown charge (ghost never pinned down) contributed
+				// nothing to the ledger — clearing the flag nets zero on
+				// both sides of the mirror, since the store refunds exactly
+				// what it charged.
+				refundHard := func() {
+					if !e.hard {
+						return
+					}
+					if e.pinChargeUnknown {
+						e.pinChargeUnknown = false
+					} else {
+						m.pinned[k.NS] -= e.pinCharge
+					}
+					e.pinCharge = 0
+				}
 				sz := int64(len(e.data))
 				switch sub {
 				case protocol.PinSoft:
 					if st != protocol.StatusOK {
 						rt.Fatalf("soft pin: %s", st)
 					}
-					if e.hard {
-						m.pinned[k.NS] -= sz // downgrade refunds
-					}
+					refundHard() // downgrade refunds
 					e.soft, e.hard = true, false
 				case protocol.PinHard:
 					switch {
@@ -371,24 +400,52 @@ func TestStoreModel(t *testing.T) {
 						if st != protocol.StatusOK {
 							rt.Fatalf("hard re-pin: %s", st)
 						}
-					case m.pinned[k.NS]+sz > m.pinnedCap:
-						if st != protocol.StatusErrPinQuota {
-							rt.Fatalf("over-cap hard pin: %s", st)
+					case e.anyOf != nil:
+						// Resurrected ghost: the store charged the block's
+						// TRUE size, which the model can't know yet — and
+						// so can't predict the pin-quota verdict either.
+						// Both outcomes are explainable; I3 bounds the
+						// window and resolveBytes retro-tightens it.
+						switch st {
+						case protocol.StatusOK:
+							e.hard, e.soft = true, false
+							e.pinChargeUnknown = true
+						case protocol.StatusErrPinQuota: // pin unapplied
+						default:
+							rt.Fatalf("hard pin on resurrected ghost: %s", st)
 						}
 					default:
-						if st != protocol.StatusOK {
-							rt.Fatalf("hard pin: %s", st)
+						lo, hi := unknownPinRange(k.NS)
+						switch {
+						case m.pinned[k.NS]+lo+sz > m.pinnedCap:
+							if st != protocol.StatusErrPinQuota {
+								rt.Fatalf("over-cap hard pin: %s", st)
+							}
+						case m.pinned[k.NS]+hi+sz > m.pinnedCap:
+							// Unknown ghost charges straddle the cap — the
+							// store's verdict depends on sizes the model
+							// can't see yet. Both outcomes are explainable.
+							if st == protocol.StatusOK {
+								m.pinned[k.NS] += sz
+								e.pinCharge = sz
+								e.hard, e.soft = true, false
+							} else if st != protocol.StatusErrPinQuota {
+								rt.Fatalf("cap-straddling hard pin: %s", st)
+							}
+						default:
+							if st != protocol.StatusOK {
+								rt.Fatalf("hard pin: %s", st)
+							}
+							m.pinned[k.NS] += sz
+							e.pinCharge = sz
+							e.hard, e.soft = true, false
 						}
-						m.pinned[k.NS] += sz
-						e.hard, e.soft = true, false
 					}
 				case protocol.Unpin:
 					if st != protocol.StatusOK {
 						rt.Fatalf("unpin: %s", st)
 					}
-					if e.hard {
-						m.pinned[k.NS] -= sz
-					}
+					refundHard()
 					e.soft, e.hard = false, false
 				}
 			},
@@ -528,6 +585,7 @@ func TestStoreModel(t *testing.T) {
 					b.leaseUntil = 0
 					b.ttlUntil = 0
 					b.soft, b.hard = false, false
+					b.pinCharge, b.pinChargeUnknown = 0, false
 				}
 				m.pinned = map[uint32]int64{}
 				// I6: the recovered index matches storage — every entry the
@@ -568,9 +626,13 @@ func TestStoreModel(t *testing.T) {
 					rt.Fatalf("I3: arena accounting: %+v", doc)
 				}
 				for _, ns := range []uint32{1, 2, 3, 9} {
-					want := m.pinned[ns] // zero when unpinned — the store must agree BOTH ways
-					if got := doc.PinnedBytes[fmt.Sprint(ns)]; got != want {
-						rt.Fatalf("I3: pinned_bytes ns%d = %d, model %d (a leaked or lost charge)", ns, got, want)
+					// Exact when no unknown ghost charges exist (the common
+					// case); bounded by candidate sizes when a hard pin
+					// landed on a not-yet-pinned-down resurrected block.
+					lo, hi := unknownPinRange(ns)
+					want, got := m.pinned[ns], doc.PinnedBytes[fmt.Sprint(ns)]
+					if got < want+lo || got > want+hi {
+						rt.Fatalf("I3: pinned_bytes ns%d = %d, model %d..%d (a leaked or lost charge)", ns, got, want+lo, want+hi)
 					}
 				}
 				// An extent-leak mutation (index entry removed, extent kept)
