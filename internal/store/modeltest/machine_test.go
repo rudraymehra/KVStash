@@ -727,15 +727,25 @@ func TestStoreModel(t *testing.T) {
 				mkSUT()           // reopen the SAME volume dir: real recovery runs
 				m.crashed()       // deleted-key ghosts become resurrectable from here on
 				// The model after a crash: DRAM contents vanished, protection
-				// state (leases/pins — memory-only) vanished, and any block
-				// may or may not have made it to a recoverable NVMe record.
-				// Byte-identical-or-NOT_FOUND (I1) is the whole contract.
-				for _, b := range m.blocks {
+				// state (leases/pins — memory-only) vanished, and recovery may
+				// resurface ANY committed-and-persisted content for a key —
+				// not just the latest. Force-delete + re-put under one key
+				// composes with the non-crash-durable NVMe DELETE: the
+				// pre-delete bytes legally come back while the re-put (DRAM-
+				// only at the kill) is legally lost. The deep gauntlet found
+				// this after 795 walks: the model pinned the key to its
+				// LATEST content and called the resurrected older version an
+				// I1 violation. So every surviving block reverts to the anyOf
+				// form the ghost path already uses; the next byte-carrying
+				// observation pins it down. I1 keeps its teeth — served bytes
+				// outside the key's committed history still fail.
+				for k, b := range m.blocks {
 					b.maybeGone = true
 					b.leaseUntil = 0
 					b.ttlUntil = 0
 					b.soft, b.hard = false, false
 					b.pinCharge, b.pinChargeUnknown = 0, false
+					b.data, b.xxh3, b.anyOf = nil, 0, m.history[k]
 				}
 				m.pinned = map[uint32]int64{}
 				// I6: the recovered index matches storage — every entry the
