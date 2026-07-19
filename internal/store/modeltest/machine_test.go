@@ -17,6 +17,7 @@ import (
 	"github.com/kvstash/kvblockd/internal/store"
 	"github.com/kvstash/kvblockd/internal/store/dram"
 	"github.com/kvstash/kvblockd/internal/store/nvme"
+	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
 const (
@@ -125,6 +126,21 @@ func TestStoreModel(t *testing.T) {
 		var s sutStore
 		var ds *dram.Store
 		var tt *store.Tiered
+		// Tenant quotas: ns 1 runs TIGHT (forces the refusal + refund paths
+		// constantly), ns 2 loose, ns 3/9 unlimited. The accountant is
+		// process state — mkSUT rebuilds it on every (re)start and recovery
+		// re-seeds the NVMe side, exactly like the daemon.
+		var quotas *tenant.Quotas
+		mkQuotas := func() *tenant.Quotas {
+			reg := tenant.NewRegistry("ns1", 1, "t1")
+			if err := reg.Add(&tenant.Namespace{ID: 2, Name: "ns2", TokenHash: [32]byte{2}}); err != nil {
+				rt.Fatal(err)
+			}
+			reg.SetQuota("ns1", tenant.TierDRAM, 128<<10) // tight: two 64K blocks, refuses the 256K draw
+			reg.SetQuota("ns1", tenant.TierNVMe, 256<<10)
+			reg.SetQuota("ns2", tenant.TierDRAM, 1<<20)
+			return tenant.NewQuotas(reg)
+		}
 		mkSUT := func() {
 			pol, perr := eviction.New(policyName, 8192)
 			if perr != nil {
@@ -134,11 +150,13 @@ func TestStoreModel(t *testing.T) {
 			if aerr != nil {
 				rt.Fatal(aerr)
 			}
+			quotas = mkQuotas()
 			ds = dram.New(arena, dram.Params{
 				LeaseDefaultMS: leaseDefaultMS,
 				LeaseMaxMS:     leaseMaxMS,
 				PinnedBytesCap: pinnedCap,
 				Now:            func() int64 { return cur },
+				Quotas:         quotas,
 			})
 			ds.AttachPolicy(pol) // evictor NOT started: pressure only via the explicit op
 			if kind == "dram" {
@@ -158,6 +176,7 @@ func TestStoreModel(t *testing.T) {
 					LeaseDefaultMS: leaseDefaultMS, LeaseMaxMS: leaseMaxMS,
 					PromoteWindow: time.Hour, // wide window; promotions happen via GETs (no background loops started)
 					Now:           func() int64 { return cur },
+					Quotas:        quotas,
 				})
 			s = tt
 		}
@@ -624,6 +643,23 @@ func TestStoreModel(t *testing.T) {
 				}
 				if doc.ArenaFreeBytes < 0 || doc.ArenaFreeBytes > doc.ArenaBytes {
 					rt.Fatalf("I3: arena accounting: %+v", doc)
+				}
+				// I3-quota: the DRAM ledger is STRICTLY bounded by the quota
+				// on this direct-Put path (no BEGIN reserve, so no slack) and
+				// never negative. NVMe may legally exceed its quota (recovery
+				// over-seed + never-failing transfers); the kvbdebug build
+				// separately panics on any underflow.
+				for _, nsq := range []uint32{1, 2} {
+					if lim := quotas.Limit(nsq, tenant.TierDRAM); lim > 0 {
+						if u := quotas.Usage(nsq, tenant.TierDRAM); u > lim {
+							rt.Fatalf("I3q: ns%d dram usage %d exceeds quota %d", nsq, u, lim)
+						}
+					}
+					for _, tr := range []tenant.Tier{tenant.TierDRAM, tenant.TierNVMe} {
+						if u := quotas.Usage(nsq, tr); u < 0 {
+							rt.Fatalf("I3q: ns%d %s usage negative: %d", nsq, tr, u)
+						}
+					}
 				}
 				for _, ns := range []uint32{1, 2, 3, 9} {
 					// Exact when no unknown ghost charges exist (the common

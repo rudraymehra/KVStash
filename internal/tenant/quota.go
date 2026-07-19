@@ -118,6 +118,16 @@ func (q *Quotas) Refund(ns uint32, tier Tier, n int64) {
 	}
 }
 
+// Seed charges n bytes UNCHECKED (recovery re-seeding a restarted process's
+// ledger — refusing recovery over quota would lose data; the evictor's
+// over-quota-first pass corrects an over-seeded tenant on its first cycle).
+func (q *Quotas) Seed(ns uint32, tier Tier, n int64) {
+	if n <= 0 || tier < 0 || tier >= tierCount {
+		return
+	}
+	q.domain(ns).used[tier].Add(n)
+}
+
 // Transfer moves n bytes from one tier to another (demote DRAM→NVMe, spill
 // NVMe→S3, promote back). It NEVER fails — see the type comment.
 func (q *Quotas) Transfer(ns uint32, from, to Tier, n int64) {

@@ -133,6 +133,11 @@ func NewTiered(d *dram.Store, pol eviction.Policy, vols []*nvme.Volume, reports 
 		for _, e := range ents {
 			ref := &nvmeRef{Loc: e.Loc, Len: e.Loc.Len, XXH3: e.XXH3}
 			t.idx.put(dram.Key{NS: e.NS, Hash: e.Key}, ref)
+			// Re-seed the tenant ledger: a restart must not mint free NVMe
+			// bytes — every recovered block is a live charge.
+			if t.p.Quotas != nil {
+				t.p.Quotas.Seed(e.NS, tenant.TierNVMe, int64(e.Loc.Len))
+			}
 		}
 	}
 	return t
