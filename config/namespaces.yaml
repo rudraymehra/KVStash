@@ -11,5 +11,13 @@
 namespaces:
   # The quickstart tenant — CHANGE OR REMOVE before exposing the daemon.
   - { name: demo, id: 1, token: "demo-token" }
-  # - { name: team-a, id: 2, token: "a-real-secret" }
-  # - { name: team-b, id: 3, token: "another-real-secret" }
+  # Production entries: prefer token_sha256 (the file then carries no
+  # credential — `echo -n SECRET | shasum -a 256`); per-tier byte quotas
+  # (0/absent = unlimited) and a pinned-bytes quota:
+  # - name: team-a
+  #   id: 2
+  #   token_sha256: "64-hex-chars"
+  #   quota_dram:  8589934592     # 8 GiB
+  #   quota_nvme:  68719476736    # 64 GiB
+  #   quota_s3:    549755813888   # 512 GiB
+  #   pin_quota:   1073741824     # 1 GiB

@@ -84,6 +84,8 @@ Usage:
   kvbctl put    [flags] KEY <FILE|->    store one block (stdin with -)
   kvbctl delete [flags] [-force] KEY... remove blocks
   kvbctl stats  [flags]                 server stats JSON
+  kvbctl namespace add|list [flags]     tenant admin (loopback admin socket)
+  kvbctl quota set [flags]              per-tier tenant quota (admin socket)
   kvbctl version                        print version
 
 Shared flags: -addr -token -ns -timeout -hex   (see 'kvbctl CMD -h')
@@ -107,6 +109,10 @@ func main() {
 		code = cmdDelete(os.Args[2:])
 	case "stats":
 		code = cmdStats(os.Args[2:])
+	case "namespace":
+		code = cmdNamespace(os.Args[2:])
+	case "quota":
+		code = cmdQuota(os.Args[2:])
 	case "-version", "--version", "version":
 		fmt.Printf("kvbctl %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
 	case "-h", "--help", "help":

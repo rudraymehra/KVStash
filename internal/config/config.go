@@ -28,8 +28,9 @@ type Config struct {
 	// ListenAddr is the data-plane TCP listener ("host:port").
 	ListenAddr string `yaml:"listen_addr"`
 	// MetricsAddr serves the ops endpoint (/metrics, /healthz, /debug/pprof);
-	// empty disables it. AdminAddr is accepted for schema stability but not
-	// yet served (the admin surface is a later week).
+	// empty disables it. AdminAddr serves the namespace/quota admin surface —
+	// LOOPBACK ONLY (enforced at bind: shell trust, same boundary as editing
+	// the namespaces file); empty disables it.
 	AdminAddr   string `yaml:"admin_addr"`
 	MetricsAddr string `yaml:"metrics_addr"`
 

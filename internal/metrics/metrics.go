@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/kvstash/kvblockd/internal/protocol"
+	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
 // Set owns the registry and every kvb_* instrument. Its recording methods
@@ -32,6 +33,9 @@ import (
 type Set struct {
 	reg   *prometheus.Registry
 	ready atomic.Bool
+
+	// Per-tenant quota view (SetTenants); nil = single-tenant, no series.
+	tenants *tenantView
 
 	opSeconds *prometheus.HistogramVec
 	hits      *prometheus.CounterVec
@@ -355,4 +359,48 @@ func (s *Set) Serve(ctx context.Context, addr string) (bound string, wait func()
 		_ = srv.Shutdown(shCtx)
 	}()
 	return ln.Addr().String(), func() { <-done }, nil
+}
+
+// ---------------------------------------------------------------------------
+// Per-tenant quota series (Week-9 tenancy).
+
+var (
+	descTenantBytes = prometheus.NewDesc("kvb_tenant_bytes",
+		"Resident bytes charged to a tenant's tier quota.", []string{"namespace", "tier"}, nil)
+	descTenantQuota = prometheus.NewDesc("kvb_tenant_quota_bytes",
+		"Configured tier quota for a tenant (0 = unlimited).", []string{"namespace", "tier"}, nil)
+)
+
+// tenantView reads the registry + accountant at scrape time. Cardinality is
+// #namespaces × 3 tiers — namespaces are operator-registered (tens, never
+// per-key), and the smoke test pins it.
+type tenantView struct {
+	reg *tenant.Registry
+	q   *tenant.Quotas
+}
+
+// SetTenants attaches the per-tenant quota series. Call once before Serve.
+func (s *Set) SetTenants(reg *tenant.Registry, q *tenant.Quotas) {
+	if reg == nil || q == nil {
+		return
+	}
+	s.tenants = &tenantView{reg: reg, q: q}
+	s.reg.MustRegister(s.tenants)
+}
+
+func (v *tenantView) Describe(ch chan<- *prometheus.Desc) {
+	ch <- descTenantBytes
+	ch <- descTenantQuota
+}
+
+func (v *tenantView) Collect(ch chan<- prometheus.Metric) {
+	tiers := []tenant.Tier{tenant.TierDRAM, tenant.TierNVMe, tenant.TierS3}
+	v.reg.Each(func(ns *tenant.Namespace) {
+		for _, t := range tiers {
+			ch <- prometheus.MustNewConstMetric(descTenantBytes, prometheus.GaugeValue,
+				float64(v.q.Usage(ns.ID, t)), ns.Name, t.String())
+			ch <- prometheus.MustNewConstMetric(descTenantQuota, prometheus.GaugeValue,
+				float64(v.q.Limit(ns.ID, t)), ns.Name, t.String())
+		}
+	})
 }

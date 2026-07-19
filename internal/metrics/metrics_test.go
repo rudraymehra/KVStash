@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/kvstash/kvblockd/internal/protocol"
+	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
 // fakeStats mimics the DRAM tier's Stats() document.
@@ -185,4 +186,42 @@ func httpBody(t *testing.T, addr, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// Cardinality contract: per-tenant series = #namespaces × 3 tiers, labeled
+// by NAME (operator-registered, tens at most) — never per-key, never per-id
+// explosion.
+func TestTenantSeriesCardinality(t *testing.T) {
+	reg := tenant.NewRegistry("team-a", 1, "ta")
+	if err := reg.Add(&tenant.Namespace{ID: 2, Name: "team-b", TokenHash: [32]byte{2}}); err != nil {
+		t.Fatal(err)
+	}
+	reg.SetQuota("team-a", tenant.TierDRAM, 1024)
+	q := tenant.NewQuotas(reg)
+	if err := q.Charge(1, tenant.TierDRAM, 512); err != nil {
+		t.Fatal(err)
+	}
+
+	set := New(nil)
+	set.SetTenants(reg, q)
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, wait, err := set.Serve(ctx, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); wait() }()
+	body := httpBody(t, addr, "/metrics")
+
+	for _, want := range []string{
+		`kvb_tenant_bytes{namespace="team-a",tier="dram"} 512`,
+		`kvb_tenant_quota_bytes{namespace="team-a",tier="dram"} 1024`,
+		`kvb_tenant_bytes{namespace="team-b",tier="s3"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing series %q", want)
+		}
+	}
+	if got := strings.Count(body, "kvb_tenant_bytes{"); got != 6 { // 2 ns × 3 tiers
+		t.Fatalf("kvb_tenant_bytes cardinality %d, want 6", got)
+	}
 }
