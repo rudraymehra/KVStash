@@ -494,10 +494,13 @@ restart-recoverable index is the contrast, not SSD eviction itself.)
   victims → reader-ref held across a bounded writer queue → group-commit
   append (fdatasync every `nvme_sync_every_bytes`) → the index swap runs
   INSIDE the dram shard-lock delete gate (zero-width: a concurrent GET
-  serves exactly one tier). Never-read blocks (admission filter,
-  `nvme_admit_min_hits`) are evicted, not written — SSD endurance. Bytes
-  already NVMe-resident (dual residency after promotion) are never
-  rewritten.
+  serves exactly one tier). Blocks under the admission filter
+  (`nvme_admit_min_hits`) are DELETED at the demote watermark, not written
+  — SSD endurance; each such deletion counts in
+  `kvb_nvme_admit_refusals_total`, and a pure-ingest workload should set
+  the filter to 0 (a rig session once watched a 20 GiB fill melt under
+  the default before this was visible). Bytes already NVMe-resident (dual
+  residency after promotion) are never rewritten.
 - **GETs**: DRAM first; NVMe via a bounded per-volume reader pool —
   saturation answers a per-key `ERR_BUSY` descriptor (retryable; §3's
   per-key-outcomes-ride-in-descriptors mechanism, no wire change). Every
@@ -553,3 +556,185 @@ PCIe-Gen4 hardware.
 - O_DIRECT alignment discipline (4 KiB buffers/offsets/lengths; why the
   aligned pool exists) and the build-tag split (`io_direct_linux.go` /
   `io_direct_other.go` / `kvb_uring` stub — why io_uring is deferred).
+
+## Tenancy model
+
+Multi-tenancy is structural, not an ACL bolted in front of a shared space:
+`namespace_id` rides in every frame header, every index key is
+`(namespace, key)`, and dedup never crosses the pair — the same 32-byte key
+committed by two tenants is two distinct blocks. The tenancy layer therefore
+has exactly two jobs: bind a connection to its namespace at HELLO, and decide
+how many bytes each tenant may hold per tier.
+
+**Hashed tokens, constant-time auth.** The registry (`namespaces.yaml`)
+retains SHA-256 digests, never plaintext: `token_sha256` is the preferred
+schema (the file itself then carries no credential), and a plaintext `token`
+entry is hashed at load and dropped. Authentication hashes the presented
+token and compares with `crypto/subtle.ConstantTimeCompare`; an unknown
+namespace runs a dummy compare so its timing matches a bad-token reject — no
+name-probing oracle. Auth is connection-scoped (one HELLO; token bytes cross
+the wire once), and an empty registry fails every HELLO: a server with no
+tenants accepts no one, secure by default.
+
+**The ledger: per-(namespace, tier) CAS accounting.** `tenant.Quotas` keeps
+one atomic byte counter per (ns, tier). Admission is a CAS loop — load,
+headroom check against the loaded value, CompareAndSwap, retry on contention
+— so check-and-add is atomic with no mutex on the hot path (a plain
+Add-then-check would briefly overshoot and need a compensating Sub that
+races readers). The documented invariant (modeltest pins it as I3):
+usage(ns, tier) ≤ quota + one in-flight block of slack — the slack exists
+because BEGIN's probe is advisory while racing writers each individually
+observed headroom; a lost race costs at most one block per racer. What keeps
+the counter honest is **refund at every removal seam**: DELETE, eviction, a
+lost publish race, demotion's dual-residency collapse and endurance-gate
+deletion on the DRAM side; the delete verb, segment-reclaim retire, and the
+corrupt-entry self-heal on the NVMe side. Tier MOVES use `Transfer`, which
+never fails — refusing a demotion for destination-tier quota would wedge the
+memory ladder; the evictor's over-quota-first pass corrects the destination
+on its next cycle. Recovery uses `Seed`, an unchecked charge: a restart must
+not mint free NVMe bytes, and refusing recovery over quota would lose data.
+A double-refund clamps at zero in release builds and panics under
+`kvbdebug`. Refunds are **tier-exact**: a retire-flipped entry's charge
+lives on S3, not NVMe (next section), and removing it refunds the S3 side —
+refunding NVMe there would leak the S3 charge forever while the underflow
+heal silently hid the NVMe double-subtract.
+
+**Advisory BEGIN, binding publish.** PUT BEGIN answers `ERR_QUOTA_BYTES`
+from a pure headroom probe (`WouldExceed`) that reserves nothing — staging
+stays lazy per the anti-amplification posture — and a refused probe kicks
+the evictor, whose over-quota-first pass may free that same tenant's cold
+blocks. The BINDING admission is `Charge` at publish, inside the commit path
+after the arena copy and before the index insert; a refused charge frees the
+extent and backs out. §3.4 keeps `ERR_QUOTA_BYTES` out of COMMIT's frozen
+response set, so the rare BEGIN-said-yes-then-lost-the-race commit maps to
+the retryable `ERR_BUSY`, and the client's fresh BEGIN reports the honest
+quota answer. Enforcement went live with zero wire change. (Zero-length
+blocks are extent-less and never charged — spec-legal per §3.4.)
+
+**Over-quota tenants pay first.** The eviction pass gained a Round 0: while
+any tenant is over its DRAM quota, victims come from the worst usage/quota
+ratio first (integer thousandths — allocation-free over a handful of
+tenants), bounded by that tenant's overage. Under shared pressure the tenant
+breaking its own budget pays before any within-budget tenant loses a block;
+only then do the proportional and remainder rounds run.
+
+**No existence oracle.** A cross-tenant probe — EXISTS, GET, even
+force-DELETE — answers exactly like a miss: `NOT_FOUND`, never `FORBIDDEN`.
+A tenant cannot learn that a foreign key exists, let alone touch it; the
+wire-wall test commits the same key under two tenants and proves two
+independent blocks with miss-identical cross-answers. (`ERR_FORBIDDEN` stays
+reserved for token-permission classes, not cross-tenant probes.)
+
+**The admin plane is shell-trust, not wire-trust.** Namespace management is
+a loopback-only HTTP listener (`admin_addr`; a non-loopback address refuses
+to bind): `POST /v1/namespace`, `POST /v1/quota`, `GET /v1/namespaces` —
+usage and quotas listed, tokens never. Mutations affect the running process
+only and say so in the response (persist by editing the namespaces file);
+quota changes re-snapshot the accountant's limits immediately. `kvbctl
+namespace add|list` and `kvbctl quota set` drive it from the shell.
+Deliberately not the data plane: no KVB1 frames, no bearer tokens — reaching
+it requires a shell on the box, the same trust boundary as editing
+`namespaces.yaml`.
+
+**Per-tenant observability at bounded cardinality.** `kvb_tenant_bytes` and
+`kvb_tenant_quota_bytes`, labeled `{namespace, tier}`, read the registry and
+accountant at scrape time: cardinality is #namespaces × 3 tiers — namespaces
+are operator-registered (tens, never per-key) and a smoke test pins the
+count.
+
+<!-- RUDRAY: prose first per the Merge Rule — from memory: why the
+     constant-time compare needs the dummy compare for unknown names; why
+     Charge is a CAS loop and not Add-then-check; where each refund seam
+     lives and what leaks if one is missed; why Transfer must never fail;
+     why cross-tenant answers NOT_FOUND and never FORBIDDEN — THEN diff
+     against internal/tenant/{registry,quota}.go and the store seams. -->
+
+## S3 cold tier
+
+The third tier and the headline differentiator: sealed NVMe segments spill
+to object storage, whole. **One sealed segment = one S3 object**,
+byte-for-byte, footer included. That coalescing is request-cost math, not
+convenience: one whole-segment PutObject replaces the ~100 per-block
+requests a 256 MB segment of 2.5 MB blocks would cost, and S3's
+no-offset-writes model fits a write-once append-only file exactly. S3 stores
+bytes, never metadata — the index never leaves the node, which is what makes
+a cold read exactly ONE ranged GetObject. Object keys are node-namespaced
+(`kvblockd/<node_id>/segments/seg-<id>.seg`); credentials come from the
+ambient AWS chain only (env, shared config, IMDS) — no credential ever lives
+in a kvblockd config file.
+
+**Spill is a copy, never a move.** A background pass enqueues every sealed,
+not-yet-spilled segment onto a bounded async write-back queue
+(`s3_spill_queue`, default 8 segments). Fire-and-forget: a full queue is a
+counted drop retried next tick, a failed upload leaves the segment
+local-only — the cold tier can never block a foreground PUT. Until reclaim
+retires the segment, reads stay on local NVMe; the spill-ack merely marks
+each entry "also on S3".
+
+**The retire-flip: reclaim becomes demotion.** When segment reclaim retires
+a SPILLED segment, its entries are not deleted — they FLIP to s3-resident:
+the index entry survives (its location now addresses the object), the
+tenant charge moves NVMe→S3 (`Transfer` under the entry's shard lock, so a
+racing DELETE either removes the entry first or observes the flip and
+refunds the right tier), and cold reads route through the restorer.
+Protections hold through the flip exactly as through a delete: leased or
+pinned entries abort the retire, and a hard-pinned block never becomes
+s3-only (PIN_HARD means DRAM residency, promoted synchronously).
+
+**Cold reads: one ranged GET, verified before a byte escapes.** A GET whose
+segment is retired-but-spilled issues a single ranged GetObject for exactly
+the payload bytes — the stored offset addresses the record (56-byte header
+first), so the range starts at `RecordDataOffset`; the object is the
+byte-identical segment file, so file offsets transfer 1:1. The bytes are
+xxh3-verified against the index entry BEFORE anything escapes to the wire; a
+mismatch counts a checksum error and answers a miss, and a slow S3 hits the
+`s3_read_timeout_ms` deadline (default 2 s) as a per-key outcome — never a
+frame stall. Promotion works from cold too: the 2nd-hit promote and
+PIN_HARD's synchronous promote read through the same verified path, so an
+s3-resident block a GET can serve is never refused a pin. Whole-segment
+restore is singleflight per segment (two concurrent cold misses trigger
+exactly one 256 MB download). **BATCH_EXISTS never touches S3** — both
+indexes are node-local map lookups, the same contract the NVMe spy test
+enforces for the device.
+
+**Restart semantics are per-life, and honest.** Spilled state is
+memory-only: after a restart every sealed segment re-spills, and the
+whole-object PUT is idempotent (same key, same bytes — sealed segments are
+write-once), so a crash costs one duplicate upload, never correctness.
+Entries that were retire-flipped are honestly LOST at restart — the local
+bytes are gone and recovery rebuilds only from local checkpoints and footers
+— a miss, never corruption, exactly the crash contract's shape. Retired
+objects are not synchronously deleted: an orphaned object costs cents, the
+bucket lifecycle rule is the recorded backstop, and reclaim never fails over
+S3 cleanup (the backend carries DeleteObject plumbing for a future
+object-GC pass).
+
+**Config and wiring.** Inert until `s3_bucket` is set — byte-for-byte the
+two-tier daemon otherwise; requires the NVMe tier. Keys: `s3_bucket`,
+`s3_region`, `s3_node_id` (required — object keys must be node-namespaced),
+`s3_endpoint_override` + `s3_path_style` (MinIO/gofakes3-compatible
+targets), `s3_spill_queue`, `s3_read_timeout_ms`. The store never imports
+the SDK — the spill/restore backends are structural interfaces implemented
+by `internal/store/s3spill`.
+
+**Observability.** STATS gains an `"s3"` sub-document (resident
+blocks/bytes, spilled segments, drops, put errors, ranged gets, restores,
+hits, read errors) whose residency split sums with the nvme sub-document to
+the index — matching the per-tenant ledger's tier split; the scrape side
+adds the `kvb_s3_*` families and tier="s3" to `kvb_blocks` /
+`kvb_store_bytes`.
+
+**Measured evidence.** The 24 h soak: **123.3M verified hits, 0 errors**.
+The overnight three-tier spill soak (MinIO on-box): **17,890+ verified cold
+reads, 0 errors**. The spill-mode kill -9 torture: **25 cycles, 0 corrupt,
+0 phantom — 18/18 cold reads served mid-kill**. The end-to-end cold-tier
+walk also caught its own integration bug as 51 checksum refusals (a
+mis-ranged read), refused before a single wrong byte escaped — the
+verify-before-serve contract doing its job.
+
+<!-- RUDRAY: prose first per the Merge Rule — from memory: the request-cost
+     arithmetic behind one-segment-one-object; why spill must be a copy and
+     what the retire-flip changes (and moves, quota-wise); the exact
+     cold-read verify path and why EXISTS must never touch S3; what a
+     restart loses and why that loss is honest — THEN diff against
+     internal/store/{s3tier.go,s3spill/,nvme/spillsurface.go}. -->

@@ -212,3 +212,39 @@ func TestDeleteGatingThroughStore(t *testing.T) {
 		t.Fatalf("clean delete: got %s", st)
 	}
 }
+
+// TestPinCapForConstructorPath: the per-namespace pin_quota override wired
+// through Params (the path main.go actually travels — a post-construction
+// field write would bypass New exactly like the withDefaults regression the
+// ladder caught once already).
+func TestPinCapForConstructorPath(t *testing.T) {
+	arena, err := dram.NewArena(16<<20, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := dram.New(arena, dram.Params{
+		LeaseDefaultMS: 5000, LeaseMaxMS: 60000,
+		PinnedBytesCap: 1 << 20,
+		PinCapFor: func(ns uint32) int64 {
+			if ns == 1 {
+				return 64 << 10
+			}
+			return 0
+		},
+	})
+	t.Cleanup(func() { _ = s.Close() })
+
+	blob := make([]byte, 128<<10) // 128 KiB: over ns1's 64 KiB override, under the global 1 MiB
+	if st := s.Put(1, k(200), blob, xxh3.Hash(blob)); st != protocol.StatusOK {
+		t.Fatal(st)
+	}
+	if st := s.Put(2, k(201), blob, xxh3.Hash(blob)); st != protocol.StatusOK {
+		t.Fatal(st)
+	}
+	if st := s.PinOp(1, k(200), protocol.PinHard); st != protocol.StatusErrPinQuota {
+		t.Fatalf("ns1 override ignored on the wire path: got %s, want ERR_PIN_QUOTA", st)
+	}
+	if st := s.PinOp(2, k(201), protocol.PinHard); st != protocol.StatusOK {
+		t.Fatalf("ns2 global fallback: %s", st)
+	}
+}

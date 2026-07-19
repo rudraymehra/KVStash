@@ -16,6 +16,10 @@ type Params struct {
 	LeaseDefaultMS uint32
 	LeaseMaxMS     uint32
 	PinnedBytesCap int64 // per-namespace; 0 = unlimited
+	// PinCapFor, when non-nil, supplies a namespace's OWN pinned-bytes cap
+	// (the registry's pin_quota); 0 from it = no override, PinnedBytesCap
+	// applies. nil = the global cap only.
+	PinCapFor func(ns uint32) int64
 	// Now is the tier's clock (unix nanos); nil = real time. The fake-clock
 	// seam: modeltest drives lease/TTL expiry deterministically through it,
 	// and the evictor draws every eligibility decision from the same source.
@@ -86,7 +90,7 @@ func New(arena *Arena, p Params) *Store {
 	return &Store{
 		arena:  arena,
 		index:  NewIndex(),
-		life:   newLifecycle(p.LeaseDefaultMS, p.LeaseMaxMS, p.PinnedBytesCap, now),
+		life:   newLifecycle(p.LeaseDefaultMS, p.LeaseMaxMS, p.PinnedBytesCap, p.PinCapFor, now),
 		now:    now,
 		alloc:  NewAllocatorMax(units, maxAllocs),
 		quotas: p.Quotas,

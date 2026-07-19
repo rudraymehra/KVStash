@@ -75,6 +75,10 @@ Notes that matter:
 
 - The tier is **inert until `nvme_paths` is set** — a DRAM-only daemon
   behaves byte-for-byte identically.
+- **Pure-ingest workloads:** never-read blocks are DELETED at the demote
+  watermark instead of tiered (`nvme_admit_min_hits`, default 1 — an SSD
+  endurance rule). If your blocks are written long before first read, set
+  it to 0 and watch `kvb_nvme_admit_refusals_total`.
 - `nvme_paths` order is positional ownership: append new volumes, never
   reorder or remove entries between restarts.
 - I/O is `O_DIRECT`, 4 KiB-aligned, log-structured 256 MiB segments; on

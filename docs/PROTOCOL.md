@@ -234,8 +234,12 @@ document.
 Deliberately JSON: cold path, human-debuggable, maps onto storage-metrics and
 Prometheus label sets without a wire-schema migration per release. The JSON
 carries a `schema` field inside the document (schema evolution never burns a
-feature bit). Includes per-namespace bytes/blocks per tier, quota headroom,
-pinned/leased bytes, hit/miss counters, credit-stall time, segment counts.
+feature bit). The document's FIELDS are implementation-defined (only the
+`schema` key is promised): today it carries the store document — per-tier
+blocks/bytes, arena occupancy, pinned bytes per namespace, eviction/demotion/
+reclaim/spill counters, segment counts. Per-namespace quota usage and headroom
+live on the admin API (`GET /v1/namespaces`) and the `kvb_tenant_*` metric
+families, not in this document.
 
 ## 4. Negotiated limits (defaults)
 
@@ -393,6 +397,14 @@ so symmetric credit can be added behind a feature bit without a header change.
 | 0x51 | `ERR_MALFORMED` | Body unparseable — frame skipped, connection healthy |
 | 0x60 | `ERR_INTERNAL` | Server fault; request MAY be retried |
 | 0xF0 | `FATAL_PROTOCOL` | Header CRC/magic/version violation; always with F_FATAL |
+
+*(Now live, v0.2.0: `ERR_QUOTA_BYTES` (0x30) is backed by real per-tenant,
+per-tier byte accounting — quota enforcement is commit-time real. The
+BEGIN-time answer remains the advisory probe §3.4/§5 always described; the
+binding charge happens at commit-time publish, and a commit that loses the
+last-headroom race still answers the retryable `ERR_BUSY`, after which the
+client's fresh BEGIN reports `ERR_QUOTA_BYTES` honestly. NO wire change:
+codes, response sets, and the state machine are exactly as frozen.)*
 
 Design rule: **only three things are connection-fatal** (magic/CRC/version,
 pre-auth traffic, sustained credit abuse). Everything else is a per-frame or

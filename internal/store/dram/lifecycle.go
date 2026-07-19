@@ -23,8 +23,13 @@ import (
 type lifecycle struct {
 	leaseDefaultMS uint32
 	leaseMaxMS     uint32
-	pinnedCap      int64        // per-namespace pinned-bytes cap (0 = unlimited)
-	now            func() int64 // instance clock (unix nanos) — Params.Now seam
+	pinnedCap      int64 // per-namespace pinned-bytes cap (0 = unlimited)
+	// pinCapFor returns a namespace's own cap override (0 = none — fall back
+	// to pinnedCap). The registry's pin_quota was parsed and listed but
+	// enforced by NOTHING until this seam — the AdmitMinHits silent-config
+	// class: an operator sets a field and the daemon quietly ignores it.
+	pinCapFor func(ns uint32) int64
+	now       func() int64 // instance clock (unix nanos) — Params.Now seam
 
 	mu     sync.Mutex // guards pinned (cold path: pin/unpin/delete only)
 	pinned map[uint32]int64
@@ -35,11 +40,12 @@ type lifecycle struct {
 	ttlBlocks atomic.Int64
 }
 
-func newLifecycle(leaseDefaultMS, leaseMaxMS uint32, pinnedCap int64, now func() int64) *lifecycle {
+func newLifecycle(leaseDefaultMS, leaseMaxMS uint32, pinnedCap int64, pinCapFor func(uint32) int64, now func() int64) *lifecycle {
 	return &lifecycle{
 		leaseDefaultMS: leaseDefaultMS,
 		leaseMaxMS:     leaseMaxMS,
 		pinnedCap:      pinnedCap,
+		pinCapFor:      pinCapFor,
 		now:            now,
 		pinned:         make(map[uint32]int64),
 	}
@@ -131,8 +137,14 @@ func (l *lifecycle) Pin(ref *BlockRef, hard bool) protocol.Status {
 	wasHard := ref.PinFlags&pinHardBit != 0
 	switch {
 	case hard && !wasHard: // into hard: the quota gate
+		cap := l.pinnedCap
+		if l.pinCapFor != nil {
+			if o := l.pinCapFor(ref.NamespaceID); o > 0 {
+				cap = o // the namespace's own pin_quota overrides the global cap
+			}
+		}
 		l.mu.Lock()
-		if l.pinnedCap > 0 && l.pinned[ref.NamespaceID]+int64(ref.Len) > l.pinnedCap {
+		if cap > 0 && l.pinned[ref.NamespaceID]+int64(ref.Len) > cap {
 			l.mu.Unlock()
 			return protocol.StatusErrPinQuota
 		}

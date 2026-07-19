@@ -76,7 +76,7 @@ func TestBlockRefAcquireRelease(t *testing.T) {
 // the lease clamp and the lazy-expiry rule.
 func TestLeaseTTLExpiry(t *testing.T) {
 	nowFn, clk := testClock(msToNanos(1_000_000))
-	l := newLifecycle(5000, 60000, 0, nowFn)
+	l := newLifecycle(5000, 60000, 0, nil, nowFn)
 	ref := &BlockRef{}
 
 	// Auto-lease: 5s default.
@@ -121,7 +121,7 @@ func TestLeaseTTLExpiry(t *testing.T) {
 // TestDeleteGatingTruthTable pins the §3.7 matrix exactly.
 func TestDeleteGatingTruthTable(t *testing.T) {
 	nowFn, _ := testClock(msToNanos(1_000_000))
-	l := newLifecycle(5000, 60000, 0, nowFn)
+	l := newLifecycle(5000, 60000, 0, nil, nowFn)
 
 	cases := []struct {
 		name       string
@@ -172,7 +172,7 @@ func TestDeleteGatingTruthTable(t *testing.T) {
 // passes the gate (incl. soft→hard upgrades), and leaving hard refunds.
 func TestPinQuota(t *testing.T) {
 	nowFn, _ := testClock(msToNanos(1_000_000))
-	l := newLifecycle(5000, 60000, 1000, nowFn) // 1000-byte cap
+	l := newLifecycle(5000, 60000, 1000, nil, nowFn) // 1000-byte cap
 
 	a := &BlockRef{NamespaceID: 7, Len: 600}
 	b := &BlockRef{NamespaceID: 7, Len: 600}
@@ -220,13 +220,36 @@ func TestPinQuota(t *testing.T) {
 	}
 }
 
+// TestPinQuotaPerNamespaceOverride: a namespace's own pin_quota (the
+// registry field that was parsed and listed but enforced by NOTHING —
+// the silent-config class) overrides the global cap in BOTH directions,
+// and namespaces without an override keep the global behavior.
+func TestPinQuotaPerNamespaceOverride(t *testing.T) {
+	nowFn, _ := testClock(msToNanos(1_000_000))
+	caps := map[uint32]int64{7: 500, 9: 5000} // ns7 tighter than global, ns9 looser
+	l := newLifecycle(5000, 60000, 1000, func(ns uint32) int64 { return caps[ns] }, nowFn)
+
+	// ns7: the 500-byte override refuses what the 1000-byte global would allow.
+	if st := l.Pin(&BlockRef{NamespaceID: 7, Len: 600}, true); st != protocol.StatusErrPinQuota {
+		t.Fatalf("ns7 override: got %s, want ERR_PIN_QUOTA", st)
+	}
+	// ns8: no override (0) — the global cap admits the same size.
+	if st := l.Pin(&BlockRef{NamespaceID: 8, Len: 600}, true); st != protocol.StatusOK {
+		t.Fatalf("ns8 global fallback: %s", st)
+	}
+	// ns9: the 5000-byte override admits what the global would refuse.
+	if st := l.Pin(&BlockRef{NamespaceID: 9, Len: 1200}, true); st != protocol.StatusOK {
+		t.Fatalf("ns9 loose override: %s", st)
+	}
+}
+
 // TestCanEvictLadder pins the evictor pre-filter in its REAL context: a
 // block resident in the index (Refcount==1, exactly the index's own ref).
 // The idle case is the load-bearing row — an idle, unleased, unpinned
 // resident block MUST be evictable, else the Week-4 evictor finds nothing.
 func TestCanEvictLadder(t *testing.T) {
 	nowFn, clk := testClock(msToNanos(1_000_000))
-	l := newLifecycle(5000, 60000, 0, nowFn)
+	l := newLifecycle(5000, 60000, 0, nil, nowFn)
 
 	ref := &BlockRef{Len: 10}
 	ref.Refcount.Store(1) // resident: the index's own reference

@@ -75,6 +75,7 @@ func run() error {
 		LeaseDefaultMS: cfg.LeaseDefaultMS,
 		LeaseMaxMS:     cfg.LeaseMaxMS,
 		PinnedBytesCap: cfg.PinnedBytesCap,
+		PinCapFor:      ns.Registry().PinQuotaFor, // per-ns pin_quota overrides the global cap
 		Quotas:         quotas,
 	})
 

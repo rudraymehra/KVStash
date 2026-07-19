@@ -189,6 +189,18 @@ func (r *Registry) Lookup(id uint32) (*Namespace, bool) {
 	return ns, ok
 }
 
+// PinQuotaFor returns the namespace's own pinned-bytes cap (0 = none set —
+// the daemon's global pinned_bytes_cap applies). This is dram.Params.PinCapFor:
+// the field was parsed, stored, and listed long before anything ENFORCED it.
+func (r *Registry) PinQuotaFor(id uint32) int64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if ns, ok := r.byID[id]; ok {
+		return ns.PinQuota
+	}
+	return 0
+}
+
 // Each calls fn for every namespace in unspecified order (metrics labels,
 // admin listing).
 func (r *Registry) Each(fn func(*Namespace)) {
