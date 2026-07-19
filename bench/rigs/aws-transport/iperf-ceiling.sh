@@ -7,6 +7,12 @@ STATE="$(dirname "$0")/.rig-state"; source "$STATE"
 SSH="ssh -i $HOME/.ssh/kvbench.pem -o StrictHostKeyChecking=accept-new ec2-user"
 OUT="$(dirname "$0")/iperf-ceiling.txt"; : > "$OUT"
 
+# Provenance header: this file is a PER-SESSION artifact — without the rig
+# label, a 50 GbE run silently contradicts a 100 GbE headline elsewhere.
+ITYPE=$(aws ec2 describe-instances --instance-ids "$A_ID" \
+  --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null || echo unknown)
+echo "# rig: 2x $ITYPE  measured: $(date -u +%Y-%m-%dT%H:%MZ)  (best value = the A1 denominator)" | tee -a "$OUT"
+
 $SSH@"$B_PUB" 'pkill iperf3 2>/dev/null; nohup iperf3 -s >/tmp/iperf3s.log 2>&1 &'; sleep 2
 for P in 8 16 32 64; do
   echo "== -P $P ==" | tee -a "$OUT"

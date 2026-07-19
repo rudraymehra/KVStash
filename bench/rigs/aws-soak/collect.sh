@@ -15,7 +15,13 @@ if aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
   # Stop the driver gracefully if still running (prints the final line).
   ssh "${SSHOPTS[@]}" "ec2-user@$PUB" \
     'kill -TERM $(cat /tmp/soakout/driver.pid) 2>/dev/null || true; sleep 5; kill -TERM $(cat /tmp/soakout/daemon.pid) 2>/dev/null || true; sleep 3' || true
-  scp -r "${SSHOPTS[@]}" "ec2-user@$PUB:/tmp/soakout/*" "$OUT/" || echo "[collect] partial pull"
+  if ! scp -r "${SSHOPTS[@]}" "ec2-user@$PUB:/tmp/soakout/*" "$OUT/"; then
+    # NEVER tear down on a failed pull — a transient ssh drop must not
+    # destroy 24 hours of artifacts. Retry collect.sh; the 27h dead-man is
+    # the only thing allowed to kill an uncollected box.
+    echo "[collect] PULL FAILED — box left RUNNING; fix connectivity and re-run collect.sh" >&2
+    exit 1
+  fi
 else
   echo "[collect] instance not running (dead-man fired?) — artifacts lost unless pulled earlier"
 fi

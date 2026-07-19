@@ -19,7 +19,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 STATE="$DIR/.rig-state"; source "$STATE"
 ROOT="$(git rev-parse --show-toplevel)"
 OUT="$DIR/tier-results.txt"; : > "$OUT"
-SSHOPTS=(-i "$HOME/.ssh/kvbench.pem" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+SSHOPTS=(-i "$HOME/.ssh/kvbench.pem" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10
+         -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -o TCPKeepAlive=yes)
 S() { ssh "${SSHOPTS[@]}" "ec2-user@$N_PUB" "$@"; }
 note() { echo "$*" | tee -a "$OUT"; }
 
@@ -35,14 +36,23 @@ namespaces:
     id: 3
     token: bench-token
 EOF
+# A still-running binary makes the overwrite fail with ETXTBSY — kill first.
+S 'pkill -x kvblockd 2>/dev/null; pkill -x getbench 2>/dev/null; pkill -x torture 2>/dev/null; sleep 1; true'
 scp "${SSHOPTS[@]}" "$BINS/kvblockd" "$BINS/getbench" "$BINS/torture" "$BINS/ns.yaml" "ec2-user@$N_PUB:/tmp/"
 
 echo "[tier] XFS on both instance-store devices"
-S 'for i in 0 1; do d=/dev/nvme$((i+1))n1; m=/mnt/nvme$i;
-     sudo mkfs.xfs -f $d >/dev/null 2>&1 && sudo mkdir -p $m && sudo mount $d $m && sudo chown ec2-user $m; done'
+# umount first (a rerun finds them mounted; mkfs -f refuses a mounted
+# device) and DON'T eat mkfs stderr — a silent refusal killed a session.
+S 'set -e; for i in 0 1; do d=/dev/nvme$((i+1))n1; m=/mnt/nvme$i;
+     sudo umount $m 2>/dev/null || true
+     sudo mkfs.xfs -qf $d && sudo mkdir -p $m && sudo mount $d $m && sudo chown ec2-user $m
+   done'
 
 # writeCfg <name> <paths-yaml> — 8 GiB arena so a 20 GiB pool is mostly
 # NVMe-resident; promotion OFF so the storm measures the DEVICE path.
+# admit_min_hits 0: the fill is pure PUTs (zero lifetime GETs) — the
+# default 1 would DELETE never-read blocks at the demote watermark instead
+# of demoting them (SSD-endurance rule), leaving the pool mostly gone.
 # nvme_max_bytes is a RECLAIM reference only; 6 TB (> the single 3.75 TB
 # device in T1a) simply means reclaim never fires during these fills —
 # intended: the storm must not race reclamation.
@@ -53,6 +63,7 @@ namespaces_path: /tmp/ns.yaml
 dram_arena_bytes: 8589934592
 nvme_paths: [$2]
 nvme_max_bytes: 6000000000000
+nvme_admit_min_hits: 0
 nvme_read_workers: 32
 nvme_demote_watermark_pct: 50
 nvme_demote_batch_pct: 10
@@ -62,23 +73,30 @@ startd() { S "nohup /tmp/kvblockd -config /tmp/$1 > /tmp/kvbd.log 2>&1 & echo \$
              for i in \$(seq 1 400); do curl -sf http://127.0.0.1:9442/healthz >/dev/null && exit 0; sleep 0.25; done; exit 1"; }
 stopd() { S 'kill "$(cat /tmp/kvbd.pid)" 2>/dev/null || true; sleep 2' ; }
 
-storm() { # storm <pool-blocks> <label>
+storm() { # storm <pool-blocks> <label> <fill-mbps>
   # Fill (PUT pool; demotion streams it to NVMe), then the GET storm.
-  S "/tmp/getbench -addr 127.0.0.1:9440 -streams 16 -secs 60 -blocks 32 -block-kib 1024 -pool $1" \
+  # The fill is THROTTLED below the device write ceiling: an unthrottled
+  # loopback fill outruns demotion and the arena EVICTS the pool instead
+  # of demoting it (legal cache behavior; wrong experiment). Ceiling
+  # evidence: fio-ceiling.sh (RAW device) + an ad-hoc FILE-level fio on
+  # this box (2026-07-19: write bs=1m qd32 ≈ 3.48 GiB/s/device, recorded
+  # in tier-results.txt); the committed conservative floor is nvmeprobe's
+  # ~2.33 GB/s/device file-level write — the throttles below sit under it.
+  S "/tmp/getbench -addr 127.0.0.1:9440 -streams 16 -secs 60 -blocks 32 -block-kib 1024 -pool $1 -fill-mbps $3" \
     | tee -a "$OUT" | sed "s/^/[$2] /"
 }
 
 note "== T1a: per-device storm (volume 0 only) =="
 writeCfg one.yaml '"/mnt/nvme0/kvb"'
 startd one.yaml
-storm 20480 "T1a"   # 20 GiB pool over an 8 GiB arena → mostly NVMe-resident
+storm 20480 "T1a" 2000   # 20 GiB pool over an 8 GiB arena → mostly NVMe-resident
 stopd
 S 'rm -rf /mnt/nvme0/kvb'
 
 note "== T1b: both-device aggregate storm =="
 writeCfg two.yaml '"/mnt/nvme0/kvb", "/mnt/nvme1/kvb"'
 startd two.yaml
-storm 20480 "T1b"
+storm 20480 "T1b" 3500
 
 note "== T3: warm restart on the two-volume fill =="
 S 'grep -c . /tmp/kvbd.log >/dev/null; kill -9 "$(cat /tmp/kvbd.pid)"; sleep 1'
@@ -88,7 +106,7 @@ T1=$(date +%s.%N)
 note "warm-restart wall (kill -9 → healthz 200): $(echo "$T1 - $T0" | bc)s"
 S 'grep "volume recovered" /tmp/kvbd.log' | tee -a "$OUT"
 note "-- hits must survive the restart (a warm storm, short):"
-storm 20480 "T3"
+storm 20480 "T3" 0 # re-fill is all write-once no-op acks — nothing to throttle
 stopd
 S 'rm -rf /mnt/nvme0/kvb /mnt/nvme1/kvb'
 

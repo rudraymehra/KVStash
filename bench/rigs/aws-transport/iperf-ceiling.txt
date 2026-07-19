@@ -1,8 +1,10 @@
+# rig: 2x c6in.8xlarge (50 GbE)  measured: 2026-07-18T19:0xZ  (best value = the A1 denominator)
+# NOTE: the 100 GbE headline in bench/BENCHMARKS.md came from a DIFFERENT session (2x c7gn.8xlarge, ceiling 99.8 Gbit/s — see docs/notes/a1-log.md); this file always holds the CURRENT rig session.
 == -P 8 ==
-75.3 Gbit/s
+49.5 Gbit/s
 == -P 16 ==
-99.1 Gbit/s
+49.8 Gbit/s
 == -P 32 ==
-99.8 Gbit/s
+49.8 Gbit/s
 == -P 64 ==
-99.8 Gbit/s
+49.8 Gbit/s
