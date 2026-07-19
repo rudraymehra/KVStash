@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 BUCKET="${BUCKET:-kvb-week9-e2e-057996826223}"
-BOX_IP="${BOX_IP:?set BOX_IP to the in-region box's public IP}"
+BOX_IP="${BOX_IP:?set BOX_IP to the in-region box public IP}"
 CREDS_JSON="${CREDS_JSON:-/tmp/kvb-e2e-creds.json}"
 SSHOPTS=(-i "$HOME/.ssh/kvbench.pem" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
 
