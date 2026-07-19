@@ -88,10 +88,10 @@ func (t *Tiered) readS3(ref *nvmeRef, ns uint32, key [32]byte) (data []byte, rel
 	ctx, cancel := context.WithTimeout(context.Background(), t.s3ReadDeadline())
 	defer cancel()
 	buf := make([]byte, ref.Len)
-	// The record's DATA sits at Off inside the segment object — Loc.Offset
-	// is already the data offset the local reader uses; the object is the
-	// byte-identical segment file, so offsets transfer 1:1.
-	if err := t.p.Restore.ReadRange(ctx, uint64(ref.Loc.SegmentID), int64(ref.Loc.Offset), int64(ref.Len), buf); err != nil {
+	// Loc.Offset addresses the RECORD (56-byte header first); the payload
+	// starts at RecordDataOffset. The object is the byte-identical segment
+	// file, so file offsets transfer 1:1.
+	if err := t.p.Restore.ReadRange(ctx, uint64(ref.Loc.SegmentID), nvme.RecordDataOffset(ref.Loc.Offset), int64(ref.Len), buf); err != nil {
 		t.s3ReadErrs.Add(1)
 		return nil, nil, false
 	}

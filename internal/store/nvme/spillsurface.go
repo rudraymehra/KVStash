@@ -82,3 +82,8 @@ func (v *Volume) SegmentEntryKeys(id uint32, fn func(ns uint32, key [32]byte, of
 		fn(e.NS, e.Key, e.Off, e.Len)
 	}
 }
+
+// RecordDataOffset converts a footer/Loc record offset (the record START)
+// into the payload's byte offset inside the segment file — the ranged-read
+// offset a byte-identical S3 object serves.
+func RecordDataOffset(recordOff uint32) int64 { return int64(recordOff) + recordHdrSize }
