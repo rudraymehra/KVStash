@@ -601,6 +601,7 @@ func writeConfigs(dir string, dataPort, metricsPort int, s3Endpoint string) (str
 	}
 	cfg := fmt.Sprintf(`listen_addr: "127.0.0.1:%d"
 metrics_addr: "127.0.0.1:%d"
+admin_addr: ""                 # unused by the harness; the DEFAULT port collides across orphans/parallel runs
 namespaces_path: %q
 max_blob_len: 4194304          # 4 MiB — the torture band tops at 2.5 MiB
 dram_arena_bytes: 67108864     # 64 MiB — small so the storm hits the demote watermark fast
