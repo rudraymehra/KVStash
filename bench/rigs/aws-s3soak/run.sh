@@ -14,8 +14,10 @@
 #           hit is byte-regenerated + xxh3-verified (cold reads included)
 #   hourly: heap/goroutine pprof, /metrics scrape (kvb_s3_* families), RSS
 #
-# SAFETY: `shutdown -h +1620` (27h) with terminate-on-shutdown; artifacts
-# go to /var/soakout (EBS — /tmp is tmpfs on AL2023 and dies with the box).
+# SAFETY: `shutdown -h +1620` (27h) with terminate-on-shutdown — which also
+# DELETES the root volume: collect within 27h or the artifacts are gone.
+# /var/soakout is EBS-backed (vs tmpfs /tmp) so it survives daemon crashes
+# and reboots, NOT termination.
 # Tagged kvbench=s3soak. Collect: bash collect.sh (within 27h).
 set -euo pipefail
 
@@ -113,7 +115,10 @@ MINIO_ROOT_USER=kvbsoak MINIO_ROOT_PASSWORD=kvbsoak-secret nohup /tmp/minio serv
   --address 127.0.0.1:9000 --console-address 127.0.0.1:9001 \
   > /var/soakout/minio.out 2>&1 &
 echo $! > /var/soakout/minio.pid
-sleep 5
+for i in $(seq 1 30); do
+  curl -sf http://127.0.0.1:9000/minio/health/ready >/dev/null && break
+  sleep 2
+done
 AWS_ACCESS_KEY_ID=kvbsoak AWS_SECRET_ACCESS_KEY=kvbsoak-secret \
   aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://kvbsoak
 

@@ -724,14 +724,38 @@ the index — matching the per-tenant ledger's tier split; the scrape side
 adds the `kvb_s3_*` families and tier="s3" to `kvb_blocks` /
 `kvb_store_bytes`.
 
+**Real-S3 latencies (measured 2026-07-20, in-region us-east-1 m7g.xlarge,
+the daemon's own spill/restore code paths via s3probe).** Whole-segment PUT
+(8 MiB): p50 110 ms (~73 MiB/s), worst of 10 = 235 ms. Ranged cold GET, p50:
+64 KiB 26.9 ms · 256 KiB 25.7 ms · 1 MiB 28.6 ms · 2.5 MiB 31.4 ms; worst
+observed of 30 per size: 33–61 ms (n is too small for honest p99s — we quote
+medians and maxima, and the review ladder caught the first draft quoting a
+"p99" range that excluded the two worst cells) —
+S3's first-byte latency dominates, so a 2.5 MiB block costs ~4 ms more than a
+64 KiB one: the economics of one-segment-one-object. A cold 2.5 MiB KV block
+at ~31 ms is roughly an order of magnitude under recomputing its prefix.
+Raw JSONL: bench/rigs/aws-s3e2e/s3probe-results.jsonl.
+
+The 17.3 h three-tier spill soak (MinIO on-box): 12.37M verified hits,
+112,851 verified cold reads, 0 errors, 0 read errors, goroutines flat
+(148→144). HONEST CAVEAT (the committed artifacts corrected our first
+read): MinIO's 40 GiB volume FILLED at ~6.8 h ("drive path full" in
+minio.out) because retired segments' objects are never deleted — the
+object-GC gap that is IMPROVEMENTS.md's first row eating its own soak.
+93% of the 3,120 upload errors came after the disk filled, spills
+flatlined 364→379, and ~111k of the 112.8k cold reads landed in the
+first ~8 h — so the cold tier was genuinely exercised for ~8 h, not
+17.3 h. Loss-free throughout (local authoritative); the single-worker
+spiller's queue pressure (enqueue-refusal ticks) is real but secondary.
+
 **Measured evidence.** The 24 h soak: **123.3M verified hits, 0 errors**,
 RSS flat (165→160 MB), and across 1.7M GC cycles the stop-the-world pauses
 held **p50 42 µs / p99 3.0 ms / p99.9 5.8 ms / max 13 ms** — measured on a
 4-vCPU box pinned at 100% CPU by design, which inflates the scheduler-bound
 tail; the arena keeps the block bytes themselves entirely outside the GC's
 world.
-The overnight three-tier spill soak (MinIO on-box): **17,890+ verified cold
-reads, 0 errors**. The spill-mode kill -9 torture: **25 cycles, 0 corrupt,
+The overnight three-tier spill soak (MinIO on-box): **112,851 verified cold
+reads, 0 read errors** (final; see the caveat below on the run's second half). The spill-mode kill -9 torture: **25 cycles, 0 corrupt,
 0 phantom — 18/18 cold reads served mid-kill**. The end-to-end cold-tier
 walk also caught its own integration bug as 51 checksum refusals (a
 mis-ranged read), refused before a single wrong byte escaped — the

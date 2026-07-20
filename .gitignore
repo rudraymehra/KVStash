@@ -47,3 +47,5 @@ bench/rigs/*/.rig-state
 /crash
 /getbench
 internal/store/modeltest/testdata/rapid/
+bench/rigs/aws-s3soak/results/
+.claude/

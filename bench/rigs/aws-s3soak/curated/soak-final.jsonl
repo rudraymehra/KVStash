@@ -1,0 +1,1 @@
+{"backpressure":18659,"daemon":{"blocks":4909,"evictions_total":702014},"elapsed_s":62340,"errors":0,"get_n":22330,"get_p50_us":413.59030627651384,"get_p999_us":522024.357439882,"get_p99_us":522024.357439882,"hits":12368522,"misses":1390043,"put_n":7908,"put_p50_us":169.40658945086005,"put_p99_us":1262.177448353619,"ts":"2026-07-20T07:35:48Z","verify_fails":0}

@@ -28,16 +28,11 @@ if aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
     exit 1
   fi
 else
-  echo "[collect] instance not running (dead-man fired) — starting it to pull /var/soakout (EBS)"
-  aws ec2 start-instances --region "$REGION" --instance-ids "$IID" >/dev/null
-  aws ec2 wait instance-running --region "$REGION" --instance-ids "$IID"
-  PUB=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
-    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-  sleep 20 # sshd
-  if ! scp -r "${SSHOPTS[@]}" "ec2-user@$PUB:/var/soakout/*" "$OUT/"; then
-    echo "[collect] PULL FAILED post-restart — box left RUNNING; re-run collect.sh" >&2
-    exit 1
-  fi
+  # The dead-man TERMINATES the instance and DeleteOnTermination removes the
+  # root volume — a fired dead-man means the artifacts are GONE. There is no
+  # recovery branch to write; collect within the 27h window or lose the run.
+  echo "[collect] instance not running — dead-man fired; artifacts are unrecoverable (terminate deletes the volume)" >&2
+  exit 1
 fi
 
 echo "[collect] terminating $IID"
