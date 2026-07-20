@@ -41,6 +41,13 @@ type s3Fixture struct {
 }
 
 func newS3Fixture(t *testing.T) *s3Fixture {
+	// Default: a tiny volume budget so reclaim genuinely fires (the retire-
+	// flip → cold-read walk needs it). Tests that want spilled-but-LIVE
+	// segments (no reclaim) pass a large budget via newS3FixtureSized.
+	return newS3FixtureSized(t, 768<<10)
+}
+
+func newS3FixtureSized(t *testing.T, volMaxBytes int64) *s3Fixture {
 	t.Helper()
 	backend := s3mem.New()
 	faker := gofakes3.New(backend)
@@ -83,7 +90,7 @@ func newS3Fixture(t *testing.T) *s3Fixture {
 	d.AttachPolicy(pol)
 	// Volume budget: ~3 segments — the 4th fill forces reclaim of the oldest.
 	vol, rep, ents, err := nvme.OpenVolume(nvme.VolumeParams{
-		Dir: t.TempDir(), SegmentBytes: 256 << 10, MaxBytes: 768 << 10,
+		Dir: t.TempDir(), SegmentBytes: 256 << 10, MaxBytes: volMaxBytes,
 		ReadWorkers: 2, CkptEverySegs: 4, MaxBlobLen: 64 << 10, Now: cur.Load,
 	})
 	if err != nil {
@@ -146,6 +153,116 @@ func driveToS3Residency(t *testing.T, fx *s3Fixture) (key [32]byte, blob []byte)
 	}
 	t.Fatal("no block served from the cold tier")
 	return [32]byte{}, nil
+}
+
+// TestS3FlipStrandAbortsRetire is the deterministic white-box pin for the
+// strand-abort branch (the Fable-5 vetting review found it shipped with zero
+// executing coverage — only the probabilistic ack-vs-reclaim hunt touched it,
+// and that never fires on a quiet box). It drives a segment to
+// sealed+spilled+LIVE (demote + spill, NO reclaim), soft-pins one of its
+// entries, then calls s3FlipRetired directly — sidestepping the advisory
+// pre-gate exactly as a lease/pin landing mid-retire would. The pinned entry
+// must STRAND the retire (a protected block may never become s3-only), stay
+// un-flipped, and keep serving locally after RetireAbort.
+func TestS3FlipStrandAbortsRetire(t *testing.T) {
+	// A LARGE volume budget (8 MiB) so reclaim NEVER fires — segments seal
+	// and spill but stay live, which is the state this test needs (the
+	// default fixture's tiny budget would reclaim-flip them instead).
+	fx := newS3FixtureSized(t, 8<<20)
+	const blk = 60 << 10
+	// Continuous 60K-block flow through the 1.5 MiB arena: it must actually
+	// fill past the 90% demote watermark (the arena is not tiny), so this
+	// takes ~40 blocks with a hand-driven demote whenever the arena walls.
+	for i := 0; i < 40; i++ {
+		b := bytes.Repeat([]byte{byte(i), byte(0x5A ^ i)}, blk/2) //nolint:gosec // G115: test payload
+		st := fx.t.Put(1, s3key(i), b, xxh3.Hash(b))
+		if st == protocol.StatusErrQuotaBytes {
+			fx.cur.Add(int64(200 * time.Millisecond))
+			fx.t.demotePass(true)
+			st = fx.t.Put(1, s3key(i), b, xxh3.Hash(b))
+		}
+		if st != protocol.StatusOK {
+			t.Fatalf("put %d: %s", i, st)
+		}
+		if i%4 == 3 {
+			fx.cur.Add(int64(200 * time.Millisecond))
+			fx.t.demotePass(true)
+		}
+	}
+	// The spiller is ASYNC: drive spillPass and poll until the ack has set
+	// S3=true on ≥2 entries of one still-live segment (never reclaim, so the
+	// local segment persists). Deterministic via a bounded deadline, the
+	// same discipline driveToS3Residency uses.
+	var segID uint32
+	var keys [][32]byte
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && len(keys) < 2 {
+		fx.t.spillPass()
+		time.Sleep(20 * time.Millisecond)
+		bySeg := map[uint32][][32]byte{}
+		fx.t.idx.rangeAll(func(k dram.Key, ref *nvmeRef) bool {
+			if ref.S3.Load() && !ref.S3Only.Load() {
+				bySeg[ref.Loc.SegmentID] = append(bySeg[ref.Loc.SegmentID], k.Hash)
+			}
+			return true
+		})
+		for id, ks := range bySeg {
+			if len(ks) >= 2 {
+				segID, keys = id, ks
+				break
+			}
+		}
+	}
+	if len(keys) < 2 {
+		t.Fatalf("could not stage a spilled+live segment with ≥2 entries (got %d)", len(keys))
+	}
+	vol := fx.t.volumeFor(keys[0])
+	if !vol.IsSpilled(segID) {
+		t.Fatalf("segment %d not spilled", segID)
+	}
+
+	// Soft-pin one entry: it must strand the retire (protection is the
+	// authoritative gate INSIDE the flip closure, not just the pre-gate).
+	pin := dram.Key{NS: 1, Hash: keys[0]}
+	fx.t.idx.withShardLock(pin, func(ref *nvmeRef) {
+		if ref == nil {
+			t.Fatal("pinned key vanished before the flip")
+		}
+		ref.PinFlags = nvPinSoftBit
+	})
+
+	if !vol.RetireBegin(segID) {
+		t.Fatalf("RetireBegin(%d) refused", segID)
+	}
+	preS3 := fx.q.Usage(1, tenant.TierS3)
+	stranded := fx.t.s3FlipRetired(vol, segID)
+	if stranded == 0 {
+		t.Fatal("a soft-pinned entry did not strand the retire — a protected block could become s3-only")
+	}
+	// The pinned entry must NOT have flipped.
+	fx.t.idx.withShardLock(pin, func(ref *nvmeRef) {
+		if ref == nil || ref.S3Only.Load() {
+			t.Fatal("pinned entry was flipped to s3-only despite stranding")
+		}
+	})
+	vol.RetireAbort(segID)
+
+	// After the abort the segment is live again: the pinned block still
+	// serves LOCALLY (never from S3), byte-intact.
+	_, _, rel, tier, st := fx.t.GetRefTier(1, keys[0])
+	if st != protocol.StatusOK {
+		t.Fatalf("pinned block unreadable after strand-abort: %s", st)
+	}
+	if tier != "nvme" {
+		t.Fatalf("pinned block served from %q, want local nvme after abort", tier)
+	}
+	rel()
+	// The stranded flip must not have leaked its tenant charge onto S3 for
+	// the pinned entry (any earlier-walked entry that legitimately flipped
+	// before the strand may have moved, so this only bounds the direction).
+	if got := fx.q.Usage(1, tenant.TierS3); got < preS3 {
+		t.Fatalf("S3 usage went backwards across a stranded flip: %d < %d", got, preS3)
+	}
 }
 
 // tripwireRestore panics on ANY backend call — the EXISTS guard's teeth.

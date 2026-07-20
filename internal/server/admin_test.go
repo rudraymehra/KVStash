@@ -39,10 +39,10 @@ func TestAdminLoopbackOnly(t *testing.T) {
 	}
 }
 
-// TestAdminAddRejectsPervesePinQuota: a pin_quota above the arena would
+// TestAdminAddRejectsPerversePinQuota: a pin_quota above the arena would
 // promise more pinnable bytes than exist (the per-ns override REPLACES the
 // global cap — an oversize one silently unbounds it); negatives are nonsense.
-func TestAdminAddRejectsPervesePinQuota(t *testing.T) {
+func TestAdminAddRejectsPerversePinQuota(t *testing.T) {
 	addr, reg, _ := adminUp(t)
 	h := sha256.Sum256([]byte("tok-x"))
 	for name, pin := range map[string]int64{
