@@ -563,8 +563,13 @@ Multi-tenancy is structural, not an ACL bolted in front of a shared space:
 `namespace_id` rides in every frame header, every index key is
 `(namespace, key)`, and dedup never crosses the pair — the same 32-byte key
 committed by two tenants is two distinct blocks. The tenancy layer therefore
-has exactly two jobs: bind a connection to its namespace at HELLO, and decide
-how many bytes each tenant may hold per tier.
+has exactly two jobs: bind a connection to its namespace at HELLO, and
+account how many bytes each tenant holds per tier. Of the three tier quotas,
+only `quota_dram` is ENFORCED (PUT admission below); `quota_nvme` and
+`quota_s3` are REPORTING/ADVISORY at v0.2 — usage and limits surface in
+stats, metrics, and the admin listing, but demotion and spill move bytes
+uncapped and nothing corrects an overage (the enforcement design is ledgered
+in IMPROVEMENTS.md with its trigger).
 
 **Hashed tokens, constant-time auth.** The registry (`namespaces.yaml`)
 retains SHA-256 digests, never plaintext: `token_sha256` is the preferred
@@ -590,9 +595,11 @@ lost publish race, demotion's dual-residency collapse and endurance-gate
 deletion on the DRAM side; the delete verb, segment-reclaim retire, and the
 corrupt-entry self-heal on the NVMe side. Tier MOVES use `Transfer`, which
 never fails — refusing a demotion for destination-tier quota would wedge the
-memory ladder; the evictor's over-quota-first pass corrects the destination
-on its next cycle. Recovery uses `Seed`, an unchecked charge: a restart must
-not mint free NVMe bytes, and refusing recovery over quota would lose data.
+memory ladder. That is exactly why the NVMe/S3 limits stay reporting-only:
+bytes land on the destination uncapped, and the evictor's over-quota-first
+pass runs on DRAM alone, so nothing corrects a cold-tier overage. Recovery
+uses `Seed`, an unchecked charge: a restart must not mint free NVMe bytes,
+and refusing recovery over quota would lose data.
 A double-refund clamps at zero in release builds and panics under
 `kvbdebug`. Refunds are **tier-exact**: a retire-flipped entry's charge
 lives on S3, not NVMe (next section), and removing it refunds the S3 side —
@@ -677,9 +684,11 @@ the index entry survives (its location now addresses the object), the
 tenant charge moves NVMe→S3 (`Transfer` under the entry's shard lock, so a
 racing DELETE either removes the entry first or observes the flip and
 refunds the right tier), and cold reads route through the restorer.
-Protections hold through the flip exactly as through a delete: leased or
-pinned entries abort the retire, and a hard-pinned block never becomes
-s3-only (PIN_HARD means DRAM residency, promoted synchronously).
+Protections hold through the flip exactly as through a delete, and by the
+same mechanism: the flip's shard-locked walk IS the authoritative gate (not
+a pre-check it could race) — a lease or pin observed there aborts the whole
+retire, and a hard-pinned block never becomes s3-only (PIN_HARD means DRAM
+residency, promoted synchronously).
 
 **Cold reads: one ranged GET, verified before a byte escapes.** A GET whose
 segment is retired-but-spilled issues a single ranged GetObject for exactly
@@ -689,9 +698,11 @@ byte-identical segment file, so file offsets transfer 1:1. The bytes are
 xxh3-verified against the index entry BEFORE anything escapes to the wire; a
 mismatch counts a checksum error and answers a miss, and a slow S3 hits the
 `s3_read_timeout_ms` deadline (default 2 s) as a per-key outcome — never a
-frame stall. Promotion works from cold too: the 2nd-hit promote and
-PIN_HARD's synchronous promote read through the same verified path, so an
-s3-resident block a GET can serve is never refused a pin. Whole-segment
+frame stall. PIN_HARD's synchronous promote reads through the same verified
+path, so an s3-resident block a GET can serve is never refused a pin. The
+2nd-hit promotion TRIGGER, though, is warm-tier only — cold ranged GETs do
+not feed it (repeatedly-hot cold blocks are the lazy whole-segment restore's
+case, ledgered in IMPROVEMENTS.md). Whole-segment
 restore is singleflight per segment (two concurrent cold misses trigger
 exactly one 256 MB download). **BATCH_EXISTS never touches S3** — both
 indexes are node-local map lookups, the same contract the NVMe spy test

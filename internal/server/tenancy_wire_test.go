@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kvstash/kvblockd/internal/config"
+	"github.com/kvstash/kvblockd/internal/protocol"
 	"github.com/kvstash/kvblockd/internal/server"
 	"github.com/kvstash/kvblockd/internal/store/dram"
 	"github.com/kvstash/kvblockd/internal/tenant"
@@ -130,6 +132,56 @@ func TestCrossTenantIsolationNoExistenceOracle(t *testing.T) {
 	// And A's block is untouched by B's force-delete attempt.
 	if n, _, err := ca.BatchExists(ctx, [][32]byte{onlyA}); err != nil || n != 1 {
 		t.Fatalf("A's block damaged by B's delete: n=%d err=%v", n, err)
+	}
+}
+
+// TestStatsPinnedBytesScopedToCaller: the wire STATS document's pinned_bytes
+// map is keyed by namespace id — before the scoping fix any bearer token
+// read EVERY tenant's pin pressure (which namespaces exist and how hard they
+// pin). Each tenant must see exactly its own entry; the fleet view stays on
+// the shell-trust surfaces (admin API, scrape).
+func TestStatsPinnedBytesScopedToCaller(t *testing.T) {
+	addr := twoTenantServer(t, 0)
+	ca := dialAs(t, addr, "a", "tok-a")
+	cb := dialAs(t, addr, "b", "tok-b")
+	ctx := context.Background()
+
+	blob := bytes.Repeat([]byte{0x42}, 4096)
+	if err := ca.Put(ctx, tkey(0xA1), blob); err != nil {
+		t.Fatal(err)
+	}
+	if err := cb.Put(ctx, tkey(0xB1), blob); err != nil {
+		t.Fatal(err)
+	}
+	if per, err := ca.Pin(ctx, [][32]byte{tkey(0xA1)}, protocol.PinHard); err != nil || per[0] != protocol.StatusOK {
+		t.Fatalf("A pin: %v %v", per, err)
+	}
+	if per, err := cb.Pin(ctx, [][32]byte{tkey(0xB1)}, protocol.PinHard); err != nil || per[0] != protocol.StatusOK {
+		t.Fatalf("B pin: %v %v", per, err)
+	}
+
+	pinned := func(c *client.Client) map[string]int64 {
+		t.Helper()
+		raw, err := c.Stats(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc struct {
+			Pinned map[string]int64 `json:"pinned_bytes"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatalf("stats decode: %v (%s)", err, raw)
+		}
+		return doc.Pinned
+	}
+
+	pa := pinned(ca)
+	if len(pa) != 1 || pa["1"] != 4096 {
+		t.Fatalf("tenant A's STATS pinned_bytes = %v, want exactly {\"1\":4096}", pa)
+	}
+	pb := pinned(cb)
+	if len(pb) != 1 || pb["2"] != 4096 {
+		t.Fatalf("tenant B's STATS pinned_bytes = %v, want exactly {\"2\":4096} — foreign namespaces leaked", pb)
 	}
 }
 

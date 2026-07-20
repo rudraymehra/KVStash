@@ -96,9 +96,21 @@ func (idx *nvmeIndex) contains(k dram.Key) bool { return idx.get(k) != nil }
 // put inserts or overwrites (a re-demotion after promotion refreshes the
 // Loc — later write wins, matching recovery's later-segID-wins rule).
 func (idx *nvmeIndex) put(k dram.Key, ref *nvmeRef) {
+	idx.putThen(k, ref, nil)
+}
+
+// putThen inserts ref and runs fn (when non-nil) under the SAME shard write
+// hold. The demotion publish charges the tenant ledger through fn: a racing
+// deleteIf serializes behind the hold, so it can only refund a charge that
+// already landed — the charge and the entry become visible atomically. fn
+// must be cheap and must not touch this index.
+func (idx *nvmeIndex) putThen(k dram.Key, ref *nvmeRef, fn func()) {
 	s := idx.shardFor(k)
 	s.mu.Lock()
 	s.m[k] = ref
+	if fn != nil {
+		fn()
+	}
 	s.mu.Unlock()
 }
 

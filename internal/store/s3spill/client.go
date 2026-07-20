@@ -65,10 +65,11 @@ func NewClient(ctx context.Context, cfg Config) (S3API, error) {
 			o.BaseEndpoint = &cfg.EndpointOverride
 		}
 		o.UsePathStyle = cfg.PathStyle
-		// Segment bodies stream (unseekable): the SDK's default flexible
-		// checksums need TLS trailing sums there and break plain-HTTP
-		// MinIO/gofakes3 targets. When-required keeps integrity via ETag +
-		// the segment's own footer xxh3s.
+		// The SDK's default flexible checksums emit trailing sums that break
+		// plain-HTTP MinIO/gofakes3 targets (segment bodies are seekable now
+		// — the ReadSeekCloser seam exists for SigV4 — but the trailing-sum
+		// incompatibility is transport-shaped, not body-shaped). When-
+		// required keeps integrity via ETag + the segment's own footer xxh3s.
 		o.RequestChecksumCalculation = awsv2.RequestChecksumCalculationWhenRequired
 	}), nil
 }

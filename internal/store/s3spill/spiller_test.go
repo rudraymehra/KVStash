@@ -99,6 +99,30 @@ func TestSpillUploadNamingAndRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSpillPutFailureCountsAndAnswersFalse: a failed upload (here: the
+// bucket does not exist) must bump put_errors and answer the completion
+// hook false — the segment stays local-only and the caller retries next
+// pass; a silent drop would strand the segment off both ledgers.
+func TestSpillPutFailureCountsAndAnswersFalse(t *testing.T) {
+	api := fakeS3(t, "kvb-test") // fixture bucket exists; we aim elsewhere
+	sp := NewSpiller(api, Config{Bucket: "no-such-bucket", NodeID: "n", OpTimeout: 5 * time.Second}, 2)
+	defer sp.Close()
+
+	done := make(chan bool, 1)
+	ok := sp.DemoteSegment(1, 1024,
+		func() (io.ReadSeekCloser, error) { return nopSeekCloser{bytes.NewReader(segBody(1024, 7))}, nil },
+		func(_ uint64, up bool) { done <- up })
+	if !ok {
+		t.Fatal("enqueue refused on an empty queue")
+	}
+	if up := <-done; up {
+		t.Fatal("upload into a missing bucket reported success")
+	}
+	if _, _, putErrs := sp.Stats(); putErrs != 1 {
+		t.Fatalf("put_errors = %d, want 1", putErrs)
+	}
+}
+
 // slowAPI wraps an S3API making PutObject block until released — the
 // never-blocks-foreground proof.
 type slowAPI struct {

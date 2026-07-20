@@ -63,6 +63,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// The registry is arena-ignorant, so the pin_quota ceiling check runs
+	// here where both meet — an override above the arena would silently
+	// unbound the pin cap (config.Validate bounds pinned_bytes_cap the same
+	// way; the admin add path enforces it at runtime).
+	if err := ns.Registry().ValidatePinQuotas(cfg.DramArenaBytes); err != nil {
+		return fmt.Errorf("namespaces: %w", err)
+	}
 	// One accountant instance spans both tiers — dram charges/refunds its
 	// side, the tiered orchestrator transfers/refunds the NVMe side.
 	quotas := tenant.NewQuotas(ns.Registry())
@@ -211,7 +218,7 @@ func run() error {
 
 	// Admin surface (loopback-enforced): namespace add / quota set / list.
 	if cfg.AdminAddr != "" {
-		admin := server.NewAdminServer(ns.Registry(), quotas)
+		admin := server.NewAdminServer(ns.Registry(), quotas, cfg.DramArenaBytes)
 		aBound, aWait, aErr := admin.Serve(ctx, cfg.AdminAddr)
 		if aErr != nil {
 			stopTier()

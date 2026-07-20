@@ -21,8 +21,16 @@ var ErrQuota = fmt.Errorf("tenant: tier quota exceeded")
 // block per racer, and Refund on EVERY exit path (abort, failed commit,
 // delete, evict, reclaim) is what keeps the counter honest. Tier MOVES
 // (demote, spill) use Transfer, which never fails: refusing a demotion for
-// destination-quota would wedge the memory ladder — instead the evictor's
-// over-quota-first pass corrects the destination tier on its next cycle.
+// destination-quota would wedge the memory ladder. Only the DRAM quota is
+// actively enforced (Charge at publish; the evictor's over-quota-first pass
+// runs on DRAM alone) — the NVMe and S3 limits are REPORTING/ADVISORY at
+// v0.2: Transfer and Seed land bytes there unchecked and nothing corrects an
+// overage (ledgered in docs/IMPROVEMENTS.md with its trigger).
+//
+// LOCK ORDER: q.mu and the registry's reg.mu are LEAVES — never held across
+// each other (or across any store lock). domain/Reload snapshot the registry
+// through QuotaSnapshot BEFORE touching q.mu; reg.Each callers must not call
+// back into this accountant while the registry lock is held.
 type Quotas struct {
 	mu  sync.RWMutex
 	reg *Registry
@@ -30,8 +38,11 @@ type Quotas struct {
 }
 
 type nsUsage struct {
-	used  [tierCount]atomic.Int64
-	limit [tierCount]int64 // 0 = unlimited; snapshot at first touch, refreshed by SetQuota via Reload
+	used [tierCount]atomic.Int64
+	// limit: 0 = unlimited; snapshot at first touch, refreshed by SetQuota
+	// via Reload. Atomic — Reload's stores race Charge/WouldExceed's bare
+	// reads (no q.mu on the hot path).
+	limit [tierCount]atomic.Int64
 }
 
 // NewQuotas builds the accountant over a registry. Namespaces added to the
@@ -47,31 +58,48 @@ func (q *Quotas) domain(ns uint32) *nsUsage {
 	if ok {
 		return u
 	}
+	// Registry snapshot BEFORE q.mu (the leaf rule): holding q.mu into a
+	// registry read once cycled against reg.Each→Usage and wedged both
+	// planes. QuotaSnapshot also copies under reg.mu, so the limits never
+	// race SetQuota's locked write.
+	var limits [tierCount]int64
+	if q.reg != nil {
+		if l, found := q.reg.QuotaSnapshot(ns); found {
+			limits = l
+		}
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if u, ok = q.by[ns]; ok {
 		return u
 	}
 	u = &nsUsage{}
-	if q.reg != nil {
-		if n, found := q.reg.Lookup(ns); found {
-			u.limit = n.Quota
-		}
+	for t := range limits {
+		u.limit[t].Store(limits[t])
 	}
 	q.by[ns] = u
 	return u
 }
 
-// Reload re-snapshots limits from the registry (admin SetQuota path).
+// Reload re-snapshots limits from the registry (admin SetQuota path). The
+// map snapshot releases q.mu before any registry read (the leaf rule);
+// nsUsage pointers are stable once published, so the limit stores need no
+// lock of their own.
 func (q *Quotas) Reload() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+	if q.reg == nil {
+		return
+	}
+	q.mu.RLock()
+	snap := make(map[uint32]*nsUsage, len(q.by))
 	for ns, u := range q.by {
-		if q.reg == nil {
-			continue
-		}
-		if n, found := q.reg.Lookup(ns); found {
-			u.limit = n.Quota
+		snap[ns] = u
+	}
+	q.mu.RUnlock()
+	for ns, u := range snap {
+		if l, found := q.reg.QuotaSnapshot(ns); found {
+			for t := range l {
+				u.limit[t].Store(l[t])
+			}
 		}
 	}
 }
@@ -86,8 +114,8 @@ func (q *Quotas) Charge(ns uint32, tier Tier, n int64) error {
 		return nil
 	}
 	u := q.domain(ns)
-	limit := u.limit[tier]
-	if limit <= 0 { // unlimited
+	limit := u.limit[tier].Load() // one snapshot for the whole loop — a mid-loop Reload must not tear the check
+	if limit <= 0 {               // unlimited
 		u.used[tier].Add(n)
 		return nil
 	}
@@ -111,16 +139,20 @@ func (q *Quotas) Refund(ns uint32, tier Tier, n int64) {
 		return
 	}
 	u := q.domain(ns)
-	if now := u.used[tier].Add(-n); now < 0 {
-		quotaUnderflow(ns, tier, now)
+	if bal := u.used[tier].Add(-n); bal < 0 {
+		quotaUnderflow(ns, tier, bal)
 		// Heal: never leave a negative balance to silently widen the quota.
-		u.used[tier].Add(-now)
+		// CAS, not Add — two racing underflow heals stacking their adds once
+		// minted a positive phantom balance; a failed CAS means another op
+		// moved the counter and its own heal (or a later one) resolves it.
+		u.used[tier].CompareAndSwap(bal, 0)
 	}
 }
 
 // Seed charges n bytes UNCHECKED (recovery re-seeding a restarted process's
-// ledger — refusing recovery over quota would lose data; the evictor's
-// over-quota-first pass corrects an over-seeded tenant on its first cycle).
+// ledger — refusing recovery over quota would lose data). A tenant seeded
+// over its NVMe limit stays over: that tier's quota is reporting-only (see
+// the type comment).
 func (q *Quotas) Seed(ns uint32, tier Tier, n int64) {
 	if n <= 0 || tier < 0 || tier >= tierCount {
 		return
@@ -128,8 +160,10 @@ func (q *Quotas) Seed(ns uint32, tier Tier, n int64) {
 	q.domain(ns).used[tier].Add(n)
 }
 
-// Transfer moves n bytes from one tier to another (demote DRAM→NVMe, spill
-// NVMe→S3, promote back). It NEVER fails — see the type comment.
+// Transfer moves n bytes from one tier to another (demote DRAM→NVMe, the
+// retire-flip NVMe→S3; promotion is NOT a transfer — the block goes
+// dual-resident and each tier keeps its own charge). It NEVER fails — see
+// the type comment.
 func (q *Quotas) Transfer(ns uint32, from, to Tier, n int64) {
 	if n <= 0 {
 		return
@@ -150,7 +184,7 @@ func (q *Quotas) WouldExceed(ns uint32, tier Tier, n int64) bool {
 		return false
 	}
 	u := q.domain(ns)
-	limit := u.limit[tier]
+	limit := u.limit[tier].Load()
 	return limit > 0 && u.used[tier].Load()+n > limit
 }
 
@@ -167,14 +201,14 @@ func (q *Quotas) Limit(ns uint32, tier Tier) int64 {
 	if tier < 0 || tier >= tierCount {
 		return 0
 	}
-	return q.domain(ns).limit[tier]
+	return q.domain(ns).limit[tier].Load()
 }
 
 // OverRatio reports usage/quota as thousandths (0 when unlimited) — the
 // evictor's over-quota-first ordering key, integer to stay allocation-free.
 func (q *Quotas) OverRatio(ns uint32, tier Tier) int64 {
 	u := q.domain(ns)
-	limit := u.limit[tier]
+	limit := u.limit[tier].Load()
 	if limit <= 0 {
 		return 0
 	}

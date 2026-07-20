@@ -361,6 +361,14 @@ func (c Config) Validate() error {
 	if c.S3Bucket != "" {
 		check(len(c.NvmePaths) > 0,
 			"s3_bucket set but nvme_paths empty — the cold tier spills SEALED NVMe segments")
+		// Segment object keys are (node, segment-id) with NO volume dimension,
+		// and every volume numbers its segments from 0 — two volumes spilling
+		// to one bucket overwrite each other's objects, and the retire-flipped
+		// survivors then fail their checksums forever. Volume-scoped keys are
+		// the ledgered follow-up (docs/IMPROVEMENTS.md); until then the pair
+		// is refused outright rather than corrupting quietly.
+		check(len(c.NvmePaths) <= 1,
+			"s3_bucket set with %d nvme_paths — the cold tier supports a single volume (segment object keys carry no volume dimension; multi-volume spill would collide)", len(c.NvmePaths))
 		check(c.S3NodeID != "",
 			"s3_bucket set but s3_node_id empty — object keys must be node-namespaced")
 	}

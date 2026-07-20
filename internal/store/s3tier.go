@@ -61,16 +61,21 @@ func (t *Tiered) spillPass() {
 					if !up {
 						return // still local-only; next tick retries
 					}
-					vol.MarkSpilled(si.ID)
-					// Flip index refs: the block's bytes now ALSO live on
-					// S3. Reads stay local until reclaim removes the
-					// segment; the flag is what reclaim's flip consults.
+					// Flag the index refs BEFORE the spilled marker: the
+					// block's bytes now ALSO live on S3 (reads stay local
+					// until reclaim retires the segment). Reclaim reads
+					// IsSpilled as "every ref of this segment carries the
+					// S3 flag" — marking first opened a window where the
+					// retire-flip saw bare refs and stranded them as ghosts
+					// (indexed, unreadable forever). MarkSpilled's volume
+					// lock publishes the flag stores to IsSpilled readers.
 					vol.SegmentEntryKeys(si.ID, func(ns uint32, key [32]byte, _, _ uint32) {
 						if ref := t.idx.get(dram.Key{NS: ns, Hash: key}); ref != nil &&
 							ref.Loc.SegmentID == si.ID {
 							ref.S3.Store(true)
 						}
 					})
+					vol.MarkSpilled(si.ID)
 				})
 			if !ok {
 				t.spillInflight.Delete(si.ID)
@@ -81,7 +86,7 @@ func (t *Tiered) spillPass() {
 
 // readS3 serves one cold block from the segment object, verified before a
 // byte escapes. Heap buffer (no arena hold), wire-deadline context.
-func (t *Tiered) readS3(ref *nvmeRef, ns uint32, key [32]byte) (data []byte, release func(), ok bool) {
+func (t *Tiered) readS3(ref *nvmeRef) (data []byte, release func(), ok bool) {
 	if t.p.Restore == nil || !ref.S3.Load() {
 		return nil, nil, false
 	}
@@ -96,11 +101,12 @@ func (t *Tiered) readS3(ref *nvmeRef, ns uint32, key [32]byte) (data []byte, rel
 		return nil, nil, false
 	}
 	if xxh3.Hash(buf) != ref.XXH3 {
-		t.checksumErrs.Add(1)
+		// The cold tier's OWN counter: an operator chasing corruption must
+		// know whether to suspect the device or the object store — this once
+		// rode the NVMe counter and misattributed S3 rot to the local disk.
+		t.s3ChecksumErrs.Add(1)
 		return nil, nil, false // never serve unverified bytes
 	}
-	_ = ns
-	_ = key
 	t.s3Hits.Add(1)
 	return buf, func() {}, true
 }
@@ -117,22 +123,42 @@ func (t *Tiered) s3ReadDeadline() time.Duration {
 // OBJECT now), move the tenant charge NVMe→S3. Each flip runs under the
 // entry's shard lock so it linearizes against deleteNvme: a racing DELETE
 // either removes the entry first (no transfer — the refund stayed NVMe)
-// or observes S3Only and refunds the S3 side. Returns entries flipped.
-func (t *Tiered) s3FlipRetired(vol *nvme.Volume, id uint32) int {
-	flipped := 0
-	vol.SegmentEntryKeys(id, func(ns uint32, key [32]byte, _, length uint32) {
+// or observes S3Only and refunds the S3 side. The closure is also the
+// AUTHORITATIVE protection gate, the same discipline as the delete path:
+// a lease or pin landing after the advisory pre-gate strands the retire,
+// never the block (a hard-pinned block must not become s3-only). Charges
+// move ref.Len, not the footer entry's length — the index ref is the
+// accounting truth, and a same-segment older generation's footer length
+// would tear the charge/refund pairing.
+//
+// Returns the number of entries that BLOCK the retire: still homed in this
+// segment but unflippable — protected, or their S3 flag never landed (a
+// spill-ack ordering violation; belt over the flag-before-MarkSpilled
+// contract). The caller must RetireAbort when it is nonzero: finishing
+// would leave ghosts (indexed, unreadable forever). Entries that are gone,
+// moved, or already flipped never block, and flips already applied stay —
+// the flip is one-way and stays correct with the segment back live (reads
+// keep serving locally; a delete refunds the S3 side the charge moved to).
+func (t *Tiered) s3FlipRetired(vol *nvme.Volume, id uint32) (stranded int) {
+	vol.SegmentEntryKeys(id, func(ns uint32, key [32]byte, _, _ uint32) {
 		t.idx.withShardLock(dram.Key{NS: ns, Hash: key}, func(ref *nvmeRef) {
-			if ref == nil || ref.Loc.SegmentID != id || !ref.S3.Load() || ref.S3Only.Load() {
+			if ref == nil || ref.Loc.SegmentID != id || ref.S3Only.Load() {
+				return // gone, moved, or already flipped — never blocks
+			}
+			if stranded > 0 {
+				return // retire already doomed — move no more charges early
+			}
+			if !ref.S3.Load() || ref.leased(t.now()) || ref.pinned() {
+				stranded++
 				return
 			}
 			if t.p.Quotas != nil {
-				t.p.Quotas.Transfer(ns, tenant.TierNVMe, tenant.TierS3, int64(length))
+				t.p.Quotas.Transfer(ns, tenant.TierNVMe, tenant.TierS3, int64(ref.Len))
 			}
 			ref.S3Only.Store(true)
 			t.s3Blocks.Add(1)
-			t.s3Bytes.Add(int64(length))
-			flipped++
+			t.s3Bytes.Add(int64(ref.Len))
 		})
 	})
-	return flipped
+	return stranded
 }

@@ -137,14 +137,14 @@ func (l *lifecycle) Pin(ref *BlockRef, hard bool) protocol.Status {
 	wasHard := ref.PinFlags&pinHardBit != 0
 	switch {
 	case hard && !wasHard: // into hard: the quota gate
-		cap := l.pinnedCap
+		capBytes := l.pinnedCap
 		if l.pinCapFor != nil {
 			if o := l.pinCapFor(ref.NamespaceID); o > 0 {
-				cap = o // the namespace's own pin_quota overrides the global cap
+				capBytes = o // the namespace's own pin_quota overrides the global cap
 			}
 		}
 		l.mu.Lock()
-		if cap > 0 && l.pinned[ref.NamespaceID]+int64(ref.Len) > cap {
+		if capBytes > 0 && l.pinned[ref.NamespaceID]+int64(ref.Len) > capBytes {
 			l.mu.Unlock()
 			return protocol.StatusErrPinQuota
 		}

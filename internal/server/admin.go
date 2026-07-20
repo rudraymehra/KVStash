@@ -26,11 +26,16 @@ import (
 type AdminServer struct {
 	reg *tenant.Registry
 	q   *tenant.Quotas
+	// arenaBytes bounds pin_quota on namespace add (the same [0, arena]
+	// check the load path runs via Registry.ValidatePinQuotas); 0 = unknown
+	// arena, bound not enforced (test-only wiring).
+	arenaBytes int64
 }
 
-// NewAdminServer builds the admin surface (nil quotas = usage reads 0).
-func NewAdminServer(reg *tenant.Registry, q *tenant.Quotas) *AdminServer {
-	return &AdminServer{reg: reg, q: q}
+// NewAdminServer builds the admin surface (nil quotas = usage reads 0;
+// arenaBytes = dram_arena_bytes, the pin_quota ceiling).
+func NewAdminServer(reg *tenant.Registry, q *tenant.Quotas, arenaBytes int64) *AdminServer {
+	return &AdminServer{reg: reg, q: q, arenaBytes: arenaBytes}
 }
 
 // Serve binds addr (loopback enforced) and serves until ctx cancels.
@@ -87,6 +92,13 @@ func (a *AdminServer) handleAddNamespace(w http.ResponseWriter, r *http.Request)
 		Quota:    [3]int64{req.QuotaDRAM, req.QuotaNVMe, req.QuotaS3},
 		PinQuota: req.PinQuota,
 	}
+	// The same [0, arena] bound the load path enforces: an override above
+	// the arena would promise more pinnable bytes than exist.
+	if req.PinQuota < 0 || (a.arenaBytes > 0 && req.PinQuota > a.arenaBytes) {
+		http.Error(w, fmt.Sprintf("pin_quota %d must be in [0, dram_arena_bytes %d]",
+			req.PinQuota, a.arenaBytes), http.StatusBadRequest)
+		return
+	}
 	if err := decodeTokenHash(req.TokenSHA256, &ns.TokenHash); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -141,6 +153,10 @@ func (a *AdminServer) handleList(w http.ResponseWriter, _ *http.Request) {
 	}
 	var out []row
 	tiers := []tenant.Tier{tenant.TierDRAM, tenant.TierNVMe, tenant.TierS3}
+	// Registry snapshot first, accountant reads after Each returns: the
+	// registry lock and the accountant's are lock-graph LEAVES — q.Usage
+	// under reg.Each once deadlocked this listing against a concurrent
+	// quota-set (Reload holds the accountant lock and reads the registry).
 	a.reg.Each(func(ns *tenant.Namespace) {
 		r := row{
 			Name: ns.Name, ID: ns.ID, PinCap: ns.PinQuota,
@@ -148,12 +164,16 @@ func (a *AdminServer) handleList(w http.ResponseWriter, _ *http.Request) {
 		}
 		for _, t := range tiers {
 			r.Quota[t.String()] = ns.Quota[t]
-			if a.q != nil {
-				r.Usage[t.String()] = a.q.Usage(ns.ID, t)
-			}
 		}
 		out = append(out, r)
 	})
+	if a.q != nil {
+		for i := range out {
+			for _, t := range tiers {
+				out[i].Usage[t.String()] = a.q.Usage(out[i].ID, t)
+			}
+		}
+	}
 	writeJSON(w, out)
 }
 

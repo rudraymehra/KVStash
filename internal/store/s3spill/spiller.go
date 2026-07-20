@@ -81,8 +81,11 @@ func (sp *Spiller) Stats() (spilled, dropped, putErrors uint64) {
 	return sp.spilled.Load(), sp.dropped.Load(), sp.putErrors.Load()
 }
 
-// Close stops the worker after the queue drains (bounded by per-op
-// deadlines; in-flight uploads finish or time out).
+// Close ABORTS rather than drains: the cancel fails the in-flight upload's
+// S3 call (counted as a put error, answered onUp(false)), and every request
+// still queued is answered onUp(false) without an upload attempt. Nothing
+// is lost — the segments were local-only copies all along and the next
+// process's spill pass re-enqueues them.
 func (sp *Spiller) Close() {
 	sp.cancel()
 	sp.wg.Wait()

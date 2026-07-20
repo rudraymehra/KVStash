@@ -1,7 +1,9 @@
 package server
 
 import (
+	"encoding/json"
 	"net"
+	"strconv"
 
 	"github.com/kvstash/kvblockd/internal/protocol"
 	"github.com/kvstash/kvblockd/internal/transport"
@@ -319,7 +321,8 @@ func (s *session) handleDelete(c *transport.Conn, h protocol.Header, body []byte
 	s.writeResp(c, h, out)
 }
 
-// handleStats returns the store's JSON stats document (§3.8).
+// handleStats returns the store's JSON stats document (§3.8), scoped to the
+// authenticated namespace where the document carries per-tenant detail.
 func (s *session) handleStats(c *transport.Conn, h protocol.Header, body []byte) {
 	if _, err := protocol.DecodeStatsReq(body); err != nil {
 		s.consume(c, h, body)
@@ -327,8 +330,35 @@ func (s *session) handleStats(c *transport.Conn, h protocol.Header, body []byte)
 		return
 	}
 	s.consume(c, h, body)
-	doc := s.srv.store.Stats()
+	doc := scopeStatsToNS(s.srv.store.Stats(), s.ns)
 	out := protocol.AppendPreamble(make([]byte, 0, protocol.PreambleSize+len(doc)), protocol.StatusOK, uint32(len(doc))) //nolint:gosec // G115: stats doc is small
 	out = append(out, doc...)
 	s.writeResp(c, h, out)
+}
+
+// scopeStatsToNS strips other tenants' entries from the store's fleet-wide
+// stats document before it crosses the wire: pinned_bytes is keyed by
+// namespace id, and any bearer token reading every tenant's pin pressure is
+// a cross-tenant information leak. The admin API and the scrape keep the
+// fleet view — they sit behind the shell-trust boundary, not a token.
+func scopeStatsToNS(doc []byte, ns uint32) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(doc, &m); err != nil {
+		return doc // malformed docs pass through — §3.8 is best-effort JSON
+	}
+	pinned, ok := m["pinned_bytes"].(map[string]any)
+	if !ok {
+		return doc // no per-tenant detail (ramstub, error doc) — nothing to scope
+	}
+	own := strconv.FormatUint(uint64(ns), 10)
+	scoped := map[string]any{}
+	if v, ok := pinned[own]; ok {
+		scoped[own] = v
+	}
+	m["pinned_bytes"] = scoped
+	out, err := json.Marshal(m)
+	if err != nil {
+		return doc
+	}
+	return out
 }

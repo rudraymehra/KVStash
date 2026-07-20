@@ -104,6 +104,12 @@ func (t *Tiered) demoteOne(k dram.Key, size int64, now int64, wg *sync.WaitGroup
 	if !ok {
 		return 0 // gone (or zero-length) — drop
 	}
+	// Quota moves use the RESIDENT length, never the policy candidate's
+	// size: a delete+re-put during the queue delay leaves c.Size describing
+	// the OLD block, and refunding it would leak (or underflow) the ledger.
+	// CompleteDemotion's identity gate (xxh3) guarantees the block it
+	// removes is the one these bytes measure.
+	resident := int64(len(data))
 
 	// Dual residency: the bytes are ALREADY on NVMe (demoted before,
 	// promoted back, cold again). Never rewrite them — complete the move.
@@ -118,7 +124,7 @@ func (t *Tiered) demoteOne(k dram.Key, size int64, now int64, wg *sync.WaitGroup
 			// Dual-residency collapse: the DRAM copy is gone, the NVMe
 			// charge already exists from the first demotion — refund DRAM.
 			if t.p.Quotas != nil {
-				t.p.Quotas.Refund(k.NS, tenant.TierDRAM, size)
+				t.p.Quotas.Refund(k.NS, tenant.TierDRAM, resident)
 			}
 			return size
 		}
@@ -137,7 +143,7 @@ func (t *Tiered) demoteOne(k dram.Key, size int64, now int64, wg *sync.WaitGroup
 			// silent variant of this branch once ate a 20 GiB rig fill.
 			t.admitRefusals.Add(1)
 			if t.p.Quotas != nil {
-				t.p.Quotas.Refund(k.NS, tenant.TierDRAM, size)
+				t.p.Quotas.Refund(k.NS, tenant.TierDRAM, resident)
 			}
 			return size
 		}
@@ -163,7 +169,21 @@ func (t *Tiered) demoteOne(k dram.Key, size int64, now int64, wg *sync.WaitGroup
 			published := t.d.CompleteDemotion(k.NS, k.Hash, sum, func(ref *dram.BlockRef) {
 				nr := &nvmeRef{Loc: loc, Len: loc.Len, XXH3: sum}
 				nr.TTLUntil.Store(ref.TTLUntil.Load())
-				t.idx.put(k, nr) // nvme shard lock UNDER the dram shard lock — the documented order
+				// Publish + tier MOVE under ONE nvme shard hold (itself under
+				// the dram shard lock — the documented order): a DELETE
+				// landing right after the publish refunds through deleteIf on
+				// the same shard, so the charge it refunds has already
+				// landed. Transferring after CompleteDemotion returned once
+				// let that DELETE refund an uncharged balance (kvbdebug
+				// panic) and the late Transfer minted a phantom NVMe charge.
+				// Transfer never fails — refusing a demotion for destination
+				// quota would wedge the memory ladder (the NVMe limit is
+				// reporting-only; see tenant.Quotas).
+				t.idx.putThen(k, nr, func() {
+					if t.p.Quotas != nil {
+						t.p.Quotas.Transfer(k.NS, tenant.TierDRAM, tenant.TierNVMe, int64(loc.Len))
+					}
+				})
 			})
 			if !published {
 				// The block proved itself hot mid-queue (leased/held) or was
@@ -174,13 +194,6 @@ func (t *Tiered) demoteOne(k dram.Key, size int64, now int64, wg *sync.WaitGroup
 				return
 			}
 			t.demotions.Add(1)
-			// The tier MOVE: NVMe gains the bytes, DRAM refunds. Transfer
-			// never fails — refusing a demotion for destination quota would
-			// wedge the memory ladder; the evictor's over-quota-first pass
-			// corrects the destination on its next cycle.
-			if t.p.Quotas != nil {
-				t.p.Quotas.Transfer(k.NS, tenant.TierDRAM, tenant.TierNVMe, size)
-			}
 		},
 	})
 	if !accepted {
@@ -222,7 +235,7 @@ func (t *Tiered) promoteSync(k dram.Key, e *nvmeRef) protocol.Status {
 		// survive" = DRAM residency) must work from the cold tier too — a
 		// GET serves this block, so a pin refusing NOT_FOUND would be a lie.
 		// readS3 verifies before a byte escapes and hands us a heap buffer.
-		data, crel, ok := t.readS3(e, k.NS, k.Hash)
+		data, crel, ok := t.readS3(e)
 		if !ok {
 			return protocol.StatusNotFound
 		}
@@ -297,24 +310,16 @@ func (t *Tiered) reclaimSegment(vol *nvme.Volume) bool {
 		// retiring the local file loses nothing — entries stay in the index
 		// (Loc now addresses the object), the tenant charge moves
 		// NVMe→S3, and cold reads route through the restorer. Protection
-		// still holds: leased/pinned entries abort the retire exactly as
-		// the delete path does (a hard-pinned block never becomes s3-only).
-		for i := range entries {
-			k := dram.Key{NS: entries[i].NS, Hash: entries[i].Key}
-			protected := false
-			t.idx.withShardLock(k, func(e *nvmeRef) {
-				if e == nil || e.Loc.SegmentID != id {
-					return
-				}
-				protected = e.leased(t.now()) || e.pinned()
-			})
-			if protected {
-				vol.RetireAbort(id)
-				t.reclaimSkips.Add(1)
-				return false
-			}
+		// holds INSIDE the flip's shard-locked walk — the authoritative
+		// gate, exactly like the delete path's — so a lease or pin landing
+		// mid-retire strands the retire (abort; reads resume locally, flips
+		// already applied stay correct) and a hard-pinned block never
+		// becomes s3-only.
+		if t.s3FlipRetired(vol, id) > 0 {
+			vol.RetireAbort(id)
+			t.reclaimSkips.Add(1)
+			return false
 		}
-		t.s3FlipRetired(vol, id)
 	} else {
 		for i := range entries {
 			k := dram.Key{NS: entries[i].NS, Hash: entries[i].Key}

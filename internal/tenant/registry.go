@@ -56,6 +56,11 @@ type Namespace struct {
 // Registry is the immutable-after-load namespace table plus the small
 // mutation surface the admin socket uses. Reads are lock-free-ish (RLock);
 // Authenticate scans by name with constant-time hash compares.
+//
+// LOCK ORDER: r.mu is a LEAF, and so is the accountant's (Quotas) — never
+// hold one across the other. In particular an Each callback must not call
+// into Quotas: Each holds r.mu.R, and Quotas.Reload holds its own lock while
+// reading this registry — the inversion is a three-party deadlock.
 type Registry struct {
 	mu     sync.RWMutex
 	byName map[string]*Namespace
@@ -187,6 +192,40 @@ func (r *Registry) Lookup(id uint32) (*Namespace, bool) {
 	defer r.mu.RUnlock()
 	ns, ok := r.byID[id]
 	return ns, ok
+}
+
+// QuotaSnapshot copies the namespace's quota triple under the registry lock —
+// the accountant reads limits through this, never via a bare ns.Quota read
+// racing SetQuota's locked write. LOCK ORDER: r.mu is a LEAF — the caller
+// must not hold the accountant's q.mu here (the reg↔quotas inversion once
+// deadlocked the scrape/admin planes).
+func (r *Registry) QuotaSnapshot(id uint32) ([tierCount]int64, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if ns, ok := r.byID[id]; ok {
+		return ns.Quota, true
+	}
+	return [tierCount]int64{}, false
+}
+
+// ValidatePinQuotas rejects any namespace whose pin_quota override exceeds
+// maxBytes (the DRAM arena) or is negative — an override above the arena
+// would promise more pinnable bytes than exist, silently unbounding the cap.
+// The registry itself is arena-ignorant, so the daemon calls this with its
+// config after load; the admin add path enforces the same bound.
+func (r *Registry) ValidatePinQuotas(maxBytes int64) error {
+	if maxBytes <= 0 {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, ns := range r.byID {
+		if ns.PinQuota < 0 || ns.PinQuota > maxBytes {
+			return fmt.Errorf("namespace %q: pin_quota %d must be in [0, dram_arena_bytes %d]",
+				ns.Name, ns.PinQuota, maxBytes)
+		}
+	}
+	return nil
 }
 
 // PinQuotaFor returns the namespace's own pinned-bytes cap (0 = none set —

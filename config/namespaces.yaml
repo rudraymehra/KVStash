@@ -13,11 +13,15 @@ namespaces:
   - { name: demo, id: 1, token: "demo-token" }
   # Production entries: prefer token_sha256 (the file then carries no
   # credential — `echo -n SECRET | shasum -a 256`); per-tier byte quotas
-  # (0/absent = unlimited) and a pinned-bytes quota:
+  # (0/absent = unlimited) and a pinned-bytes quota. Only quota_dram is
+  # ENFORCED (PUT admission); quota_nvme and quota_s3 are reporting-only at
+  # v0.2 — usage and limits surface in stats/metrics/admin, but demotion and
+  # spill move bytes uncapped (enforcement is ledgered in IMPROVEMENTS.md).
+  # pin_quota must not exceed dram_arena_bytes (refused at startup).
   # - name: team-a
   #   id: 2
   #   token_sha256: "64-hex-chars"
-  #   quota_dram:  8589934592     # 8 GiB
-  #   quota_nvme:  68719476736    # 64 GiB
-  #   quota_s3:    549755813888   # 512 GiB
-  #   pin_quota:   1073741824     # 1 GiB
+  #   quota_dram:  8589934592     # 8 GiB — enforced
+  #   quota_nvme:  68719476736    # 64 GiB — reporting-only (v0.2)
+  #   quota_s3:    549755813888   # 512 GiB — reporting-only (v0.2)
+  #   pin_quota:   1073741824     # 1 GiB (≤ dram_arena_bytes)

@@ -15,11 +15,14 @@ import (
 	"github.com/kvstash/kvblockd/internal/tenant"
 )
 
+// adminArenaBytes stands in for dram_arena_bytes (the pin_quota ceiling).
+const adminArenaBytes = 1 << 20
+
 func adminUp(t *testing.T) (string, *tenant.Registry, *tenant.Quotas) {
 	t.Helper()
 	reg := tenant.NewRegistry("a", 1, "tok-a")
 	q := tenant.NewQuotas(reg)
-	a := NewAdminServer(reg, q)
+	a := NewAdminServer(reg, q, adminArenaBytes)
 	ctx, cancel := context.WithCancel(context.Background())
 	addr, wait, err := a.Serve(ctx, "127.0.0.1:0")
 	if err != nil {
@@ -30,9 +33,38 @@ func adminUp(t *testing.T) (string, *tenant.Registry, *tenant.Quotas) {
 }
 
 func TestAdminLoopbackOnly(t *testing.T) {
-	a := NewAdminServer(tenant.NewRegistry("a", 1, "t"), nil)
+	a := NewAdminServer(tenant.NewRegistry("a", 1, "t"), nil, adminArenaBytes)
 	if _, _, err := a.Serve(context.Background(), "0.0.0.0:0"); err == nil {
 		t.Fatal("non-loopback admin bind accepted")
+	}
+}
+
+// TestAdminAddRejectsPervesePinQuota: a pin_quota above the arena would
+// promise more pinnable bytes than exist (the per-ns override REPLACES the
+// global cap — an oversize one silently unbounds it); negatives are nonsense.
+func TestAdminAddRejectsPervesePinQuota(t *testing.T) {
+	addr, reg, _ := adminUp(t)
+	h := sha256.Sum256([]byte("tok-x"))
+	for name, pin := range map[string]int64{
+		"over-arena": adminArenaBytes + 1,
+		"negative":   -1,
+	} {
+		body, _ := json.Marshal(map[string]any{
+			"name": name, "id": 9, "token_sha256": hex.EncodeToString(h[:]),
+			"pin_quota": pin,
+		})
+		resp, err := http.Post(fmt.Sprintf("http://%s/v1/namespace", addr), "application/json", bytes.NewReader(body)) //nolint:noctx // test-local
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s pin_quota accepted: %d", name, resp.StatusCode)
+		}
+		if _, ok := reg.Lookup(9); ok {
+			t.Fatalf("%s: namespace landed in the registry despite the reject", name)
+		}
 	}
 }
 

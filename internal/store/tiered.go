@@ -73,8 +73,14 @@ func (p Params) withDefaults() Params {
 // today's behavior).
 //
 // LOCK ORDER (extends dram's): dram shard lock → nvme index shard lock →
-// (allocMu | policy | volume internals) — never inverted. GETs take only
-// shard RLocks and the volume's segment read-hold.
+// (allocMu | policy | volume internals | tenant accountant) — never
+// inverted. GETs take only shard RLocks and the volume's segment read-hold.
+// The tenant locks are LEAVES below everything here AND below each other:
+// the accountant's q.mu and the registry's reg.mu are never held across one
+// another (Quotas snapshots the registry via QuotaSnapshot before locking
+// itself; reg.Each callers never call back into the accountant) — the
+// reg↔quotas inversion once wedged the scrape, admin, and data planes in
+// one cycle.
 type Tiered struct {
 	d    *dram.Store
 	pol  eviction.Policy
@@ -95,21 +101,26 @@ type Tiered struct {
 	scCands  []eviction.Candidate
 	scSegs   []nvme.SegmentInfo
 
-	spillInflight sync.Map // segID → queued-or-uploading (spillPass vs onUp)
+	// spillInflight: segID → queued-or-uploading (spillPass vs onUp). Keyed
+	// by segment id ALONE — volume-blind, which is sound only because config
+	// validation refuses multi-volume + S3 (segment object keys carry no
+	// volume dimension either; both widen together, see IMPROVEMENTS.md).
+	spillInflight sync.Map
 
-	demotions     atomic.Uint64
-	demoteDrops   atomic.Uint64 // queue-full / write-failed / publish-gate-refused demotions
-	dedupSkips    atomic.Uint64 // dual-resident: bytes already on NVMe, append skipped
-	admitRefusals atomic.Uint64 // blocks under the min-hits endurance gate, DELETED instead of demoted
-	promotions    atomic.Uint64
-	s3Hits        atomic.Uint64 // cold ranged GETs served (verified)
-	s3ReadErrs    atomic.Uint64 // cold read failures (deadline, transport)
-	s3Blocks      atomic.Int64  // s3-resident (retire-flipped) blocks — Int64: removals decrement
-	s3Bytes       atomic.Int64
-	reclaims      atomic.Uint64
-	reclaimSkips  atomic.Uint64
-	readBusy      atomic.Uint64
-	checksumErrs  atomic.Uint64
+	demotions      atomic.Uint64
+	demoteDrops    atomic.Uint64 // queue-full / write-failed / publish-gate-refused demotions
+	dedupSkips     atomic.Uint64 // dual-resident: bytes already on NVMe, append skipped
+	admitRefusals  atomic.Uint64 // blocks under the min-hits endurance gate, DELETED instead of demoted
+	promotions     atomic.Uint64
+	s3Hits         atomic.Uint64 // cold ranged GETs served (verified)
+	s3ReadErrs     atomic.Uint64 // cold read failures (deadline, transport)
+	s3ChecksumErrs atomic.Uint64 // cold reads that failed verification (object rot — distinct from the device counter)
+	s3Blocks       atomic.Int64  // s3-resident (retire-flipped) blocks — Int64: removals decrement
+	s3Bytes        atomic.Int64
+	reclaims       atomic.Uint64
+	reclaimSkips   atomic.Uint64
+	readBusy       atomic.Uint64
+	checksumErrs   atomic.Uint64 // DEVICE reads that failed verification (nvme tier; s3 has its own)
 
 	recoveredBlocks int
 	recoverySecs    float64
@@ -224,7 +235,19 @@ func (t *Tiered) refundNvmeQuota(ns uint32, ref *nvmeRef) {
 }
 
 // CanStoreNS is the tenant-aware BEGIN probe, delegated to the write tier.
-func (t *Tiered) CanStoreNS(ns uint32, n uint32) bool { return t.d.CanStoreNS(ns, n) }
+// A refusal kicks the demoter exactly like CanStore's — BEGIN pressure is
+// pressure regardless of which probe the server asked through, and demotion
+// (not just eviction) is how this store makes room.
+func (t *Tiered) CanStoreNS(ns uint32, n uint32) bool {
+	ok := t.d.CanStoreNS(ns, n)
+	if !ok {
+		select {
+		case t.kick <- struct{}{}:
+		default:
+		}
+	}
+	return ok
+}
 
 // ExistsPrefix merges both indexes — pure map lookups, NO device I/O ever
 // (the spy test enforces it): the EXISTS p99 contract survives tiering.
@@ -296,8 +319,20 @@ func (t *Tiered) GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, 
 	case nvme.ReadGone:
 		// Segment retired locally. If a spilled copy exists this is the
 		// COLD path: one ranged GetObject, verified before a byte escapes.
-		if data, rel, ok := t.readS3(e, ns, key); ok {
-			extendNvmeLease(e, t.now()+int64(t.clampLeaseMS(0))*int64(time.Millisecond))
+		if data, rel, ok := t.readS3(e); ok {
+			// Same discipline as the warm path below: the §3.3 auto-lease
+			// lands under the shard lock with an identity re-check, so it
+			// orders against the delete gate and never mints a protection
+			// promise on a removed or replaced entry. No promotion probe —
+			// the cold tier feeds promotion only through lazy restore
+			// (ledgered in IMPROVEMENTS.md), never per ranged GET.
+			now := t.now()
+			t.idx.withShardLock(k, func(ref *nvmeRef) {
+				if ref != e {
+					return
+				}
+				extendNvmeLease(ref, now+int64(t.clampLeaseMS(0))*int64(time.Millisecond))
+			})
 			return data, e.XXH3, rel, "s3", protocol.StatusOK
 		}
 		// No S3 copy (or the cold read failed its deadline): a plain miss
@@ -557,14 +592,21 @@ func (t *Tiered) Stats() []byte {
 	if err := json.Unmarshal(t.d.Stats(), &doc); err != nil {
 		doc = map[string]any{"schema": 1, "store": "dram", "error": "dram stats decode failed"}
 	}
-	blocks, bytes := t.idx.stats()
 	// The index holds BOTH nvme-resident and retire-flipped (s3-only)
 	// entries; report each tier's own residency so the sub-documents sum to
-	// the index, matching the per-tenant quota ledger's tier split.
+	// the index, matching the per-tenant quota ledger's tier split. Read the
+	// s3 counters BEFORE walking the index (a flip landing in between
+	// otherwise oversubtracts) and clamp: a removal racing the walk can
+	// still skew one sample transiently, but never below zero.
 	s3Blocks, s3Bytes := t.s3Blocks.Load(), t.s3Bytes.Load()
+	blocks, bytes := t.idx.stats()
 	if s3Blocks > 0 {
-		blocks -= int(s3Blocks)
-		bytes -= s3Bytes
+		if blocks -= int(s3Blocks); blocks < 0 {
+			blocks = 0
+		}
+		if bytes -= s3Bytes; bytes < 0 {
+			bytes = 0
+		}
 	}
 	volStats := make(map[string]int64, 8)
 	for _, v := range t.vols {
@@ -607,6 +649,7 @@ func (t *Tiered) Stats() []byte {
 			"restores_total":         restores,
 			"hits_total":             t.s3Hits.Load(),
 			"read_errors_total":      t.s3ReadErrs.Load(),
+			"checksum_errors_total":  t.s3ChecksumErrs.Load(),
 		}
 	}
 	b, err := json.Marshal(doc)

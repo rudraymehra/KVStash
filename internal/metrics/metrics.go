@@ -222,6 +222,8 @@ var (
 		"Cold reads served after verification (a byte never escapes unverified).", nil, nil)
 	descS3ReadErrors = prometheus.NewDesc("kvb_s3_read_errors_total",
 		"Cold reads that failed (deadline or transport) and answered NOT_FOUND.", nil, nil)
+	descS3ChecksumErrs = prometheus.NewDesc("kvb_s3_checksum_errors_total",
+		"Cold reads that failed verification and answered NOT_FOUND (object-side rot — the device counter is kvb_nvme_checksum_errors_total).", nil, nil)
 )
 
 // storeCollector decodes the store's Stats() JSON at scrape time. A document
@@ -260,6 +262,7 @@ func (c *storeCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descS3Restores
 	ch <- descS3Hits
 	ch <- descS3ReadErrors
+	ch <- descS3ChecksumErrs
 }
 
 func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
@@ -296,15 +299,16 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 		} `json:"nvme"`
 		// Present only when the cold tier is configured.
 		S3 *struct {
-			Blocks     float64 `json:"blocks"`
-			Bytes      float64 `json:"bytes"`
-			Spilled    float64 `json:"spilled_segments_total"`
-			SpillDrops float64 `json:"spill_drops_total"`
-			PutErrors  float64 `json:"put_errors_total"`
-			RangedGets float64 `json:"ranged_gets_total"`
-			Restores   float64 `json:"restores_total"`
-			Hits       float64 `json:"hits_total"`
-			ReadErrors float64 `json:"read_errors_total"`
+			Blocks       float64 `json:"blocks"`
+			Bytes        float64 `json:"bytes"`
+			Spilled      float64 `json:"spilled_segments_total"`
+			SpillDrops   float64 `json:"spill_drops_total"`
+			PutErrors    float64 `json:"put_errors_total"`
+			RangedGets   float64 `json:"ranged_gets_total"`
+			Restores     float64 `json:"restores_total"`
+			Hits         float64 `json:"hits_total"`
+			ReadErrors   float64 `json:"read_errors_total"`
+			ChecksumErrs float64 `json:"checksum_errors_total"`
 		} `json:"s3"`
 	}
 	if err := json.Unmarshal(c.stats(), &doc); err != nil {
@@ -357,6 +361,7 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(descS3Restores, prometheus.CounterValue, s3.Restores)
 		ch <- prometheus.MustNewConstMetric(descS3Hits, prometheus.CounterValue, s3.Hits)
 		ch <- prometheus.MustNewConstMetric(descS3ReadErrors, prometheus.CounterValue, s3.ReadErrors)
+		ch <- prometheus.MustNewConstMetric(descS3ChecksumErrs, prometheus.CounterValue, s3.ChecksumErrs)
 	}
 }
 
@@ -443,13 +448,23 @@ func (v *tenantView) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (v *tenantView) Collect(ch chan<- prometheus.Metric) {
+	// Snapshot the registry FIRST, then read the accountant: reg.mu and the
+	// accountant's mutex are lock-graph LEAVES — calling q.* inside reg.Each
+	// (registry lock held) once cycled against Reload and deadlocked the
+	// scrape, admin, and data planes together.
+	type row struct {
+		id   uint32
+		name string
+	}
+	var rows []row
+	v.reg.Each(func(ns *tenant.Namespace) { rows = append(rows, row{ns.ID, ns.Name}) })
 	tiers := []tenant.Tier{tenant.TierDRAM, tenant.TierNVMe, tenant.TierS3}
-	v.reg.Each(func(ns *tenant.Namespace) {
+	for _, ns := range rows {
 		for _, t := range tiers {
 			ch <- prometheus.MustNewConstMetric(descTenantBytes, prometheus.GaugeValue,
-				float64(v.q.Usage(ns.ID, t)), ns.Name, t.String())
+				float64(v.q.Usage(ns.id, t)), ns.name, t.String())
 			ch <- prometheus.MustNewConstMetric(descTenantQuota, prometheus.GaugeValue,
-				float64(v.q.Limit(ns.ID, t)), ns.Name, t.String())
+				float64(v.q.Limit(ns.id, t)), ns.name, t.String())
 		}
-	})
+	}
 }

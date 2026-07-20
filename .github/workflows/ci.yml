@@ -88,6 +88,7 @@ jobs:
   # blocks as verified cold reads.
   crash-torture-s3:
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
@@ -98,12 +99,13 @@ jobs:
           cache: false
       # A plain docker-run step, not a service container: minio/minio needs
       # the `server /data` command and GH services cannot pass one (and the
-      # self-starting bitnami images left Docker Hub in 2025).
+      # self-starting bitnami images left Docker Hub in 2025). Tag pinned —
+      # `latest` made this job's S3 peer a moving target.
       - name: start minio
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=tortuser -e MINIO_ROOT_PASSWORD=tort-secret-ci \
-            minio/minio:latest server /data
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:9000/minio/health/ready >/dev/null && exit 0
             sleep 2

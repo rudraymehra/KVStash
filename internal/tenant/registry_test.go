@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -90,6 +91,28 @@ func TestEmptyRegistryAcceptsNoOne(t *testing.T) {
 	}
 	if _, ok := r.Authenticate("", nil); ok {
 		t.Fatal("empty registry authenticated an empty pair")
+	}
+}
+
+func TestValidatePinQuotas(t *testing.T) {
+	r, err := LoadRegistry(writeReg(t, `
+namespaces:
+  - { name: sane, id: 1, token: t, pin_quota: 1024 }
+  - { name: greedy, id: 2, token: t, pin_quota: 2048 }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ValidatePinQuotas(2048); err != nil {
+		t.Fatalf("in-bounds pin quotas rejected: %v", err)
+	}
+	if err := r.ValidatePinQuotas(2047); err == nil {
+		t.Fatal("pin_quota above the arena accepted — the override would unbound the cap")
+	} else if !strings.Contains(err.Error(), "greedy") {
+		t.Fatalf("rejection does not name the offender: %v", err)
+	}
+	if err := r.ValidatePinQuotas(0); err != nil {
+		t.Fatalf("unknown arena (0) must skip the check: %v", err)
 	}
 }
 

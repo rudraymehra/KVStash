@@ -146,6 +146,19 @@ func TestValidateRejections(t *testing.T) {
 			func(c *Config) { c.NvmePaths = []string{"/a"}; c.NvmeMaxBytes = 8 << 30; c.EvictionPolicy = "none" },
 			"eviction_policy",
 		},
+		{
+			// Segment object keys carry no volume dimension and per-volume
+			// segment ids all start at 0 — two volumes spilling to one bucket
+			// silently overwrite each other's objects.
+			"s3 with multiple nvme volumes",
+			func(c *Config) {
+				c.NvmePaths = []string{"/a", "/b"}
+				c.NvmeMaxBytes = 8 << 30
+				c.S3Bucket = "kvb"
+				c.S3NodeID = "n1"
+			},
+			"single volume",
+		},
 	}
 	for _, tc := range cases {
 		c := Default()
