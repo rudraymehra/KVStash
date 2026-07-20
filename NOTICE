@@ -6,3 +6,7 @@ This product includes software developed as part of the kvblockd project
 
 Contains a Go port of OffsetAllocator, Copyright (c) 2023 Sebastian Aaltonen,
 licensed under the MIT License (https://github.com/sebbbi/OffsetAllocator).
+
+Vendors xxHash (adapters/nixl/third_party/xxhash/xxhash.h, v0.8.3),
+Copyright (c) 2012-2023 Yann Collet, licensed under the BSD 2-Clause License
+(https://github.com/Cyan4973/xxHash).

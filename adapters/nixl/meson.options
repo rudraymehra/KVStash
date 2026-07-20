@@ -1,0 +1,6 @@
+option('nixl_path', type: 'string', value: '',
+       description: 'Path to an ai-dynamo/nixl source checkout. Enables libplugin_KVBLOCKD.so and the NIXL-engine flavor of test_transfer. Empty = client-core only (macOS-friendly).')
+option('nixl_build_path', type: 'string', value: '',
+       description: 'Path to the nixl meson build directory (provides libnixl_build for linking the engine test; `meson compile -C <dir> nixl_build` is enough).')
+option('kvblockd_bin', type: 'string', value: '',
+       description: 'Path to a prebuilt kvblockd binary for test_transfer. Empty = the test harness go-builds ./cmd/kvblockd from the repo root.')

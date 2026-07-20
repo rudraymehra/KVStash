@@ -1,0 +1,115 @@
+name: nixl
+
+# NIXL plugin (beta): build libplugin_KVBLOCKD.so against the latest NIXL
+# release tag (the stability bar) AND against HEAD (the tripwire — allowed to
+# go red; a red HEAD leg auto-files an issue instead of blocking), then run
+# test_transfer against a real kvblockd daemon. Weekly cron + path-triggered,
+# same shape as e2e-cpu.yml.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17 3 * * 1" # weekly, Monday 03:17 UTC
+  pull_request:
+    paths:
+      - "adapters/nixl/**"
+      - "internal/protocol/**"
+      - ".github/workflows/nixl.yml"
+
+permissions:
+  contents: read
+  issues: write # HEAD-tripwire auto-filed issue
+
+concurrency:
+  group: nixl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plugin:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - nixl_ref: "v1.3.1" # latest release tag — the stability bar
+            tripwire: false
+          - nixl_ref: "main" # HEAD — the tripwire
+            tripwire: true
+    name: nixl-${{ matrix.nixl_ref }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.tripwire }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: apt deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q meson ninja-build pkg-config libabsl-dev g++
+
+      - name: clone nixl @ ${{ matrix.nixl_ref }}
+        run: |
+          git clone --depth 1 --branch "${{ matrix.nixl_ref }}" \
+            https://github.com/ai-dynamo/nixl.git build-deps/nixl
+          git -C build-deps/nixl log -1 --format='nixl at %H (%cs)'
+
+      - name: configure nixl (headers + infra lib only)
+        run: |
+          meson setup build-deps/nixl/build build-deps/nixl \
+            -Ddisable_gds_backend=true -Dbuild_tests=false \
+            -Dbuild_examples=false -Dwith_trace=false
+
+      - name: build libnixl_build (descriptor/serdes symbols)
+        run: meson compile -C build-deps/nixl/build nixl_build
+
+      - name: build kvblockd daemon
+        run: go build -o bin/kvblockd ./cmd/kvblockd
+
+      - name: configure plugin + tests
+        run: |
+          meson setup adapters/nixl/build adapters/nixl \
+            -Dnixl_path="$GITHUB_WORKSPACE/build-deps/nixl" \
+            -Dnixl_build_path="$GITHUB_WORKSPACE/build-deps/nixl/build" \
+            -Dkvblockd_bin="$GITHUB_WORKSPACE/bin/kvblockd"
+
+      - name: build libplugin_KVBLOCKD.so
+        run: |
+          meson compile -C adapters/nixl/build
+          ls -la adapters/nixl/build/libplugin_KVBLOCKD.so
+          nm -D adapters/nixl/build/libplugin_KVBLOCKD.so | grep -E "nixl_plugin_(init|fini)"
+
+      - name: run tests (protocol goldens + transfer gate vs live daemon)
+        run: meson test -C adapters/nixl/build --print-errorlogs --timeout-multiplier 2
+
+      - name: ASAN rerun of the transfer gate (release-tag leg only)
+        if: ${{ !matrix.tripwire }}
+        run: |
+          meson configure adapters/nixl/build -Db_sanitize=address -Dbuildtype=debugoptimized
+          meson compile -C adapters/nixl/build
+          meson test -C adapters/nixl/build transfer-gate --print-errorlogs --timeout-multiplier 4
+
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nixl-logs-${{ matrix.nixl_ref }}
+          path: |
+            adapters/nixl/build/meson-logs/
+            build-deps/nixl/build/meson-logs/
+          if-no-files-found: ignore
+
+      - name: tripwire — file an issue when HEAD breaks
+        if: ${{ failure() && matrix.tripwire && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "nixl HEAD tripwire: plugin build/test broke ($(date -u +%F))" \
+            --body "The weekly nixl.yml HEAD leg failed. The v1.3.1 tag leg is the stability bar; investigate upstream churn. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --label ci || echo "issue creation failed (label missing or perms); see run logs"

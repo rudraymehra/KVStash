@@ -12,6 +12,11 @@ dist/
 *.test
 testdata/corpus-large/
 
+# External build dependencies fetched at build time (never vendored):
+# ai-dynamo/nixl checkout for the adapters/nixl plugin (see its README).
+build-deps/
+adapters/nixl/build/
+
 # Local env
 .env
 
