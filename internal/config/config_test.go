@@ -111,6 +111,7 @@ func TestValidateRejections(t *testing.T) {
 		{"lease max over clamp", func(c *Config) { c.LeaseMaxMS = protocol.MaxLeaseMS + 1 }, "lease_max_ms"},
 		{"zero conns", func(c *Config) { c.MaxConns = 0 }, "max_conns"},
 		{"bad addr", func(c *Config) { c.ListenAddr = "not-an-addr:port:extra" }, "listen_addr"},
+		{"bad s3compat addr", func(c *Config) { c.S3CompatAddr = "not-an-addr:port:extra" }, "s3compat_addr"},
 		{"negative sndbuf", func(c *Config) { c.SockSndBuf = -1 }, "sock_sndbuf"},
 		{
 			"nvme paths without budget",

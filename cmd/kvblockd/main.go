@@ -250,6 +250,33 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "kvblockd: metrics on", bound)
 	}
 
+	// S3-compat endpoint (s3compat_addr set): the NIXL obj / vLLM obj
+	// zero-code path, on the SAME store and tenant table as the data plane.
+	// Its handlers read the store, so the CLEAN shutdown path below must wait
+	// for them before closeStore — the drain-before-Close rule again.
+	s3wait := func() bool { return true }
+	if cfg.S3CompatAddr != "" {
+		if host, _, herr := net.SplitHostPort(cfg.S3CompatAddr); herr == nil {
+			if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+				fmt.Fprintln(os.Stderr, "kvblockd: WARNING: s3compat_addr", cfg.S3CompatAddr,
+					"is not loopback — tenant tokens (Authorization headers) and block bytes cross it in cleartext; keep it on a private network or terminate TLS in front")
+			}
+		}
+		s3 := server.NewS3Compat(cfg, srvStore, ns)
+		bound, wait, err := s3.Serve(ctx, cfg.S3CompatAddr)
+		if err != nil {
+			stopTier()
+			stopEvict()
+			_ = closeStore()
+			return fmt.Errorf("s3compat endpoint: %w", err)
+		}
+		s3wait = wait
+		// Early-error/timeout paths: cancel ctx, then reap the listener
+		// goroutines (waiting twice is safe — both channels are closed).
+		defer func() { stop(); _ = s3wait() }()
+		fmt.Fprintln(os.Stderr, "kvblockd: s3compat on", bound)
+	}
+
 	if _, err := srv.Start(ctx); err != nil {
 		stopTier()
 		stopEvict()
@@ -273,8 +300,16 @@ func run() error {
 	}
 	// Strictly AFTER a SUCCESSFUL Drain: stop the tier movers (the demoter
 	// releases its arena holds), then the evictor, then close — volumes
-	// first (writer drain + final sync), dram arena last.
+	// first (writer drain + final sync), dram arena last. The s3compat
+	// server counts as one more reader population: a false from its wait
+	// (an HTTP handler outliving the shutdown grace, possibly mid-Get)
+	// gets the same treatment as a failed Drain — skip the close, let
+	// process exit reclaim.
 	stopTier()
 	stopEvict()
+	if !s3wait() {
+		fmt.Fprintln(os.Stderr, "kvblockd: s3compat shutdown timed out — leaving the store open for process exit")
+		return nil
+	}
 	return closeStore()
 }

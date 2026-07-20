@@ -6,6 +6,7 @@
 listen_addr: ":9440"          # data plane (KVB1 frames)
 admin_addr: "127.0.0.1:9441"  # ops plane (namespace add / quota set); loopback ONLY — a non-loopback address is refused at startup
 metrics_addr: "127.0.0.1:9442" # ops endpoint: /metrics, /healthz, /debug/pprof ("" = disabled)
+s3compat_addr: ""             # S3-subset endpoint for NIXL obj / vLLM obj (bucket = namespace, bearer auth); "" = disabled (e.g. "127.0.0.1:9500")
 
 max_conns: 1024               # global accept cap (cheap DoS floor)
 

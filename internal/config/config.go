@@ -33,6 +33,10 @@ type Config struct {
 	// the namespaces file); empty disables it.
 	AdminAddr   string `yaml:"admin_addr"`
 	MetricsAddr string `yaml:"metrics_addr"`
+	// S3CompatAddr serves the S3-subset endpoint (PutObject/GetObject/
+	// HeadObject; bucket = namespace, bearer-token auth — see
+	// internal/server/s3compat.go). Empty (the default) disables it.
+	S3CompatAddr string `yaml:"s3compat_addr"`
 
 	// MaxConns is a global accept cap — a cheap DoS floor. Per-tenant
 	// connection accounting is the tenant package's job, not this field's.
@@ -195,6 +199,7 @@ var envTable = []struct {
 }{
 	{"KVBLOCKD_LISTEN_ADDR", func(c *Config, v string) error { c.ListenAddr = v; return nil }},
 	{"KVBLOCKD_METRICS_ADDR", func(c *Config, v string) error { c.MetricsAddr = v; return nil }},
+	{"KVBLOCKD_S3COMPAT_ADDR", func(c *Config, v string) error { c.S3CompatAddr = v; return nil }},
 	{"KVBLOCKD_NAMESPACES", func(c *Config, v string) error { c.NamespacesPath = v; return nil }},
 	{"KVBLOCKD_MAX_CONNS", func(c *Config, v string) error {
 		n, err := strconv.Atoi(v)
@@ -311,6 +316,7 @@ func (c Config) Validate() error {
 		{"listen_addr", c.ListenAddr},
 		{"admin_addr", c.AdminAddr},
 		{"metrics_addr", c.MetricsAddr},
+		{"s3compat_addr", c.S3CompatAddr},
 	} {
 		if a.addr == "" {
 			continue
