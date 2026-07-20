@@ -2,7 +2,7 @@
 #
 # Everything here serves one sentence in the README: "one static binary,
 # no dependencies." CGO is off, the linux binaries must survive
-# test/release/assert_static.sh (statically linked, ldd fails, <20MB,
+# test/release/assert_static.sh (statically linked, ldd fails, <24MB,
 # boots in a scratch container), and the Docker image is FROM scratch.
 #
 # Local dry run:  goreleaser release --snapshot --clean

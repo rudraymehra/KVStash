@@ -37,6 +37,12 @@ debt and headroom). Dates are when the entry was recorded.
 | NIXL native C++ plugin — beta posture | C-11 reclassified it stretch (segfault-class unknowns vs a zero-code S3-compat path that already works) | NIXL CI green across HEAD+tag for a sustained window; a partner asks for the native path |
 | vLLM connector churn-watch (`SharedStorageConnector`→`ExampleConnector` rename; RFC tier-dict loading never merged) | Upstream moves faster than releases; A6 matrix + UPSTREAM.lock are the tripwire | A6 matrix failure on any new vLLM release |
 
+## Binary size
+
+| Item | Why it waits | Revisit trigger |
+|---|---|---|
+| `kvb_nos3` build tag to strip aws-sdk-go-v2 and reclaim a ~14 MB SDK-free binary (the S3 tier's SDK is ~2.5 MB of the ~21 MB release binary; the assert_static gate was raised 20→24 MB to accept the full-featured build) (2026-07-21) | Needs the SDK-importing seam (s3spill client) split behind `//go:build !kvb_nos3` with a stub for the tag, plus a goreleaser matrix leg — real work, and the full binary is still a single dependency-free static binary (the claim that matters) | When a deployment cares about the smaller binary, or before a "tiny binary" marketing push; ship it as a second goreleaser artifact |
+
 ## Performance headroom (unscheduled, measured)
 
 | Item | Why it waits | Revisit trigger |

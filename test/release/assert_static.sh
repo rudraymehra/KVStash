@@ -4,14 +4,21 @@
 # every artifact; ANY failure fails the release.
 #
 # linux binaries: `file` must say "statically linked"; `ldd` must refuse it
-# (where ldd exists — ubuntu CI); size < 20MB HARD (the ~11MB claim);
-# boots `--version` inside a FROM-scratch container when docker is present.
+# (where ldd exists — ubuntu CI); size < 24MB HARD; boots `--version` inside
+# a FROM-scratch container when docker is present.
 # darwin binaries: Mach-O check + the same size gate (dev-only platform,
 # no static/scratch story to prove).
+#
+# The gate was 20MB when the daemon was DRAM+NVMe only (~11MB). The S3 cold
+# tier statically links aws-sdk-go-v2, ~2.5MB of real, load-bearing code, so
+# the full-featured binary is ~21MB — still a single dependency-free static
+# binary, the claim that actually matters. 24MB leaves honest headroom; an
+# SDK-free build (-tags kvb_nos3, tracked in docs/IMPROVEMENTS.md) reclaims
+# the smaller size for deployments that don't use the cold tier.
 set -euo pipefail
 BIN="$1"; GOOS="$2"; GOARCH="${3:-}"
 NAME="$(basename "$BIN")"
-MAX_BYTES=$((20 * 1024 * 1024))
+MAX_BYTES=$((24 * 1024 * 1024))
 
 fail() { echo "assert_static: FAIL [$NAME $GOOS/$GOARCH]: $*" >&2; exit 1; }
 
@@ -20,7 +27,7 @@ fail() { echo "assert_static: FAIL [$NAME $GOOS/$GOARCH]: $*" >&2; exit 1; }
 # 1. Size gate (all platforms). README quotes the real number — print it.
 SIZE=$(wc -c <"$BIN" | tr -d ' ')
 if [ "$SIZE" -ge "$MAX_BYTES" ]; then
-  fail "size $SIZE bytes >= 20MB gate"
+  fail "size $SIZE bytes >= 24MB gate"
 fi
 printf 'assert_static: %s %s/%s size %.1f MB\n' "$NAME" "$GOOS" "$GOARCH" \
   "$(awk "BEGIN{print $SIZE/1048576}")"

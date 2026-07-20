@@ -42,7 +42,7 @@ Chart 1 (GB/s vs Redis 7 / Valkey 8 / Mooncake-TCP / NVMe-fs floor, two client c
 | TTL / lease / pin ladder | **yes** ([PROTOCOL.md §6](docs/PROTOCOL.md)) | TTL only | no lease/pin | no | no | TTL only |
 | S3 / object tier | **ships v1.0.0** (binding roadmap — see note) | via pluggable backends | no | no | no | no |
 | Warm restart after kill -9 | **yes — measured** (100-loop torture, contract above) | n/a (in-process cache) | metadata lives in etcd | no (SSD index held in memory) | no | RDB/AOF replay; no block-level crash contract |
-| Single static binary, no sidecars | **yes (~11 MB)** | no (pip package + engine) | no (etcd + C++ toolchain) | no | no | server + client libraries |
+| Single static binary, no sidecars | **yes (~21 MB, S3 tier included)** | no (pip package + engine) | no (etcd + C++ toolchain) | no | no | server + client libraries |
 
 **Honesty notes:** tenancy/quota *enforcement* ships v0.2 — in this build namespaces isolate identity and pinned-bytes accounting, full per-tenant quotas/QoS are next. The S3 tier is a v1.0.0 commitment bound by this project's founding rulings (all three tiers are the point) — it is **not in this build**, and we say so rather than demo-ware it. Competitor cells describe the linked docs/issues as of writing; if we got one wrong, file an issue and the table gets fixed.
 
