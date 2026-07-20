@@ -6,6 +6,7 @@ Two packages, Apache-2.0, `requires-python >= 3.10`:
 |---|---|---|
 | `kvblockd` | KVB1 wire client (protocol codec, sync socket client, connection pool, key hashing) | `blake3`, `xxhash` |
 | `lmcache-kvblockd` | LMCache `RemoteConnector` backend (`kvblockd://` scheme) | `kvblockd`, `lmcache>=0.5.1,<0.6` |
+| `sglang-kvblockd` | SGLang `HiCacheStorage` (v1) backend — CPU-validated, GPU e2e DEFERred (`docs/design/sglang-hicache-v1.1.md`), NOT on PyPI | `kvblockd` (sglang/torch as extras) |
 
 ## kvblockd
 

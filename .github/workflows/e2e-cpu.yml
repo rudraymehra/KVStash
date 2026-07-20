@@ -8,6 +8,7 @@ on:
       - "python/**"
       - "internal/protocol/**"
       - "bench/e2e/cpu/**"
+      - "bench/e2e/sglang/**"
       - ".github/workflows/e2e-cpu.yml"
 
 permissions:
@@ -91,3 +92,51 @@ jobs:
             /tmp/vllm.log
             /tmp/vllm2.log
           if-no-files-found: ignore
+
+  # A6-style tripwire for socket #4 (SGLang HiCache, wk 12). CPU-only, no
+  # GPU, no model download: (1) the backend imports + instantiates with NO
+  # sglang installed (shim ABC), (2) the CPU unit suite runs against a
+  # daemon built from source, (3) the pinned sglang release installs and
+  # the backend subclasses the REAL HiCacheStorage ABC — interface drift
+  # trips THIS job, not a partner deployment. The GPU e2e itself is
+  # DEFERred (docs/design/sglang-hicache-v1.1.md).
+  sglang-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install CPU torch + backend (NO sglang yet)
+        run: |
+          pip install pytest blake3 xxhash
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-deps ./python/kvblockd ./python/sglang_kvblockd
+      - name: import + instantiate WITHOUT sglang (shim leg)
+        run: python bench/e2e/sglang/import_check.py
+      - name: CPU unit suite (daemon built from source by the fixture)
+        env:
+          PYTHONHASHSEED: "0"
+          # Correctness leg; the 1ms figure is a loopback-rig number.
+          # Shared-runner scheduler jitter gets headroom, not a free pass.
+          KVB_SGL_EXISTS_BUDGET_MS: "3.0"
+        run: pytest python/sglang_kvblockd/tests -q
+      - name: install pinned sglang (the tripwire pin)
+        run: |
+          source bench/e2e/sglang/versions.env
+          PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
+            pip install "sglang==$SGLANG_VERSION"
+      - name: ABC import-check against real sglang (drift trips here)
+        run: python bench/e2e/sglang/import_check.py --require-sglang
+      - name: re-run suite against the real ABC + StorageMetrics
+        env:
+          PYTHONHASHSEED: "0"
+          KVB_SGL_EXISTS_BUDGET_MS: "3.0"
+        run: pytest python/sglang_kvblockd/tests -q

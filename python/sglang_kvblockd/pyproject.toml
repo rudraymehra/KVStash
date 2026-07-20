@@ -1,0 +1,31 @@
+# NOT PUBLISHED: the wk-12 SGLang spike verdict is DEFER
+# (docs/design/sglang-hicache-v1.1.md). Per C-4 the PyPI publish task is
+# unconditional on the SHIP branch only — this package is twine-buildable
+# and stays local until the revisit trigger fires.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sglang-kvblockd"
+version = "0.1.0"
+description = "SGLang HiCache storage backend (v1 interface) backed by kvblockd"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Rudray Mehra", email = "rudraymehra@gmail.com" }]
+dependencies = [
+    "kvblockd>=0.1.0",
+]
+
+[project.optional-dependencies]
+# The backend imports WITHOUT sglang (a shim stands in for the ABC); sglang
+# is only needed to subclass the real HiCacheStorage — test/e2e-time only.
+test = ["pytest>=8", "torch"]
+sglang = ["sglang>=0.4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sglang_kvblockd"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

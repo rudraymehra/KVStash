@@ -59,6 +59,13 @@ Format: Keep a Changelog (https://keepachangelog.com), SemVer after v0.1.0.
   (statically linked + <20 MB + scratch-boot gates), SBOMs, `FROM scratch`
   Docker image, `deploy/kvblockd.service`, `scripts/install.sh`, and the
   tag-driven release workflow.
+- `python/sglang_kvblockd`: SGLang HiCacheStorage v1 backend (zero-copy
+  `batch_get_v1`/`batch_set_v1` into the pinned host pool, consecutive-prefix
+  `batch_exists`, rank/model-fingerprinted keys with golden vectors) + CPU
+  unit suite + `sglang-cpu` CI tripwire leg. Spike verdict: **DEFER** — CPU-
+  validated, not GPU-validated; not published to PyPI. Blocker + revisit
+  trigger in `docs/design/sglang-hicache-v1.1.md`; v2 controller methods
+  stubbed pending sgl-project/sglang#18239.
 
 ### Changed
 - Transport writes are windowed at `write_chunk_bytes` (~1 MiB) per writev

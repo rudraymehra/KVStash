@@ -1,0 +1,521 @@
+{
+  "scheme": "sglang-hicache-v1",
+  "note": "Golden vectors for sglang_kvblockd.keymap. wire_key32 = blake3-256 over domain 'kvblockd-cek-v1\\x00' + u32-LE length-prefixed UTF-8 fields (SCHEME, fingerprint, full_key) — the identical construction and shared oracle as python/kvblockd hashing.wire_key / Go pkg/client.WireKey. Regenerate ONLY on a deliberate, versioned scheme change: every stored block's identity depends on these bytes.",
+  "cases": [
+    {
+      "name": "mha-tp1",
+      "config": {
+        "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+        "tp_rank": 0,
+        "tp_size": 1,
+        "pp_rank": 0,
+        "pp_size": 1,
+        "is_mla_model": false
+      },
+      "fingerprint": "meta-llama/Llama-3.1-8B-Instruct|tp1|pp1|mha",
+      "suffixes": [
+        "_0_0_k",
+        "_0_0_v"
+      ],
+      "page_suffix": "_0_0_pg",
+      "vectors": [
+        {
+          "logical_key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "physical_keys": [
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_0_0_k",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "fcae128a13f021f0822ace6e4575ac265b9cfe810603cbcb811f77de1c3749be",
+            "54b6e5d1ea7ac454efa34f5938410baf641541f2c25259955b106dd7d223d536"
+          ],
+          "page_wire_key_hex": "3e939ae0be4e7f3b3ddb71e671a0de761d133b075c4b0436af586c19782efaa0"
+        },
+        {
+          "logical_key": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+          "physical_keys": [
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_0_0_k",
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "b973e5717d47df08ff27e943cda854cec5fbf2870113b13ca4a95827ebccc45c",
+            "380da8e2b729bc45ce26979fd0a96a30ce3a35d36d5889feb2fa9bf6c334c33d"
+          ],
+          "page_wire_key_hex": "2e81630cd89e726528db3e8f3bef0dd2560c7bcf818d19d0aa41ec34a9bb578a"
+        },
+        {
+          "logical_key": "",
+          "physical_keys": [
+            "_0_0_k",
+            "_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "816e149ae787db6d0eb75bc70d133ce3ac5a6ea4c5f879b93574fbdcab04327f",
+            "338b09e0af28a987052ba02c47da27b5063e81e61507a54b28a5d40f1b3d589e"
+          ],
+          "page_wire_key_hex": "41ffcf4c49e57d3b68e3d6acd7f3c14a64abe96f92322831f6e2340e8f7a3d83"
+        },
+        {
+          "logical_key": "weird_5_k",
+          "physical_keys": [
+            "weird_5_k_0_0_k",
+            "weird_5_k_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "05ca85e9b055a0f87a64cbfb76ae2655b9eb3c4204b1df404b73c32b9a02b9b3",
+            "924f6745a5d7c9e41b056a70afdbaf5a541db9255c059ea8ee0f6a1a4f4717b6"
+          ],
+          "page_wire_key_hex": "225e4042af350afa62b822c961db9e016a57cfbc41ccd9f90357d5c4600651c5"
+        }
+      ]
+    },
+    {
+      "name": "mha-tp2-r1",
+      "config": {
+        "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+        "tp_rank": 1,
+        "tp_size": 2,
+        "pp_rank": 0,
+        "pp_size": 1,
+        "is_mla_model": false
+      },
+      "fingerprint": "meta-llama/Llama-3.1-8B-Instruct|tp2|pp1|mha",
+      "suffixes": [
+        "_1_0_k",
+        "_1_0_v"
+      ],
+      "page_suffix": "_1_0_pg",
+      "vectors": [
+        {
+          "logical_key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "physical_keys": [
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_1_0_k",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_1_0_v"
+          ],
+          "wire_keys_hex": [
+            "d053b34458ac6c18dbb2fdb72c001bb1e654b8d8eaefd5ea5a1f941b3d3483d0",
+            "382c7071a24c65c1029a8c786f2b28725ec68548138dc593ed72428c0c4c912e"
+          ],
+          "page_wire_key_hex": "7fa0a98e8d12d821129a8b440fed8be1d061da9e8964697858d1dd4101953fa7"
+        },
+        {
+          "logical_key": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+          "physical_keys": [
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_1_0_k",
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_1_0_v"
+          ],
+          "wire_keys_hex": [
+            "1e176cdbbfdb799c6c2be73ec02721d648c669d949e56f1be5db9f7779151db4",
+            "b7247db8e29de9f31832411878c22394e11660114afbfe9c78e86e383f909398"
+          ],
+          "page_wire_key_hex": "568082bcc0d8dd89eed8e9bc1e6b22d81b761c97a8729d9a5116a947dd21197d"
+        },
+        {
+          "logical_key": "",
+          "physical_keys": [
+            "_1_0_k",
+            "_1_0_v"
+          ],
+          "wire_keys_hex": [
+            "6628e97e75a15ae8111c1fbb5e05f1713bbfe7095bddcd97dea12f366be7d6a5",
+            "9d46f5cf2fc0136965810af6d5575e70149dc96e61e528d80e8fe5dae9c02894"
+          ],
+          "page_wire_key_hex": "7f5cf051dc156b6a01b5ee11ca136a7a317c5a566584791b66f90b880c29c689"
+        },
+        {
+          "logical_key": "weird_5_k",
+          "physical_keys": [
+            "weird_5_k_1_0_k",
+            "weird_5_k_1_0_v"
+          ],
+          "wire_keys_hex": [
+            "1781a2b14b65509ec5f7229fa85d92f940301b712247b674d1a811d1487c85ea",
+            "31a8fba577ca4c5eb4a268564848698d3f554974764928c791fecdbc2eafea32"
+          ],
+          "page_wire_key_hex": "b5e411b90626c7f515d73e367699221a7926fbfe2a9fb1c93c1361406c00c53a"
+        }
+      ]
+    },
+    {
+      "name": "mha-tp4-pp2",
+      "config": {
+        "model_name": "Qwen/Qwen2.5-7B@rev2",
+        "tp_rank": 3,
+        "tp_size": 4,
+        "pp_rank": 1,
+        "pp_size": 2,
+        "is_mla_model": false
+      },
+      "fingerprint": "Qwen/Qwen2.5-7B@rev2|tp4|pp2|mha",
+      "suffixes": [
+        "_3_1_k",
+        "_3_1_v"
+      ],
+      "page_suffix": "_3_1_pg",
+      "vectors": [
+        {
+          "logical_key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "physical_keys": [
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_3_1_k",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_3_1_v"
+          ],
+          "wire_keys_hex": [
+            "0c7f774ae2e46c6f9b760f3c7592c3a6c2c7fe5b53ea01445ce33d164fd5ce1d",
+            "08888934e5b619db21c0fe5131584c3c46482022af57472e48fcc4a93a887eca"
+          ],
+          "page_wire_key_hex": "675643b0016153a731e37135fc8b1bda285f1dadf828bbbdb2c75467e80f2119"
+        },
+        {
+          "logical_key": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+          "physical_keys": [
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_3_1_k",
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_3_1_v"
+          ],
+          "wire_keys_hex": [
+            "2bbfa35c2cba11aff5498cdfd4f5e7f4d5ead6b8493122b5c0a4d272802214a9",
+            "e8c95d35b9142067f773879c99315a36a7acb4c2a51ebde3ead53e5f8787e992"
+          ],
+          "page_wire_key_hex": "4b39f4d49f0b0572f1bf5bf43aa18588ea720a0e1e322b8a3a9106404edf562b"
+        },
+        {
+          "logical_key": "",
+          "physical_keys": [
+            "_3_1_k",
+            "_3_1_v"
+          ],
+          "wire_keys_hex": [
+            "a3dcb4763d701b37e03e3b2aec07ebe3df5c257a616439c845e42056d3d98143",
+            "6a1a9386300a134c3666f014252a27f5a4e937c03b246889b28b856410fdd3c5"
+          ],
+          "page_wire_key_hex": "2d45d6130a8762525c4e3e5319a1a74d16d32899bf5330611733a458e9b411a8"
+        },
+        {
+          "logical_key": "weird_5_k",
+          "physical_keys": [
+            "weird_5_k_3_1_k",
+            "weird_5_k_3_1_v"
+          ],
+          "wire_keys_hex": [
+            "dd26271613f8a3611976035ece61e1b0859cbdfa72adcb78839823751565fb53",
+            "17f08d46f936179c0f8ec65ed5b5698f821cc5c20f2f67b96649d875ed139091"
+          ],
+          "page_wire_key_hex": "377c8f08be7bd8fae120569fcd71e422deccbc02a92a0293c2b8f69c750133bb"
+        }
+      ]
+    },
+    {
+      "name": "mla-tp8",
+      "config": {
+        "model_name": "deepseek-ai/DeepSeek-V3",
+        "tp_rank": 5,
+        "tp_size": 8,
+        "pp_rank": 0,
+        "pp_size": 1,
+        "is_mla_model": true
+      },
+      "fingerprint": "deepseek-ai/DeepSeek-V3|pp1|mla",
+      "suffixes": [
+        "_0_k"
+      ],
+      "page_suffix": "_0_pg",
+      "vectors": [
+        {
+          "logical_key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "physical_keys": [
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_0_k"
+          ],
+          "wire_keys_hex": [
+            "a630c6b4a9773740e6666d66f108260d9e442a56a30177254233e58c37912b0e"
+          ],
+          "page_wire_key_hex": "4fe086c1b52ca9a6e2520ec0e878571baa7e041ffadc54b67faa8de2b29b257e"
+        },
+        {
+          "logical_key": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+          "physical_keys": [
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_0_k"
+          ],
+          "wire_keys_hex": [
+            "0943b030a0436b605bb3eb368f726807032e42fdd35f842989b84f25c2da2800"
+          ],
+          "page_wire_key_hex": "79beed05b80cb7f607e97d4ed4c25b08793922026447d0d2c3175628aec25aa1"
+        },
+        {
+          "logical_key": "",
+          "physical_keys": [
+            "_0_k"
+          ],
+          "wire_keys_hex": [
+            "ddce6233b2f774bbb45f9a48d7d0e5fa3d2e13214577077415a1c01af2a03ac5"
+          ],
+          "page_wire_key_hex": "af8dc80ce578e4ca77a9dd72314d68b251c4744a8081a921cb4ab3938f9a4e30"
+        },
+        {
+          "logical_key": "weird_5_k",
+          "physical_keys": [
+            "weird_5_k_0_k"
+          ],
+          "wire_keys_hex": [
+            "81050c9c64630a9c624d95fd0adae574b1326e72750ab6ac50d824f2e7381df6"
+          ],
+          "page_wire_key_hex": "3c5bbe3c8f4ffcf75bb3f6c6dfc1a33e6f2049c611c3e95a8ea6120a16b10d3e"
+        }
+      ]
+    },
+    {
+      "name": "mla-pp2",
+      "config": {
+        "model_name": "deepseek-ai/DeepSeek-V3",
+        "tp_rank": 0,
+        "tp_size": 4,
+        "pp_rank": 1,
+        "pp_size": 2,
+        "is_mla_model": true
+      },
+      "fingerprint": "deepseek-ai/DeepSeek-V3|pp2|mla",
+      "suffixes": [
+        "_1_k"
+      ],
+      "page_suffix": "_1_pg",
+      "vectors": [
+        {
+          "logical_key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "physical_keys": [
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_1_k"
+          ],
+          "wire_keys_hex": [
+            "a08ac860fd87aaeb96e2277c529e2a26b5c654c4e827c02a542d45fb9fe632c3"
+          ],
+          "page_wire_key_hex": "13441ac1b52d9add2ae99707106d3a707f2e3f26a6be31520b6ccf0c0a3466d0"
+        },
+        {
+          "logical_key": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+          "physical_keys": [
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_1_k"
+          ],
+          "wire_keys_hex": [
+            "2ff529f97550e7b65de81441f4588c437eecc2b1411b8879aef308da1105f955"
+          ],
+          "page_wire_key_hex": "5e42054e3b4d1a6ec4a4dd339612be8eb23a64666109b86d9f19a0b9a9b85f8e"
+        },
+        {
+          "logical_key": "",
+          "physical_keys": [
+            "_1_k"
+          ],
+          "wire_keys_hex": [
+            "a49724b61e34b68946d8d18ba33784f42d866ebab55fb7520e7c7571ccf82022"
+          ],
+          "page_wire_key_hex": "6251af13ea4a407a595cdf957c3740ca3d5593fae44766eb3f1041ab25f8045f"
+        },
+        {
+          "logical_key": "weird_5_k",
+          "physical_keys": [
+            "weird_5_k_1_k"
+          ],
+          "wire_keys_hex": [
+            "7c13d893fe9a2c6b4548ee7855772cf40e2e9fb29f78b42fad2dd19b3988be21"
+          ],
+          "page_wire_key_hex": "db32e50a61208faca73bc95dc762fccaf5334498d10e67d138ce99f362fb8a7f"
+        }
+      ]
+    },
+    {
+      "name": "mha-cp2",
+      "config": {
+        "model_name": "unicode/café-λ-模型",
+        "tp_rank": 0,
+        "tp_size": 2,
+        "pp_rank": 0,
+        "pp_size": 1,
+        "is_mla_model": false,
+        "attn_cp_rank": 1,
+        "attn_cp_size": 2
+      },
+      "fingerprint": "unicode/café-λ-模型|tp2|pp1|mha|cp2",
+      "suffixes": [
+        "_0_0_cp1_k",
+        "_0_0_cp1_v"
+      ],
+      "page_suffix": "_0_0_cp1_pg",
+      "vectors": [
+        {
+          "logical_key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "physical_keys": [
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_0_0_cp1_k",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_0_0_cp1_v"
+          ],
+          "wire_keys_hex": [
+            "2099b917c3022a2383fb37cf1a8bcdf87d4c8be26813ef35b9bd9542a9f35ab5",
+            "0fb0e246946ca00aa39e4b9b2dac9e1d9b341171e8677fbf24c941efca1fa563"
+          ],
+          "page_wire_key_hex": "8933e6f5b4d8c0f1d925eec8caac107110ec4e909b96904ece0dfed8b420d19e"
+        },
+        {
+          "logical_key": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+          "physical_keys": [
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_0_0_cp1_k",
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_0_0_cp1_v"
+          ],
+          "wire_keys_hex": [
+            "328a502fc808b5ce6a8743aad1e4328bcd93cf5a2ebedff86cfbf542226d19cf",
+            "b553835ec796ce2c9f86bed56f4782ffc060aac49fc358ed502211c03e154c9d"
+          ],
+          "page_wire_key_hex": "4e645249e651564bbc9154b480fb2f1c72152ce91660b4906b2f053857925146"
+        },
+        {
+          "logical_key": "",
+          "physical_keys": [
+            "_0_0_cp1_k",
+            "_0_0_cp1_v"
+          ],
+          "wire_keys_hex": [
+            "409e08572b6445141746fe57ac9adfee2a7e9c8c8400650b6eb72cb928278e88",
+            "d9769e34adf4f587526c5e7a36f694351cc53a9a7be195795e8a2681e89e684e"
+          ],
+          "page_wire_key_hex": "c33e96f6fdf21e68be795a12707db9c699367227aa237c6a05081d3efc244684"
+        },
+        {
+          "logical_key": "weird_5_k",
+          "physical_keys": [
+            "weird_5_k_0_0_cp1_k",
+            "weird_5_k_0_0_cp1_v"
+          ],
+          "wire_keys_hex": [
+            "2a206148e7150f8b25df7d4eb5e41afa8ebfc28203615ff541e76d41096d44d0",
+            "c34487e4fa99a8748e7d019143febd4a2727a49a880aac54c12dd77bac685f12"
+          ],
+          "page_wire_key_hex": "36f7c7d89a107c22f6cae691fb53de0e56dddadcb6e75e585f23aa107a80ba0d"
+        }
+      ]
+    },
+    {
+      "name": "mha-headsplit",
+      "config": {
+        "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+        "tp_rank": 0,
+        "tp_size": 2,
+        "pp_rank": 0,
+        "pp_size": 1,
+        "is_mla_model": false,
+        "should_split_heads": true,
+        "tp_lcm_size": 8
+      },
+      "fingerprint": "meta-llama/Llama-3.1-8B-Instruct|tp2|pp1|mha|hs8",
+      "suffixes": [
+        "_0_0_k",
+        "_0_0_v"
+      ],
+      "page_suffix": "_0_0_pg",
+      "vectors": [
+        {
+          "logical_key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "physical_keys": [
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_0_0_k",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "6ec3524b05799435563df79d04608a14f042369c20e8196891f9579e292f4740",
+            "abaf94aebd52a4920836388e65e6e654e7e8318ab9254150d93564f3149a1ed4"
+          ],
+          "page_wire_key_hex": "0e6724bf68bdbc07c616a663ce52c900d2d0b77b55403d061da4c5c871212ff9"
+        },
+        {
+          "logical_key": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+          "physical_keys": [
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_0_0_k",
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "13d6b7e5d56c02fa85b2735a4d2997f97ed90d284dc357a12e3034803d0d12a6",
+            "4f0149964480d8c6d58787c82cc8fb796c738991f15d0a83374003e8817a66c1"
+          ],
+          "page_wire_key_hex": "9772c610f7d07f22ae3cc8797822bab0d1286d45406ed81b937cbbe59183819e"
+        },
+        {
+          "logical_key": "",
+          "physical_keys": [
+            "_0_0_k",
+            "_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "4448c157988e46ab6503c20df1aba517e73087ebacf4b46cc16222a96b09b332",
+            "a9655a05e0f25c44130874c1d4b4b3d8fc475ec57e920128ad99781c980326fb"
+          ],
+          "page_wire_key_hex": "4966dcb15ba6e4a14ce505e39af6a9bbee07101a51d7b333dfdc829aba63f8ef"
+        },
+        {
+          "logical_key": "weird_5_k",
+          "physical_keys": [
+            "weird_5_k_0_0_k",
+            "weird_5_k_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "d85d762b23b26ece6efcf720e6241d52c822b65174fea7a186dcca45f06e1c5a",
+            "3a013e03c3a88094a945eced289ceb8db86d11201b091ba9336440d2337a6709"
+          ],
+          "page_wire_key_hex": "e733d5ab2eaf7b8cd13d8281eaf18d2a554e80908970f18fc9943d371997e0de"
+        }
+      ]
+    },
+    {
+      "name": "no-config",
+      "config": null,
+      "fingerprint": "unknown-model|tp1|pp1|mha",
+      "suffixes": [
+        "_0_0_k",
+        "_0_0_v"
+      ],
+      "page_suffix": "_0_0_pg",
+      "vectors": [
+        {
+          "logical_key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "physical_keys": [
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_0_0_k",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "44c8056e17dfbbda6b270c473d6b1ce4d6bd16aa8ad6031a4d76f9fdd563e446",
+            "62696d91af584f0eed9f491c173ca401cbbca2aa736adee3f2ada031e39720c9"
+          ],
+          "page_wire_key_hex": "92dcdc8fcfeb2fa19b83147782a1ffb6927fa7b08a9aa6eb798a85c7260abac8"
+        },
+        {
+          "logical_key": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+          "physical_keys": [
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_0_0_k",
+            "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "55437b56739ad8c6009d633552bb35e410343d56bea2a4e0fdc7df2f8d2ff594",
+            "474772519e99801d9fa96becd21edaf2e70cfe7e03f2594fa3053ae750398502"
+          ],
+          "page_wire_key_hex": "7015942a9b4ce46e0eb72371d4b133bef9c340286faa26a077e5c4a63eb2ec11"
+        },
+        {
+          "logical_key": "",
+          "physical_keys": [
+            "_0_0_k",
+            "_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "9791af9106b68ba83ddc311a99928c983b1402f29a3cec8b2e0ca3a6f82c61cf",
+            "01161484450e179925b31a5515b7ecad0bb3b58ca1df9c0e0ed9012dca7d9480"
+          ],
+          "page_wire_key_hex": "6ef2dbc2cb1feeabdfa94191be35fe57aee4b348cbcaabbdde304efba3001a1c"
+        },
+        {
+          "logical_key": "weird_5_k",
+          "physical_keys": [
+            "weird_5_k_0_0_k",
+            "weird_5_k_0_0_v"
+          ],
+          "wire_keys_hex": [
+            "56431f5467ee6c60737faa03ab0084b0edea309756e2d95bc6aa063a1aa07425",
+            "9faea3bfadf15f76368c5a35d40c24c9f2d5a698bd4a10b3b075206c31f626bb"
+          ],
+          "page_wire_key_hex": "8c0d9360bb01ef8c86303233b0a274892b579a2dfee2fb6e0549c925000966fb"
+        }
+      ]
+    }
+  ]
+}
