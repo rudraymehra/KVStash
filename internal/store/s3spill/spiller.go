@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -25,6 +26,7 @@ type Spiller struct {
 	spilled   atomic.Uint64 // segments landed on S3
 	dropped   atomic.Uint64 // enqueue overflows (counter — never silent)
 	putErrors atomic.Uint64 // failed uploads (the segment stays local-only)
+	inflight  atomic.Int64  // enqueued-but-not-yet-acked (Flush waits on this)
 }
 
 type spillReq struct {
@@ -58,11 +60,31 @@ func NewSpiller(api S3API, cfg Config, queueDepth int) *Spiller {
 func (sp *Spiller) DemoteSegment(segID uint64, size int64, open func() (io.ReadSeekCloser, error), onUp func(uint64, bool)) bool {
 	select {
 	case sp.queue <- spillReq{segID: segID, size: size, open: open, onUp: onUp}:
+		sp.inflight.Add(1) // paired with the decrement after onUp in loop()
 		return true
 	default:
 		sp.dropped.Add(1)
 		return false
 	}
+}
+
+// Flush blocks until every enqueued spill has been uploaded-or-failed AND its
+// onUp callback has run (inflight drains to zero), or ctx expires (returns
+// false). It is the graceful-drain primitive a caller uses before it depends
+// on the tier flags being settled — and the deterministic handle the tests
+// use instead of racing a wall clock against the async worker. Poll-based:
+// the worker is single-threaded and this is a cold-path barrier, not the
+// hot path.
+func (sp *Spiller) Flush(ctx context.Context) bool {
+	for sp.inflight.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			runtime.Gosched()
+		}
+	}
+	return true
 }
 
 // Drop deletes a segment's S3 object (reclaim retired it everywhere).
@@ -100,6 +122,7 @@ func (sp *Spiller) loop(ctx context.Context) {
 			if req.onUp != nil {
 				req.onUp(req.segID, ok)
 			}
+			sp.inflight.Add(-1)
 		case <-ctx.Done():
 			// Drain-with-callbacks: every queued request gets its answer
 			// (false) — abandoned callbacks once leaked arena refs in the
@@ -110,6 +133,7 @@ func (sp *Spiller) loop(ctx context.Context) {
 					if req.onUp != nil {
 						req.onUp(req.segID, false)
 					}
+					sp.inflight.Add(-1)
 				default:
 					return
 				}

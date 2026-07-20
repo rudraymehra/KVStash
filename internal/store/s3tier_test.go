@@ -70,7 +70,7 @@ func newS3FixtureSized(t *testing.T, volMaxBytes int64) *s3Fixture {
 		o.RequestChecksumCalculation = awsc.RequestChecksumCalculationWhenRequired
 	})
 	cfg := s3spill.Config{Bucket: "kvb-tier", NodeID: "fx", OpTimeout: 10 * time.Second}
-	sp := s3spill.NewSpiller(api, cfg, 8)
+	sp := s3spill.NewSpiller(api, cfg, 32)
 	t.Cleanup(sp.Close)
 	re := s3spill.NewRestorer(api, cfg)
 
@@ -110,35 +110,51 @@ func newS3FixtureSized(t *testing.T, volMaxBytes int64) *s3Fixture {
 // driveToS3Residency fills the fixture and hand-drives the ladder until at
 // least one segment is retire-flipped, then returns a key currently SERVED
 // from the cold tier (proving the read path before anyone breaks it).
+// pump runs ONE deterministic tier cycle: lapse leases, demote to NVMe,
+// enqueue spills, WAIT for the async spiller to ack them (Flush — so the
+// S3 flags are settled), THEN reclaim (which now FLIPS spilled segments
+// instead of racing the ack and deleting them). Replacing the old
+// wall-clock/sleep drive with a Flush barrier is what makes these tests
+// deterministic on a slow, contended CI runner (the async spiller missing
+// a 15s deadline was the CI-only flake).
+func (fx *s3Fixture) pump() {
+	fx.cur.Add(int64(200 * time.Millisecond))
+	fx.t.demotePass(true)
+	fx.t.spillPass()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	fx.sp.Flush(ctx)
+	cancel()
+	fx.t.reclaimPass()
+}
+
 func driveToS3Residency(t *testing.T, fx *s3Fixture) (key [32]byte, blob []byte) {
 	t.Helper()
 	const blk, total = 60 << 10, 100
 	blobs := map[int][]byte{}
-	for i := 0; i < total; i++ {
+	for i := 0; i < total && fx.q.Usage(1, tenant.TierS3) == 0; i++ {
 		b := bytes.Repeat([]byte{byte(i), byte(0xA0 ^ i)}, blk/2) //nolint:gosec // G115: test payload pattern
 		blobs[i] = b
 		st := fx.t.Put(1, s3key(i), b, xxh3.Hash(b))
 		if st == protocol.StatusErrQuotaBytes {
-			fx.cur.Add(int64(200 * time.Millisecond))
-			fx.t.DemoteNow()
+			fx.pump()
 			st = fx.t.Put(1, s3key(i), b, xxh3.Hash(b))
 		}
 		if st != protocol.StatusOK {
 			t.Fatalf("put %d: %s", i, st)
 		}
 		if i%4 == 3 {
-			fx.cur.Add(int64(200 * time.Millisecond))
-			fx.t.DemoteNow()
+			fx.pump()
 		}
 	}
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) && fx.q.Usage(1, tenant.TierS3) == 0 {
-		fx.cur.Add(int64(100 * time.Millisecond))
-		fx.t.DemoteNow()
-		time.Sleep(20 * time.Millisecond)
+	// A few extra cycles to flip the last spilled segments (bounded, no wall
+	// clock — Flush inside pump is the barrier, so this converges even on a
+	// 1-CPU runner).
+	for k := 0; k < 40 && fx.q.Usage(1, tenant.TierS3) == 0; k++ {
+		fx.pump()
 	}
 	if fx.q.Usage(1, tenant.TierS3) == 0 {
-		t.Fatal("no segment reached s3-residency")
+		spilled, dropped, putErrs := fx.sp.Stats()
+		t.Fatalf("no segment reached s3-residency (spilled=%d dropped=%d errs=%d)", spilled, dropped, putErrs)
 	}
 	for i := 0; i < total; i++ {
 		data, _, rel, tier, st := fx.t.GetRefTier(1, s3key(i))
@@ -189,16 +205,17 @@ func TestS3FlipStrandAbortsRetire(t *testing.T) {
 			fx.t.demotePass(true)
 		}
 	}
-	// The spiller is ASYNC: drive spillPass and poll until the ack has set
-	// S3=true on ≥2 entries of one still-live segment (never reclaim, so the
-	// local segment persists). Deterministic via a bounded deadline, the
-	// same discipline driveToS3Residency uses.
+	// The spiller is ASYNC: spillPass enqueues, then Flush WAITS for the acks
+	// so S3=true is settled — deterministic, no wall-clock race (the CI-only
+	// flake). This fixture never reclaims (large volume), so spilled segments
+	// stay live and their entries accumulate the S3 flag.
 	var segID uint32
 	var keys [][32]byte
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) && len(keys) < 2 {
+	for k := 0; k < 40 && len(keys) < 2; k++ {
 		fx.t.spillPass()
-		time.Sleep(20 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		fx.sp.Flush(ctx)
+		cancel()
 		bySeg := map[uint32][][32]byte{}
 		fx.t.idx.rangeAll(func(k dram.Key, ref *nvmeRef) bool {
 			if ref.S3.Load() && !ref.S3Only.Load() {
@@ -211,6 +228,10 @@ func TestS3FlipStrandAbortsRetire(t *testing.T) {
 				segID, keys = id, ks
 				break
 			}
+		}
+		if len(keys) < 2 { // seal more if the fill didn't produce ≥2 yet
+			fx.cur.Add(int64(200 * time.Millisecond))
+			fx.t.demotePass(true)
 		}
 	}
 	if len(keys) < 2 {
@@ -290,36 +311,28 @@ func TestS3SpillRetireFlipColdRead(t *testing.T) {
 	blobs := map[int][]byte{}
 	// A continuous 6 MiB flow of 60K blocks through the 1.5 MiB arena:
 	// demotion stays busy (watermark crossed repeatedly), segments ROTATE
-	// and seal, the 768 KiB volume budget forces reclaim, and the async
-	// spiller keeps landing copies — the full ladder under one loop.
-	for i := 0; i < total; i++ {
+	// and seal, the 768 KiB volume budget forces reclaim, and pump() spills
+	// + FLUSHES before reclaiming — so reclaim flips (not deletes) the
+	// spilled segments deterministically, even on a slow CI runner.
+	for i := 0; i < total && fx.q.Usage(1, tenant.TierS3) == 0; i++ {
 		b := bytes.Repeat([]byte{byte(i), byte(0xA0 ^ i)}, blk/2) //nolint:gosec // G115: test payload pattern
 		blobs[i] = b
 		st := fx.t.Put(1, s3key(i), b, xxh3.Hash(b))
 		if st == protocol.StatusErrQuotaBytes {
-			// Arena wall with no evictor: demote by hand and retry once.
-			fx.cur.Add(int64(200 * time.Millisecond))
-			fx.t.DemoteNow()
+			fx.pump() // arena wall: demote→spill→flush→reclaim, then retry once
 			st = fx.t.Put(1, s3key(i), b, xxh3.Hash(b))
 		}
 		if st != protocol.StatusOK {
 			t.Fatalf("put %d: %s", i, st)
 		}
 		if i%4 == 3 {
-			fx.cur.Add(int64(200 * time.Millisecond)) // leases lapse
-			fx.t.DemoteNow()
-			fx.t.spillPass()
-			fx.t.reclaimPass()
+			fx.pump()
 		}
 	}
-	// Drive until at least one spilled segment has been retire-flipped.
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) && fx.q.Usage(1, tenant.TierS3) == 0 {
-		fx.cur.Add(int64(100 * time.Millisecond))
-		fx.t.DemoteNow()
-		fx.t.spillPass()
-		fx.t.reclaimPass()
-		time.Sleep(20 * time.Millisecond)
+	// A few extra cycles to flip the last spilled segments (bounded, Flush is
+	// the barrier — converges without a wall-clock deadline).
+	for k := 0; k < 40 && fx.q.Usage(1, tenant.TierS3) == 0; k++ {
+		fx.pump()
 	}
 	if fx.q.Usage(1, tenant.TierS3) == 0 {
 		spilled, dropped, putErrs := fx.sp.Stats()
