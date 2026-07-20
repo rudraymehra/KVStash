@@ -46,6 +46,11 @@ jobs:
   vllm-abi:
     # Best-effort: vLLM CPU install is heavy (~5-15 min) and old versions may not
     # have CPU wheels. fail-fast off so one bad version doesn't hide the rest.
+    # A6 coverage: BOTH adapters (lmcache_kvblockd + vllm_kvblockd) import AND
+    # instantiate in every cell of the last-4-minors matrix. The native check
+    # asserts real-subclass + factory registration where the tiering module
+    # exists, and prints a documented SKIP for the tier half where it doesn't
+    # (python/README.md version-support policy).
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -64,8 +69,12 @@ jobs:
           PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu pip install "vllm==${{ matrix.version }}"
       - name: check interface
         run: python .github/scripts/check_imports.py --target vllm
-      - name: kvblockd client imports against this vLLM's torch
+      - name: both adapters import + instantiate against this vLLM
+        env:
+          PYTHONHASHSEED: "0"
         run: |
-          pip install blake3 xxhash
-          pip install --no-deps ./python/kvblockd
+          pip install blake3 xxhash numpy
+          pip install --no-deps ./python/kvblockd ./python/lmcache_kvblockd ./python/vllm_kvblockd
           python -c "import kvblockd; from kvblockd.client import Client"
+          python bench/e2e/cpu/import_check.py
+          python bench/e2e/cpu/import_check_vllm_native.py

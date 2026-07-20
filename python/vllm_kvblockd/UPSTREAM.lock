@@ -1,0 +1,57 @@
+# UPSTREAM.lock — the exact vLLM sources this adapter was written against.
+#
+# Pinned: vllm-project/vllm tag v0.25.0
+#   commit 702f4814fe54fabff350d43cb753ae3e47c0c276  (tag object, fetched 2026-07-20)
+#
+# Files read at that tag (copies vendored under upstream_refs/, names
+# disambiguated because two of them are both called base.py):
+#
+#   vllm/distributed/kv_transfer/kv_connector/v1/base.py
+#       -> upstream_refs/kv_connector_v1_base.py        (KVConnectorBase_V1)
+#   vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py
+#       -> upstream_refs/example_connector.py           (SharedStorageConnector was
+#          RENAMED to ExampleConnector before v0.25.0 — the week-10 plan's model)
+#   vllm/distributed/kv_transfer/kv_connector/factory.py
+#       -> upstream_refs/kv_connector_factory.py        (external load path +
+#          3-arg-constructor enforcement + HMA gate)
+#   vllm/v1/kv_offload/base.py
+#       -> upstream_refs/kv_offload_base.py             (OffloadKey, ReqContext,
+#          LookupResult, OffloadingSpec)
+#   vllm/v1/kv_offload/tiering/base.py
+#       -> upstream_refs/tiering_base.py                (SecondaryTierManager,
+#          JobMetadata, JobResult)
+#   vllm/v1/kv_offload/tiering/factory.py
+#       -> upstream_refs/tiering_factory.py             (SecondaryTierFactory)
+#   vllm/v1/kv_offload/tiering/async_lookup.py
+#       -> upstream_refs/tiering_async_lookup.py        (AsyncLookupManager — the
+#          model for our _AsyncExistsBatcher; we vendor the PATTERN, not the import)
+#   vllm/v1/kv_offload/tiering/fs/manager.py
+#       -> upstream_refs/tiering_fs_manager.py          (FileSystemTierManager — the
+#          model implementation: strides[0] block size, DualQueueThreadPool)
+#
+# Churn survey across the A6 window (verified against raw tags 2026-07-20):
+#   - KVConnectorBase_V1.__init__(vllm_config, role, kv_cache_config) — IDENTICAL
+#     3-arg signature at v0.22.1, v0.23.0, v0.24.0, v0.25.0. The connector factory
+#     at v0.25.0 additionally REFUSES external connectors without a
+#     kv_cache_config kwarg, so the 3-arg form is mandatory and safe window-wide.
+#   - vllm/v1/kv_offload/tiering/{base,factory}.py present with the same
+#     SecondaryTierManager.__init__(offloading_spec, primary_kv_view, tier_type)
+#     at v0.22.1 and v0.23.0 (and v0.25.0). No documented skip is currently
+#     needed in the A6 matrix; the import check still prints SKIP (exit 0) if a
+#     future/older release lacks the tiering module.
+#   - HMA gate (v0.25.0 factory): a connector that does not implement SupportsHMA
+#     cannot be created unless --disable-hybrid-kv-cache-manager is passed.
+#     KvblockdConnector does not implement SupportsHMA in v0.1 -> the CPU e2e
+#     serve line carries that flag (bench/e2e/vllm-native-cpu.sh).
+#   - SPEC 5 §2.4 delta: the RFC-era tier config carried module_path/class_name
+#     INSIDE the tier dict. The MERGED v0.25.0 SecondaryTierFactory ignores
+#     those keys (registry-only resolution) and passes every non-"type" key to
+#     the tier constructor. Working out-of-tree loading goes through
+#     OffloadingSpecFactory: spec_name=KvblockdTieringSpec +
+#     spec_module_path=vllm_kvblockd.tier_manager (importing our module is what
+#     registers the "kvblockd" tier type). KvblockdTierManager still ACCEPTS
+#     and ignores module_path/class_name kwargs so RFC-shaped configs don't
+#     crash. The code is the contract, not the RFC (week-10 ruling).
+#
+# Re-verify this file's survey (and refresh upstream_refs/) before every vLLM
+# version bump — see the CHURN-WATCH header in src/vllm_kvblockd/connector.py.

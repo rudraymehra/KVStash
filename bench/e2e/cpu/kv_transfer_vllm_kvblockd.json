@@ -1,0 +1,7 @@
+{"kv_connector": "KvblockdConnector", "kv_role": "kv_both",
+ "kv_connector_module_path": "vllm_kvblockd.connector",
+ "kv_connector_extra_config": {
+   "kvblockd_endpoint": "kvblockd://127.0.0.1:9440",
+   "kvblockd_namespace": "vllm",
+   "kvblockd_token": "e2e-token",
+   "kvblockd_streams": 4}}

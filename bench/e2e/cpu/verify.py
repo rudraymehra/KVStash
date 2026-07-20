@@ -13,18 +13,32 @@ driven by the CI harness (e2e-cpu.yml restarts vLLM and re-invokes this
 script with --expect-hits, asserting (b) holds on a cold engine). Run twice:
 once plain, once post-restart with --expect-hits.
 
-Usage: verify.py --vllm http://127.0.0.1:18000 --metrics http://127.0.0.1:9442 [--expect-hits]
+MIXED-HIT mode (--prefix-mixed REF, engine must run with prefix caching
+ENABLED and a warm daemon): first request computes the PREFIX prompt, filling
+vLLM's LOCAL prefix cache from daemon loads; the second request sends the
+FULL prompt, so the scheduler sees a local hit on the prefix blocks AND a
+remote hit on the tail — the connector must load exactly the tail range. A
+mis-ranged load leaves attended-but-uninitialized KV, which surfaces here as
+a completion that differs from REF (saved by an earlier --save-ref run).
+
+Usage: verify.py --vllm http://127.0.0.1:18000 --metrics http://127.0.0.1:9442
+                 [--expect-hits] [--save-ref PATH | --prefix-mixed PATH]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import sys
 import time
 import urllib.request
 
-PROMPT = " ".join(["The quick brown fox jumps over the lazy dog."] * 16)  # ~640 tokens
+_SENTENCE = "The quick brown fox jumps over the lazy dog."
+PROMPT = " ".join([_SENTENCE] * 16)  # ~640 tokens
+# Cut at a sentence boundary so the prefix prompt's token ids are a strict
+# prefix of PROMPT's (mid-word cuts retokenize the seam).
+PREFIX_PROMPT = " ".join([_SENTENCE] * 8)
 
 
 def _post(url, payload):
@@ -48,17 +62,49 @@ def _hits(metrics_url) -> float:
     return total
 
 
+def _prefix_mixed(args) -> int:
+    """Mixed local+remote leg: warm the LOCAL prefix cache via the prefix
+    prompt (loaded from the daemon), then require the FULL prompt — whose
+    tail must load remotely — to reproduce the reference completion."""
+    ref = json.loads(pathlib.Path(args.prefix_mixed).read_text())["text"]
+    hits0 = _hits(args.metrics)
+    _post(args.vllm, {"model": args.model, "prompt": PREFIX_PROMPT,
+                      "temperature": 0.0, "max_tokens": 1})
+    out, _ = _post(args.vllm, {"model": args.model, "prompt": PROMPT,
+                               "temperature": 0.0, "max_tokens": 32})
+    hits = _hits(args.metrics)
+
+    ok = True
+    if out != ref:
+        print("FAIL (mixed): completion under a mixed local+remote prefix hit "
+              "differs from the reference (mis-ranged tail load?)", file=sys.stderr)
+        ok = False
+    if hits <= hits0:
+        print(f"FAIL (mixed): kvb_hits_total did not grow ({hits0} -> {hits}); "
+              "the mixed leg never touched the daemon", file=sys.stderr)
+        ok = False
+    print(json.dumps({"mixed_identical": out == ref, "kvb_hits_delta": hits - hits0}))
+    return 0 if ok else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--vllm", default="http://127.0.0.1:18000")
     ap.add_argument("--metrics", default="http://127.0.0.1:9442")
     ap.add_argument("--model", default="facebook/opt-125m")
     ap.add_argument("--expect-hits", action="store_true", help="post-restart run: require hits on a cold engine (property d)")
+    ap.add_argument("--save-ref", help="write the round-1 completion to PATH (reference for --prefix-mixed)")
+    ap.add_argument("--prefix-mixed", help="mixed local+remote leg: compare against the reference at PATH (engine must have prefix caching ENABLED)")
     args = ap.parse_args()
+
+    if args.prefix_mixed:
+        return _prefix_mixed(args)
 
     payload = {"model": args.model, "prompt": PROMPT, "temperature": 0.0, "max_tokens": 32}
 
     out1, ttft1 = _post(args.vllm, payload)
+    if args.save_ref:
+        pathlib.Path(args.save_ref).write_text(json.dumps({"text": out1}))
     time.sleep(1.0)
     out2, ttft2 = _post(args.vllm, payload)
     hits = _hits(args.metrics)

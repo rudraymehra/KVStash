@@ -1,0 +1,69 @@
+name: vllm-native-cpu
+
+# Week-10 gate: the NATIVE vLLM adapter (KvblockdConnector, no LMCache in the
+# loop) must serve opt-125m on the CPU backend with byte-identical completions,
+# kvb_hits_total > 0 on round 2, and hits SURVIVING a vLLM restart against the
+# same daemon. Cloned from the Week-5 e2e-cpu.yml leg; the recipe itself lives
+# in bench/e2e/vllm-native-cpu.sh so the Mac dev loop and CI run one script.
+# Cost: dispatch-only + PR-path-triggered while private (same policy as e2e-cpu).
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "python/**"
+      - "internal/protocol/**"
+      - "bench/e2e/cpu/**"
+      - "bench/e2e/vllm-native-cpu.sh"
+      - ".github/workflows/vllm-native-cpu.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: cache pip + wheels
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: vllm-native-cpu-${{ hashFiles('bench/e2e/cpu/versions.env') }}
+      - name: install stack (CPU torch + vllm + adapter)
+        run: bash bench/e2e/vllm-native-cpu.sh install
+      - name: adapter import + instantiate tripwire
+        env:
+          PYTHONHASHSEED: "0"
+        run: python bench/e2e/cpu/import_check_vllm_native.py
+      - name: daemon + vLLM serve + verify + restart-persistence
+        env:
+          PYTHONHASHSEED: "0"
+          VLLM_CPU_KVCACHE_SPACE: "1"
+          OMP_NUM_THREADS: "1"
+        run: bash bench/e2e/vllm-native-cpu.sh serve
+      - name: logs
+        if: always()
+        run: |
+          echo "=== daemon ==="; tail -50 /tmp/kvbd-native.log 2>/dev/null || true
+          echo "=== vllm (round A) ==="; tail -50 /tmp/vllm-native.log 2>/dev/null || true
+          echo "=== vllm (round B, post-restart) ==="; tail -50 /tmp/vllm-native2.log 2>/dev/null || true
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-native-cpu-logs
+          path: |
+            /tmp/kvbd-native.log
+            /tmp/vllm-native.log
+            /tmp/vllm-native2.log
+          if-no-files-found: ignore

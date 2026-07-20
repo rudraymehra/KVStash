@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-kvblockd"
+version = "0.1.0"
+description = "vLLM native KV-transfer adapter backed by kvblockd (KVConnectorBase_V1 + SecondaryTierManager)"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Rudray Mehra", email = "rudraymehra@gmail.com" }]
+dependencies = [
+    "kvblockd>=0.1.0",
+    "numpy",  # JobMetadata.block_ids is an np.ndarray; also zero-copy tensor views
+]
+
+[project.optional-dependencies]
+# vllm is NEVER a hard runtime dep: the plugin is loaded BY vllm
+# (kv_connector_module_path / spec_module_path), so a hard pin would make the
+# package uninstallable next to a vllm the resolver dislikes. The pin lives
+# here, as the tested window (gate A6: last 4 minors).
+vllm = ["vllm>=0.22,<0.26"]
+test = ["pytest>=8", "torch"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vllm_kvblockd"]
+
+[tool.hatch.build.targets.sdist]
+# Vendored upstream reference copies are for contract review, not distribution.
+exclude = ["upstream_refs"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Vendored vLLM reference copies (UPSTREAM.lock) are upstream's style, not ours.
+extend-exclude = ["upstream_refs"]
