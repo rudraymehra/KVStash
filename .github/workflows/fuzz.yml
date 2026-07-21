@@ -37,7 +37,7 @@ jobs:
           PKG: ${{ matrix.pkg }}
       - name: upload corpus and crashers
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: corpus-${{ matrix.func }}
           path: "**/testdata/fuzz/**"
@@ -81,7 +81,7 @@ jobs:
             -rapid.checks=20000 -rapid.steps=500 || echo "CRASH=1" >> "$GITHUB_ENV"
       - name: upload shrunk seeds
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rapid-seeds
           path: "**/testdata/rapid/**"

@@ -84,7 +84,7 @@ jobs:
           echo "=== vllm (post-restart) ==="; tail -50 /tmp/vllm2.log 2>/dev/null || true
       - name: upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-cpu-logs
           path: |
