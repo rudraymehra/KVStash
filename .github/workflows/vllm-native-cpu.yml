@@ -59,7 +59,7 @@ jobs:
           echo "=== vllm (round B, post-restart) ==="; tail -50 /tmp/vllm-native2.log 2>/dev/null || true
       - name: upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vllm-native-cpu-logs
           path: |
