@@ -9,7 +9,7 @@ published benchmarks actually ran — nothing aspirational.
 
 Pick one:
 
-- **Script:** `curl -fsSL https://raw.githubusercontent.com/kvstash/kvblockd/main/scripts/install.sh | sh`
+- **Script:** `curl -fsSL https://raw.githubusercontent.com/rudraymehra/KVStash/main/scripts/install.sh | sh`
 - **Tarball:** grab `kvblockd_<ver>_<os>_<arch>.tar.gz` from releases, verify
   against `checksums.txt`, untar; the binaries are static — copy them anywhere.
 - **Docker:**
@@ -18,7 +18,7 @@ Pick one:
     -v $PWD/config:/config \
     -e KVBLOCKD_NAMESPACES=/config/namespaces.yaml \
     -e KVBLOCKD_METRICS_ADDR=0.0.0.0:9442 \
-    ghcr.io/kvstash/kvblockd:<ver>
+    ghcr.io/rudraymehra/kvblockd:<ver>
   ```
   (`FROM scratch` — no shell inside. The metrics override matters: the
   default bind is container-loopback, dead through `-p`.)

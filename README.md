@@ -13,7 +13,7 @@
 ## 60-second quickstart
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kvstash/kvblockd/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/rudraymehra/KVStash/main/scripts/install.sh | sh
 kvblockd --config /usr/local/etc/kvblockd/example.yaml &   # :9440, 1 GiB DRAM arena, demo tenant
 echo hello | kvbctl put -ns demo -token demo-token demo-key -
 kvbctl get -ns demo -token demo-token demo-key             # → hello
