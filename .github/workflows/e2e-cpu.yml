@@ -37,7 +37,7 @@ jobs:
           echo $! > /tmp/kvbd.pid
           bash scripts/wait-healthz.sh 127.0.0.1:9442 30
       - name: cache pip + wheels
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: e2e-cpu-${{ hashFiles('bench/e2e/cpu/versions.env') }}
