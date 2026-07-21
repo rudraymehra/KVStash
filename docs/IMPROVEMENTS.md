@@ -36,6 +36,7 @@ debt and headroom). Dates are when the entry was recorded.
 | SGLang v2 controller methods (stubbed `NotImplementedError`) | Upstream interface still churning (sgl-project/sglang#18239) | A tagged SGLang release stabilizes v2 |
 | NIXL native C++ plugin — beta posture | C-11 reclassified it stretch (segfault-class unknowns vs a zero-code S3-compat path that already works) | NIXL CI green across HEAD+tag for a sustained window; a partner asks for the native path |
 | vLLM connector churn-watch (`SharedStorageConnector`→`ExampleConnector` rename; RFC tier-dict loading never merged) | Upstream moves faster than releases; A6 matrix + UPSTREAM.lock are the tripwire | A6 matrix failure on any new vLLM release |
+| Heavy external-integration CI legs have never gone green on first contact (2026-07-21): `e2e-cpu` sglang real-ABC import → `TypeError: int() ... not NoneType`; `vllm-native-cpu` full CPU serve; `nixl` meson configure (NIXL built from source). NOT on the main-push path (PR/dispatch/cron only) so main stays green; our own correctness is covered by ci.yml (unit + race + torture + the vLLM-adapter UNIT job, all green) | Each leg installs a GB-scale upstream / builds a C++ dep from the internet — fragile, drift-driven, and they last failed inside a Dependabot PR's restricted context (no secrets), which muddies the signal. Real triage needs a clean dispatch run per leg | Before relying on any adapter's live-integration claim; also add an `if: github.actor != 'dependabot[bot]'` guard so action-bump PRs stop tripping them |
 
 ## Binary size
 
