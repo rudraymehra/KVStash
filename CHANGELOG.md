@@ -4,6 +4,55 @@ All notable changes to kvblockd will be documented in this file.
 Format: Keep a Changelog (https://keepachangelog.com), SemVer after v0.1.0.
 
 ## [Unreleased]
+
+> In flight, pending merge (not yet on main): **lazy whole-segment restore**
+> (repeated cold hits pull the whole segment back to NVMe and flip its
+> entries home) + **S3 object GC** (delete a retired segment's object once
+> its last s3-resident entry is gone). Tracked with revisit triggers in
+> `docs/IMPROVEMENTS.md`.
+
+### Added
+- `python/vllm_kvblockd`: native vLLM integration — a KVConnector-v1
+  connector with no LMCache in the path, plus `KvblockdTierManager` for
+  vLLM's offloading/tiering altitude. Model-fingerprinted keys pinned by
+  golden vectors; the pinned upstream contract carried in `UPSTREAM.lock`;
+  unit suites run against a real daemon. The tier-manager GPU e2e is
+  deferred until a GPU session is funded (`DEFER.md` in-package — the
+  announcement must not outrun the evidence); the heavy live-serve CI leg
+  (`vllm-native-cpu`) is dispatch-gated and ledgered in
+  `docs/IMPROVEMENTS.md`.
+- `python/sglang_kvblockd`: SGLang HiCacheStorage v1 backend (zero-copy
+  `batch_get_v1`/`batch_set_v1` into the pinned host pool, consecutive-prefix
+  `batch_exists`, rank/model-fingerprinted keys with golden vectors) + CPU
+  unit suite + `sglang-cpu` CI tripwire leg. Spike verdict: **DEFER** — CPU-
+  validated, not GPU-validated; not published to PyPI. Blocker + revisit
+  trigger in `docs/design/sglang-hicache-v1.1.md`; v2 controller methods
+  stubbed pending sgl-project/sglang#18239.
+- `adapters/nixl`: native C++ NIXL storage-backend plugin (**beta**) —
+  `libplugin_KVBLOCKD.so` discovered via `NIXL_PLUGIN_DIR`; WRITE maps to
+  `PUT_STREAM BEGIN→CHUNK→COMMIT`, READ to `BATCH_GET` tiled across a
+  connection pool with per-block xxh3 verification. The NIXL-free C++
+  client core (KVB1 codec, HELLO auth, all 8 verbs, credit ledger)
+  byte-compares against the Go/Python golden vectors; meson build +
+  `nixl.yml` CI leg. The S3-compat endpoint is the zero-code default path
+  for NIXL; this plugin is the performance path — CI-tracked, not GA.
+- S3-compatibility endpoint: `s3compat_addr` (default off) serves a minimal
+  S3 REST subset — PutObject, GetObject with Range, HeadObject — on its own
+  listener, so NIXL's `obj` plugin and vLLM's `obj` tier reach kvblockd with
+  zero plugin code via `endpoint_override`. Bucket = namespace against the
+  same tenant registry and constant-time token compare as HELLO (unknown
+  bucket and wrong token collapse to one 403 — no enumeration oracle);
+  accepts Bearer and SigV4-shaped auth (the access-key id is the token; the
+  signature is deliberately not verified — a documented divergence); the
+  object key is the 64-hex encoding of the 32-byte block key. A
+  compatibility surface, not the performance path: every GET copies to the
+  heap before `net/http`.
+
+## [0.1.0-rc1] - 2026-07-18
+
+_Pre-release: the foundation. Everything below first shipped in this tag
+and is included in v0.2.0._
+
 ### Added
 - Repository scaffold: module, license, CI, directory structure.
 - `docs/PROTOCOL.md`: frozen wire protocol v1 (KVB1) — 64-byte header, 8 batch
@@ -59,13 +108,6 @@ Format: Keep a Changelog (https://keepachangelog.com), SemVer after v0.1.0.
   (statically linked + <20 MB + scratch-boot gates), SBOMs, `FROM scratch`
   Docker image, `deploy/kvblockd.service`, `scripts/install.sh`, and the
   tag-driven release workflow.
-- `python/sglang_kvblockd`: SGLang HiCacheStorage v1 backend (zero-copy
-  `batch_get_v1`/`batch_set_v1` into the pinned host pool, consecutive-prefix
-  `batch_exists`, rank/model-fingerprinted keys with golden vectors) + CPU
-  unit suite + `sglang-cpu` CI tripwire leg. Spike verdict: **DEFER** — CPU-
-  validated, not GPU-validated; not published to PyPI. Blocker + revisit
-  trigger in `docs/design/sglang-hicache-v1.1.md`; v2 controller methods
-  stubbed pending sgl-project/sglang#18239.
 
 ### Changed
 - Transport writes are windowed at `write_chunk_bytes` (~1 MiB) per writev
@@ -124,6 +166,12 @@ Format: Keep a Changelog (https://keepachangelog.com), SemVer after v0.1.0.
 - S3 observability: an `s3` sub-document in STATS (resident blocks/bytes,
   spill/drop/put-error, ranged-get/restore, hit/read-error counters) and the
   `kvb_s3_*` scrape families; `kvb_blocks`/`kvb_store_bytes` gain tier="s3".
+
+### Changed
+- Release: the static-binary size gate (`test/release/assert_static.sh`) was
+  raised 20 MB → 24 MB to admit the full-featured S3-tier binary
+  (aws-sdk-go-v2 is the growth); a `kvb_nos3` slim build is ledgered as
+  future work in `docs/IMPROVEMENTS.md`.
 
 ### Fixed
 - Tier-exact refunds: removing an s3-resident (retire-flipped) entry refunds
