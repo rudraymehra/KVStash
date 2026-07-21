@@ -35,7 +35,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: cache pip + wheels
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: vllm-native-cpu-${{ hashFiles('bench/e2e/cpu/versions.env') }}
