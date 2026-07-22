@@ -24,7 +24,10 @@
 package modeltest
 
 import (
+	"fmt"
+
 	"github.com/kvstash/kvblockd/internal/eviction"
+	"github.com/kvstash/kvblockd/internal/protocol"
 )
 
 // mBlock is the model's copy of one committed block.
@@ -111,8 +114,32 @@ func (m *model) noteDeleted(k eviction.Key) {
 	m.ghosts[k] = m.epoch
 }
 
-// crashed bumps the epoch (called by simulate_crash).
-func (m *model) crashed() { m.epoch++ }
+// crashed applies simulate_crash's whole model transition (also driven
+// directly by the deterministic crash-survivor regression): the epoch bump
+// makes deleted-key ghosts resurrectable from here on, and every surviving
+// block reverts to the anyOf form — DRAM contents vanished, protection
+// state (leases/pins — memory-only) vanished, and recovery may resurface
+// ANY committed-and-persisted content for a key, not just the latest.
+// Force-delete + re-put under one key composes with the non-crash-durable
+// NVMe DELETE: the pre-delete bytes legally come back while the re-put
+// (DRAM-only at the kill) is legally lost. The deep gauntlet found this
+// after 795 walks: the model pinned the key to its LATEST content and
+// called the resurrected older version an I1 violation. So every surviving
+// block reverts to the anyOf form the ghost path already uses; the next
+// byte-carrying observation pins it down. I1 keeps its teeth — served
+// bytes outside the key's committed history still fail.
+func (m *model) crashed() {
+	m.epoch++
+	for k, b := range m.blocks {
+		b.maybeGone = true
+		b.leaseUntil = 0
+		b.ttlUntil = 0
+		b.soft, b.hard = false, false
+		b.pinCharge, b.pinChargeUnknown = 0, false
+		b.data, b.xxh3, b.anyOf = nil, 0, m.history[k]
+	}
+	m.pinned = map[uint32]int64{}
+}
 
 // resurrectable reports whether an observation of the model-absent key k is
 // explainable as post-crash resurrection.
@@ -152,6 +179,94 @@ func (m *model) resolveBytes(ns uint32, b *mBlock, data []byte, sum uint64) bool
 		}
 	}
 	return false
+}
+
+// applyPut reconciles one PUT's observed status against the model and
+// applies the resulting transition — the write-once truth table the machine
+// asserts after every put action. Returns "" when the outcome is legal,
+// else the invariant-violation message (the machine Fatalfs it verbatim).
+// Extracted from the rapid closure so the deterministic crash-survivor
+// regression drives the SAME oracle the random walks use.
+func (m *model) applyPut(k eviction.Key, data []byte, sum uint64, st protocol.Status) string {
+	e := m.blocks[k]
+	switch {
+	case e == nil:
+		switch {
+		case st == protocol.StatusOK:
+			m.insert(k, data, sum)
+		case st == protocol.StatusErrQuotaBytes: // full arena, no evictor: legal
+		case st == protocol.StatusOKExists && m.resurrectable(k):
+			// A crash resurrected the deleted key with OUR sum: the resident
+			// content is (xxh3-)identical to this put.
+			b := m.materializeGhost(k)
+			if !m.resolveBytes(k.NS, b, data, sum) {
+				return fmt.Sprintf("put resurrected-dup: OK_EXISTS but %v matches no history", k)
+			}
+			b.maybeGone = false
+		case st == protocol.StatusErrImmutableConflict && m.resurrectable(k):
+			// Resurrected with some OTHER historical content — the write-once
+			// alarm is correct; content pins down at the next GET.
+			m.materializeGhost(k).maybeGone = false
+		default:
+			return fmt.Sprintf("put fresh: %s", st)
+		}
+	case e.anyOf != nil:
+		// Unresolved post-crash block (a crash SURVIVOR the model kept, or a
+		// materialized ghost no observation has pinned down): its resident
+		// content — if the key survived at all — is SOME member of the key's
+		// committed history, unknown until byte-carrying evidence arrives.
+		// e.xxh3 is 0 here (a placeholder, not knowledge), so the dup/conflict
+		// split below would misclassify EVERY put as conflicting content and
+		// reject a legal OK_EXISTS — the 2026-07-22 CI model-soak failure:
+		// put C → demote to NVMe → crash → recovery resurfaces C → put C
+		// again is a digest-verified write-once hit the harness called a
+		// violation (schedule-dependent because survival depends on whether
+		// the record reached the file before the kill). Same semantics the
+		// e==nil ghost arm above already grants; survivors get them too.
+		switch {
+		case st == protocol.StatusOKExists:
+			// The store vouches a RESIDENT block carries this put's digest:
+			// legal iff the bytes are one of the key's committed contents
+			// (crash recovery may resurface any of them — never invented
+			// ones), and the match pins the block down exactly like a GET.
+			if !m.resolveBytes(k.NS, e, data, sum) {
+				return fmt.Sprintf("put survivor-dup: OK_EXISTS but %v matches no committed content", k)
+			}
+			e.maybeGone = false // the write-once gate answered on a resident block
+		case st == protocol.StatusErrImmutableConflict:
+			// Resident with some OTHER historical content — the write-once
+			// alarm is correct; the content pins down at the next
+			// byte-carrying observation. The refusal itself proves residency.
+			e.maybeGone = false
+		case st == protocol.StatusOK && e.maybeGone:
+			m.insert(k, data, sum) // did not survive the crash: fresh insert
+		case st == protocol.StatusErrQuotaBytes && e.maybeGone:
+			delete(m.blocks, k) // gone AND the arena is full
+		default:
+			return fmt.Sprintf("put unresolved: %s (maybeGone=%v)", st, e.maybeGone)
+		}
+	case e.xxh3 == sum: // duplicate content
+		switch {
+		case st == protocol.StatusOKExists: // present (maybeGone stays — bytes unverified)
+		case st == protocol.StatusOK && e.maybeGone: // was evicted: fresh insert
+			m.insert(k, data, sum)
+		case st == protocol.StatusErrQuotaBytes && e.maybeGone: // evicted AND arena full
+			delete(m.blocks, k)
+		default:
+			return fmt.Sprintf("put dup: %s (maybeGone=%v)", st, e.maybeGone)
+		}
+	default: // conflicting content
+		switch {
+		case st == protocol.StatusErrImmutableConflict:
+		case st == protocol.StatusOK && e.maybeGone:
+			m.insert(k, data, sum)
+		case st == protocol.StatusErrQuotaBytes && e.maybeGone:
+			delete(m.blocks, k)
+		default:
+			return fmt.Sprintf("put conflict: %s (maybeGone=%v)", st, e.maybeGone)
+		}
+	}
+	return ""
 }
 
 func bytesEqual(a, b []byte) bool {

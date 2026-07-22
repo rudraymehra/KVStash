@@ -374,50 +374,10 @@ func TestStoreModel(t *testing.T) {
 				fill := rapid.Byte().Draw(rt, "fill")
 				data := bytes.Repeat([]byte{fill ^ byte(ns)}, size) //nolint:gosec // G115: byte mixing
 				sum := xxh3.Hash(data)
-				st := s.Put(ns, h, data, sum)
-				e := m.blocks[k]
-				switch {
-				case e == nil:
-					switch {
-					case st == protocol.StatusOK:
-						m.insert(k, data, sum)
-					case st == protocol.StatusErrQuotaBytes: // full arena, no evictor: legal
-					case st == protocol.StatusOKExists && m.resurrectable(k):
-						// A crash resurrected the deleted key with OUR sum:
-						// the resident content is (xxh3-)identical to this put.
-						b := m.materializeGhost(k)
-						if !m.resolveBytes(k.NS, b, data, sum) {
-							rt.Fatalf("put resurrected-dup: OK_EXISTS but %v matches no history", k)
-						}
-						b.maybeGone = false
-					case st == protocol.StatusErrImmutableConflict && m.resurrectable(k):
-						// Resurrected with some OTHER historical content —
-						// the write-once alarm is correct; content pins down
-						// at the next GET.
-						m.materializeGhost(k).maybeGone = false
-					default:
-						rt.Fatalf("put fresh: %s", st)
-					}
-				case e.xxh3 == sum: // duplicate content
-					switch {
-					case st == protocol.StatusOKExists: // present (maybeGone stays — bytes unverified)
-					case st == protocol.StatusOK && e.maybeGone: // was evicted: fresh insert
-						m.insert(k, data, sum)
-					case st == protocol.StatusErrQuotaBytes && e.maybeGone: // evicted AND arena full
-						delete(m.blocks, k)
-					default:
-						rt.Fatalf("put dup: %s (maybeGone=%v)", st, e.maybeGone)
-					}
-				default: // conflicting content
-					switch {
-					case st == protocol.StatusErrImmutableConflict:
-					case st == protocol.StatusOK && e.maybeGone:
-						m.insert(k, data, sum)
-					case st == protocol.StatusErrQuotaBytes && e.maybeGone:
-						delete(m.blocks, k)
-					default:
-						rt.Fatalf("put conflict: %s (maybeGone=%v)", st, e.maybeGone)
-					}
+				// The write-once truth table lives in model.applyPut (shared
+				// with the deterministic crash-survivor regression).
+				if msg := m.applyPut(k, data, sum, s.Put(ns, h, data, sum)); msg != "" {
+					rt.Fatalf("%s", msg)
 				}
 			},
 			"get": func(rt *rapid.T) {
@@ -741,29 +701,10 @@ func TestStoreModel(t *testing.T) {
 				}
 				tt.CrashForTest() // volumes drop fds mid-flight, arena unmapped — SIGKILL semantics
 				mkSUT()           // reopen the SAME volume dir: real recovery runs
-				m.crashed()       // deleted-key ghosts become resurrectable from here on
-				// The model after a crash: DRAM contents vanished, protection
-				// state (leases/pins — memory-only) vanished, and recovery may
-				// resurface ANY committed-and-persisted content for a key —
-				// not just the latest. Force-delete + re-put under one key
-				// composes with the non-crash-durable NVMe DELETE: the
-				// pre-delete bytes legally come back while the re-put (DRAM-
-				// only at the kill) is legally lost. The deep gauntlet found
-				// this after 795 walks: the model pinned the key to its
-				// LATEST content and called the resurrected older version an
-				// I1 violation. So every surviving block reverts to the anyOf
-				// form the ghost path already uses; the next byte-carrying
-				// observation pins it down. I1 keeps its teeth — served bytes
-				// outside the key's committed history still fail.
-				for k, b := range m.blocks {
-					b.maybeGone = true
-					b.leaseUntil = 0
-					b.ttlUntil = 0
-					b.soft, b.hard = false, false
-					b.pinCharge, b.pinChargeUnknown = 0, false
-					b.data, b.xxh3, b.anyOf = nil, 0, m.history[k]
-				}
-				m.pinned = map[uint32]int64{}
+				// Ghost epoch bump + every surviving block reverts to the
+				// anyOf form (recovery may resurface ANY committed content —
+				// see model.crashed for the full rationale).
+				m.crashed()
 				// I6: the recovered index matches storage — every entry the
 				// store still vouches for must read back checksum-clean.
 				if bad := tt.Scrub(); bad != 0 {
