@@ -1,8 +1,8 @@
 # kvblockd
 
-**A single static Go binary that serves LLM KV-cache blocks at 10+ GB/s over the plain TCP you already have.** Engines (vLLM via LMCache today; SGLang/NIXL next) store prefix-keyed, write-once cache blocks here and load them back faster than the GPU can recompute them — DRAM-tiered, NVMe-backed, multi-tenant, and honest about every number it publishes.
+**A single static Go binary that serves LLM KV-cache blocks at 10+ GB/s over the plain TCP you already have.** Engines (vLLM via LMCache today; native vLLM, SGLang, and NIXL adapters on `main`, validation-gated) store prefix-keyed, write-once cache blocks here and load them back faster than the GPU can recompute them — tiered DRAM → NVMe → S3, multi-tenant, and honest about every number it publishes.
 
-> **Status: pre-release (v0.1.0-rc).** The wire protocol is frozen at v1, the DRAM and NVMe tiers ship, and the transport numbers below are measured. The two headline charts (throughput matrix vs baselines; TTFT vs hit rate on a real vLLM stack) land here from the committed benchmark harness — raw JSONL first, pictures second.
+> **Status: all three tiers — DRAM, NVMe, S3 — ship on `main`. Latest published release: v0.2.0** (the S3 tier landed there; lazy cold-segment restore + cold-object GC completed on `main` since). The wire protocol is frozen at v1 and the transport numbers below are measured. The two headline charts (throughput matrix vs baselines; TTFT vs hit rate on a real vLLM stack) land here from the committed benchmark harness — raw JSONL first, pictures second.
 
 ## Why
 
@@ -38,13 +38,13 @@ Chart 1 (GB/s vs Redis 7 / Valkey 8 / Mooncake-TCP / NVMe-fs floor, two client c
 | | kvblockd | [LMCache](https://github.com/LMCache/LMCache) | [Mooncake](https://github.com/kvcache-ai/Mooncake) | PegaFlow | InfiniStore | Redis / Valkey |
 |---|---|---|---|---|---|---|
 | Standalone TCP data plane for MB blocks | **yes — the product** | no (Python lib inside the engine process; remote stores via connectors) | TCP mode exists; designed and tuned for RDMA ([Transfer Engine docs](https://kvcache-ai.github.io/Mooncake/)) | no | RDMA-first | protocol yes; string-store semantics, not MB-block zero-copy ([LMCache #2204](https://github.com/LMCache/LMCache/issues/2204)) |
-| Tenancy + quotas | **ships v0.2** (namespace identity is already structural at HELLO) | no ([#2878](https://github.com/LMCache/LMCache/issues/2878): `cache_salt` ignored on the remote path) | no per-tenant quotas ([#1035](https://github.com/kvcache-ai/Mooncake/issues/1035)) | no | no | ACLs, no cache-aware quotas |
+| Tenancy + quotas | **shipped v0.2.0** (namespace identity is already structural at HELLO) | no ([#2878](https://github.com/LMCache/LMCache/issues/2878): `cache_salt` ignored on the remote path) | no per-tenant quotas ([#1035](https://github.com/kvcache-ai/Mooncake/issues/1035)) | no | no | ACLs, no cache-aware quotas |
 | TTL / lease / pin ladder | **yes** ([PROTOCOL.md §6](docs/PROTOCOL.md)) | TTL only | no lease/pin | no | no | TTL only |
-| S3 / object tier | **ships v1.0.0** (binding roadmap — see note) | via pluggable backends | no | no | no | no |
+| S3 / object tier | **yes — shipped v0.2.0**, completed on `main` (see note) | via pluggable backends | no | no | no | no |
 | Warm restart after kill -9 | **yes — measured** (100-loop torture, contract above) | n/a (in-process cache) | metadata lives in etcd | no (SSD index held in memory) | no | RDB/AOF replay; no block-level crash contract |
 | Single static binary, no sidecars | **yes (~21 MB, S3 tier included)** | no (pip package + engine) | no (etcd + C++ toolchain) | no | no | server + client libraries |
 
-**Honesty notes:** tenancy/quota *enforcement* ships v0.2 — in this build namespaces isolate identity and pinned-bytes accounting, full per-tenant quotas/QoS are next. The S3 tier is a v1.0.0 commitment bound by this project's founding rulings (all three tiers are the point) — it is **not in this build**, and we say so rather than demo-ware it. Competitor cells describe the linked docs/issues as of writing; if we got one wrong, file an issue and the table gets fixed.
+**Honesty notes:** tenancy + quotas shipped in v0.2.0 — hashed-token namespace registry, per-(namespace, tier) byte accounting with CAS admission (`ERR_QUOTA_BYTES` at PUT, binding charge at commit), per-namespace pin quota, over-quota-first eviction, per-tenant metrics. Open scope, stated plainly: the DRAM quota is *enforced*; NVMe/S3 quotas are accounted and reported but not yet enforced (reclaim-ordering design pending — [docs/ROADMAP.md](docs/ROADMAP.md)); per-tenant QoS stays future commercial-edition scope. The S3 tier shipped in v0.2.0 (async spill; reclaim retire-flips entries s3-resident; cold GETs are single ranged reads, xxh3-verified before a byte escapes; EXISTS never touches S3) and is completed on `main` — repeated cold hits restore the whole segment back to NVMe and flip its entries home, and cold-object GC deletes a retired segment's object once its last s3-resident entry is gone. Competitor cells describe the linked docs/issues as of writing; if we got one wrong, file an issue and the table gets fixed.
 
 ## When NOT to use kvblockd
 
@@ -56,7 +56,7 @@ Chart 1 (GB/s vs Redis 7 / Valkey 8 / Mooncake-TCP / NVMe-fs floor, two client c
 
 ## v1 cut-line
 
-TCP only (MSG_ZEROCOPY/sendfile-class optimizations in scope; RDMA/AF_XDP/DPDK out). Reached through the connectors people already run — LMCache → vLLM today; NIXL and SGLang next, paths reserved in [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md). Blocks are opaque sealed bytes — the server never parses tensors. No HA/replication in v1. Tenancy quotas v0.2; S3 tier v1.0.0.
+TCP only (MSG_ZEROCOPY/sendfile-class optimizations in scope; RDMA/AF_XDP/DPDK out). Reached through the connectors people already run — LMCache → vLLM today; on `main`: a native vLLM connector (code-complete, GPU e2e deferred), an SGLang HiCache backend (CPU-validated, verdict DEFER until a GPU run), a native NIXL C++ plugin (beta), and the S3-compat endpoint as the zero-code NIXL/`obj` path ([docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)). Blocks are opaque sealed bytes — the server never parses tensors. No HA/replication in v1. Tenancy quotas and the S3 tier both shipped in v0.2.0; the cold tier is completed on `main`.
 
 ## Security model
 

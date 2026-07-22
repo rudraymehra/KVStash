@@ -83,18 +83,45 @@ full stack on `facebook/opt-125m` (CPU) at the pinned
 | `connection refused` in logs, serving still works | expected during a daemon restart — the connector re-dials lazily; hits resume once it's back |
 | vLLM won't build on macOS arm64 | known upstream flakiness — the CI gate (ubuntu) is authoritative; on Mac, run the connector unit suite (`pytest python/lmcache_kvblockd/tests`) which exercises every line of the adapter against a real daemon without vLLM |
 
-## Next connectors (status: reserved, not shipped)
+## Follow-on connectors (status: on `main`, validation-gated)
 
 The strategy is fixed: kvblockd is reached through the connectors people
-already run, in this order — nothing here is speculative enough to promise a
-date, and nothing ships half-working.
+already run, in this order. All three follow-on connectors now have real
+code merged on `main` — but merged is not GA: each row states what is
+validated and what is still gated, and nothing is called supported until
+its pre-registered gate is green.
 
-| Connector | Status | Reserved path |
+| Connector | Status | Path |
 |---|---|---|
 | LMCache → vLLM | **shipped** (above) | `python/lmcache_kvblockd/` |
-| vLLM native connector | next | `adapters/vllm/` (created when work starts) |
-| NIXL plugin | planned | `adapters/nixl/` |
-| SGLang HiCache backend | planned | `adapters/sglang/` (created when work starts) |
+| vLLM native connector | **on `main`** — code-complete, CPU-validated in CI; GPU e2e deferred | `python/vllm_kvblockd/` |
+| NIXL | **beta** (native plugin); zero-code today via the S3-compat endpoint | `adapters/nixl/` + `internal/server/s3compat.go` |
+| SGLang HiCache backend | **on `main`** — CPU-validated; verdict **DEFER** until a GPU run | `python/sglang_kvblockd/` |
+
+Per-connector honesty notes:
+
+- **vLLM native** (`vllm-kvblockd`): a native KVConnector-v1
+  (`KvblockdConnector`) plus the `KvblockdTierManager` offloading altitude.
+  The connector runs end-to-end on the vLLM CPU backend in CI
+  (`.github/workflows/vllm-native-cpu.yml`); the tier manager is
+  code-complete and unit-tested against a real daemon, but its GPU
+  end-to-end is deferred, not faked — the exact revisit trigger and pass
+  criteria live in `python/vllm_kvblockd/DEFER.md`. Not on PyPI yet.
+- **NIXL**: two paths. The zero-code default is the S3-compatibility
+  endpoint (`s3compat_addr`, off unless configured) — NIXL's stock `obj`
+  plugin (and vLLM's `obj` tier) reach kvblockd via `endpoint_override`
+  with no plugin code (`internal/server/s3compat.go`). The native C++
+  plugin (`libplugin_KVBLOCKD.so`) is the performance path: **beta**,
+  CI-tracked (`.github/workflows/nixl.yml`), not GA — caveats in
+  `adapters/nixl/README.md`.
+- **SGLang** (`sglang-kvblockd`): a HiCacheStorage **v1** backend,
+  CPU-validated (23-test suite against a live daemon, plus the
+  `sglang-cpu` tripwire job in `e2e-cpu.yml`) — **not GPU-validated and
+  not on PyPI**; the pre-registered SHIP gate and its blocker are in
+  [docs/design/sglang-hicache-v1.1.md](design/sglang-hicache-v1.1.md). The
+  HiCache **v2** controller methods are stubbed pending upstream
+  stabilization
+  ([sgl-project/sglang#18239](https://github.com/sgl-project/sglang/issues/18239)).
 
 Version-compatibility policy: each shipped connector pins the upstream
 releases it is tested against (the support matrix above); when an upstream

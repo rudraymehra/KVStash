@@ -61,6 +61,63 @@ are collected._
   compatibility surface, not the performance path: every GET copies to the
   heap before `net/http`.
 
+## [0.2.0] - 2026-07-20
+
+### Added
+- Multi-tenant byte quotas: per-(namespace, tier) accounting with CAS
+  admission — charged at publish, refunded at every removal seam (delete,
+  eviction, lost publish race, reclaim retire, corrupt-entry self-heal),
+  transferred on tier moves, re-seeded from recovery so a restart never mints
+  free bytes. PUT BEGIN answers `ERR_QUOTA_BYTES` from an advisory probe; the
+  binding charge is commit-time. No wire change. Over-quota tenants are
+  evicted first under shared pressure; cross-tenant probes answer
+  `NOT_FOUND`, never `FORBIDDEN` (no existence oracle).
+- Namespace registry with hashed bearer tokens: `namespaces.yaml` carries
+  `token_sha256` (plaintext `token` accepted and hashed at load, never
+  retained); constant-time authentication with uniform timing for unknown
+  names; per-tier quotas + pin quota per namespace.
+- Admin socket: loopback-only HTTP surface (`admin_addr`) — `POST
+  /v1/namespace`, `POST /v1/quota`, `GET /v1/namespaces` (tokens never
+  listed); mutations are runtime-only and say so (persist via the namespaces
+  file).
+- `kvbctl` admin verbs: `namespace add|list` and `quota set` against the
+  admin socket, alongside the existing data-plane verbs.
+- Per-tenant metrics: `kvb_tenant_bytes` + `kvb_tenant_quota_bytes` labeled
+  `{namespace, tier}` — cardinality #namespaces × 3 tiers, pinned by test.
+- S3 cold tier: one sealed NVMe segment = one whole S3 object (request-cost
+  coalescing), spilled on a bounded async write-back queue — a copy, reads
+  stay local; reclaim of a spilled segment retire-flips its entries to
+  s3-resident (index entries survive, the tenant charge moves NVMe→S3); cold
+  GETs are single ranged GetObject reads, xxh3-verified before a byte
+  escapes; EXISTS never touches S3; restart re-spills idempotently (spilled
+  state is memory-only; s3-only entries are honestly lost at restart).
+  Config keys: `s3_bucket` (tier inert until set), `s3_region`, `s3_node_id`,
+  `s3_endpoint_override`, `s3_path_style`, `s3_spill_queue`,
+  `s3_read_timeout_ms`; credentials come from the ambient AWS chain only —
+  never from kvblockd config.
+- S3 observability: an `s3` sub-document in STATS (resident blocks/bytes,
+  spill/drop/put-error, ranged-get/restore, hit/read-error counters) and the
+  `kvb_s3_*` scrape families; `kvb_blocks`/`kvb_store_bytes` gain tier="s3".
+
+### Changed
+- Release: the static-binary size gate (`test/release/assert_static.sh`) was
+  raised 20 MB → 24 MB to admit the full-featured S3-tier binary
+  (aws-sdk-go-v2 is the growth); a `kvb_nos3` slim build is ledgered as
+  future work in `docs/IMPROVEMENTS.md`.
+
+### Fixed
+- Tier-exact refunds: removing an s3-resident (retire-flipped) entry refunds
+  the tenant's S3 charge, not NVMe — the mismatch leaked the S3 charge and
+  the underflow heal masked the NVMe double-subtract.
+- Cold-tier hard-pin promotion: PIN_HARD (and 2nd-hit promotion) on an
+  s3-resident block promotes through the verified cold-read path instead of
+  answering `NOT_FOUND` for a block GET still serves.
+- `nvme_admit_min_hits: 0` genuinely means admit-everything: an internal
+  default clamp silently turned an explicit 0 into 1, and a pure-ingest fill
+  was deleted at the demote watermark with no counter. Endurance-gate
+  deletions are now counted (`kvb_nvme_admit_refusals_total`) and the
+  operator default (1) lives visibly in the config layer.
+
 ## [0.1.0-rc1] - 2026-07-18
 
 _Pre-release: the foundation. Everything below first shipped in this tag
@@ -141,60 +198,3 @@ and is included in v0.2.0._
   CHUNKs no longer reset the inactivity timer; tombstoned streams are reaped
   after a grace period; HELLO rejections answer as HELLO responses with
   F_FATAL; Drain no longer races new connections past its snapshot.
-
-## [0.2.0] - 2026-07-20
-
-### Added
-- Multi-tenant byte quotas: per-(namespace, tier) accounting with CAS
-  admission — charged at publish, refunded at every removal seam (delete,
-  eviction, lost publish race, reclaim retire, corrupt-entry self-heal),
-  transferred on tier moves, re-seeded from recovery so a restart never mints
-  free bytes. PUT BEGIN answers `ERR_QUOTA_BYTES` from an advisory probe; the
-  binding charge is commit-time. No wire change. Over-quota tenants are
-  evicted first under shared pressure; cross-tenant probes answer
-  `NOT_FOUND`, never `FORBIDDEN` (no existence oracle).
-- Namespace registry with hashed bearer tokens: `namespaces.yaml` carries
-  `token_sha256` (plaintext `token` accepted and hashed at load, never
-  retained); constant-time authentication with uniform timing for unknown
-  names; per-tier quotas + pin quota per namespace.
-- Admin socket: loopback-only HTTP surface (`admin_addr`) — `POST
-  /v1/namespace`, `POST /v1/quota`, `GET /v1/namespaces` (tokens never
-  listed); mutations are runtime-only and say so (persist via the namespaces
-  file).
-- `kvbctl` admin verbs: `namespace add|list` and `quota set` against the
-  admin socket, alongside the existing data-plane verbs.
-- Per-tenant metrics: `kvb_tenant_bytes` + `kvb_tenant_quota_bytes` labeled
-  `{namespace, tier}` — cardinality #namespaces × 3 tiers, pinned by test.
-- S3 cold tier: one sealed NVMe segment = one whole S3 object (request-cost
-  coalescing), spilled on a bounded async write-back queue — a copy, reads
-  stay local; reclaim of a spilled segment retire-flips its entries to
-  s3-resident (index entries survive, the tenant charge moves NVMe→S3); cold
-  GETs are single ranged GetObject reads, xxh3-verified before a byte
-  escapes; EXISTS never touches S3; restart re-spills idempotently (spilled
-  state is memory-only; s3-only entries are honestly lost at restart).
-  Config keys: `s3_bucket` (tier inert until set), `s3_region`, `s3_node_id`,
-  `s3_endpoint_override`, `s3_path_style`, `s3_spill_queue`,
-  `s3_read_timeout_ms`; credentials come from the ambient AWS chain only —
-  never from kvblockd config.
-- S3 observability: an `s3` sub-document in STATS (resident blocks/bytes,
-  spill/drop/put-error, ranged-get/restore, hit/read-error counters) and the
-  `kvb_s3_*` scrape families; `kvb_blocks`/`kvb_store_bytes` gain tier="s3".
-
-### Changed
-- Release: the static-binary size gate (`test/release/assert_static.sh`) was
-  raised 20 MB → 24 MB to admit the full-featured S3-tier binary
-  (aws-sdk-go-v2 is the growth); a `kvb_nos3` slim build is ledgered as
-  future work in `docs/IMPROVEMENTS.md`.
-
-### Fixed
-- Tier-exact refunds: removing an s3-resident (retire-flipped) entry refunds
-  the tenant's S3 charge, not NVMe — the mismatch leaked the S3 charge and
-  the underflow heal masked the NVMe double-subtract.
-- Cold-tier hard-pin promotion: PIN_HARD (and 2nd-hit promotion) on an
-  s3-resident block promotes through the verified cold-read path instead of
-  answering `NOT_FOUND` for a block GET still serves.
-- `nvme_admit_min_hits: 0` genuinely means admit-everything: an internal
-  default clamp silently turned an explicit 0 into 1, and a pure-ingest fill
-  was deleted at the demote watermark with no counter. Endurance-gate
-  deletions are now counted (`kvb_nvme_admit_refusals_total`) and the
-  operator default (1) lives visibly in the config layer.

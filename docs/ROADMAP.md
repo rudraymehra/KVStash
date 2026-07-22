@@ -10,7 +10,7 @@ claim graduates from this file only with measured evidence behind it, the
 same %-of-ceiling discipline every published number already follows
 ([BENCHMARKS.md](BENCHMARKS.md), [DESIGN.md](DESIGN.md)).
 
-## Shipped (v0.1.0-rc1 → v0.2.0)
+## Shipped (v0.1.0-rc1 → v0.2.0 → `main`)
 
 What exists today, with the receipts:
 
@@ -21,6 +21,15 @@ What exists today, with the receipts:
   0 phantom over 18,160 journaled acks**) → S3 (one sealed segment = one
   object, single ranged GetObject cold reads, xxh3-verified before a byte
   escapes; measured in-region latencies in [DESIGN.md](DESIGN.md)).
+- **Cold tier completed (landed on `main`, changelogged as v0.5.0).** Lazy
+  whole-segment restore — repeated cold hits pull the whole segment back to
+  NVMe and flip its entries home, one download amortized across every
+  entry — and S3 object GC: a retired segment's object is deleted once its
+  last s3-resident entry is gone (refund-driven, bounded per demoter pass,
+  backstopped by the bucket lifecycle rule). This closes the gap that filled
+  the first spill soak's own disk; the receipt still owed is the GC-on
+  spill-soak re-run (autopsy and triggers in
+  [IMPROVEMENTS.md](IMPROVEMENTS.md)).
 - **Tenancy + quotas.** Namespace registry with hashed tokens and
   constant-time HELLO auth; per-(namespace, tier) CAS byte accounting charged
   at publish and refunded at every removal seam; over-quota tenants evicted
@@ -48,7 +57,10 @@ What exists today, with the receipts:
 - **Release pipeline.** Tag-driven goreleaser v2 static matrix
   (linux/amd64, linux/arm64, darwin/arm64), `assert_static.sh` gate
   (statically linked, <24 MB), SBOMs, `FROM scratch` image, `install.sh`,
-  systemd unit. Latest release: **v0.2.0**.
+  systemd unit. Latest published release: **v0.2.0**. The v0.5.0 cut (the
+  completed cold tier) is changelogged ([CHANGELOG](../CHANGELOG.md)) but its
+  tag and artifacts are not yet published — it becomes the latest release
+  only when they exist.
 - **Benchmarks with the ceiling drawn on.** GET at **12.67 GB/s ≈ 102% of
   the iperf3 ceiling on a 100 GbE pair, xxh3 verify ON**; the Chart-1 matrix
   vs Redis 7 / Valkey 8 / redis-py at 100% of a 50 GbE wire; NVMe quoted as
@@ -80,17 +92,7 @@ are execute-only:
 
 Gate: a funded GPU hour. The announcements do not outrun the evidence.
 
-### 2. Lazy whole-segment restore + S3 object GC (in flight)
-
-Cold blocks are currently served one ranged GET each, and the daemon never
-deletes a retired segment's S3 object — the spill soak filled its own disk
-through exactly that gap (IMPROVEMENTS.md records the autopsy). In flight
-now: repeated cold hits pull the whole segment back to NVMe and flip its
-entries home; object GC deletes a segment's object when its last
-s3-resident entry is gone. Acceptance: the spill soak re-runs clean after GC
-lands, with object count bounded by the working set.
-
-### 3. TLS / mTLS
+### 2. TLS / mTLS
 
 v1 transport is deliberately plaintext TCP on a trusted segment, with
 TLS-termination guidance in the [deployment guide](deployment-guide.md).
@@ -101,7 +103,7 @@ that bit, mTLS as the tenant-channel option, zero cost when the bit is off.
 Acceptance: the wire-path gate re-run with TLS on, the overhead published
 as a number rather than adjectives.
 
-### 4. io_uring NVMe engine (experiment, spike-gated)
+### 3. io_uring NVMe engine (experiment, spike-gated)
 
 The measured baseline says the thread-pool engine is not the bottleneck on
 current hardware: **98.3% of the fio device ceiling per device, 98.5%
@@ -113,7 +115,7 @@ io_uring-vs-threadpool pread spike on hardware whose device ceiling
 actually exceeds what the pool drives — the engine ships only if the spike
 prints a win. No numbers, no engine.
 
-### 5. `kvb_nos3` slim build
+### 4. `kvb_nos3` slim build
 
 The full-featured binary carries aws-sdk-go-v2 for the S3 tier (the static
 gate was raised to 24 MB to admit it). Planned: an S3-less build behind a
@@ -122,7 +124,7 @@ The full build stays the default and the headline — a single static binary
 with all three tiers is the point; the slim one is for deployments that
 want the smaller footprint. Ledgered in IMPROVEMENTS.md.
 
-### 6. Benchmark completion
+### 5. Benchmark completion
 
 - **Chart 2 — TTFT vs hit rate** through a real vLLM + LMCache + kvblockd
   stack, with the honest production-trace hit-rate band. Blocked on GPU
