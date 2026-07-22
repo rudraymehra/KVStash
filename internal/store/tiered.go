@@ -89,8 +89,10 @@ type Tiered struct {
 	p    Params
 	now  func() int64
 
-	kick    chan struct{}   // CanStore pressure nudge
-	promote chan promoteReq // best-effort 2nd-hit promotions (drop on full)
+	kick     chan struct{}   // CanStore pressure nudge
+	promote  chan promoteReq // best-effort 2nd-hit promotions (drop on full)
+	restoreq chan restoreReq // best-effort 2nd-COLD-hit segment restores (drop on full)
+	dropq    chan uint32     // dead-object GC candidates (drop on full — orphan-safe)
 
 	stopOnce sync.Once
 	stopped  chan struct{}
@@ -101,11 +103,36 @@ type Tiered struct {
 	scCands  []eviction.Candidate
 	scSegs   []nvme.SegmentInfo
 
-	// spillInflight: segID → queued-or-uploading (spillPass vs onUp). Keyed
-	// by segment id ALONE — volume-blind, which is sound only because config
-	// validation refuses multi-volume + S3 (segment object keys carry no
-	// volume dimension either; both widen together, see IMPROVEMENTS.md).
+	// spillInflight: the cold tier's per-segment latch — held across a spill
+	// (spillPass → onUp), a whole-segment restore, an object-GC drop, and a
+	// segment retire (reclaimSegment's RetireBegin→RetireFinish window), so
+	// an object PUT and its DELETE can never race unordered and a restore's
+	// flip-home can never interleave with a retire's flip-out. Every holder
+	// TRY-acquires (LoadOrStore + skip on busy) — nothing ever blocks on it,
+	// so it adds no lock-order edge. Keyed by segment id ALONE —
+	// volume-blind, which is sound only because config validation refuses
+	// multi-volume + S3 (segment object keys carry no volume dimension
+	// either; both widen together, see IMPROVEMENTS.md).
 	spillInflight sync.Map
+
+	// s3GCQueued dedupes dropq nominations — at most one queued candidate
+	// per segment (the double-Drop guard); the entry clears when gcPass
+	// dequeues it or when a full queue refuses the nomination.
+	s3GCQueued sync.Map
+
+	// s3SegRefs counts each segment's s3-resident (S3Only) entries — object-
+	// GC liveness. s3SegMu is a LEAF: taken inside shard-locked closures,
+	// never held across any other lock (the tenant-accountant posture).
+	s3SegMu   sync.Mutex
+	s3SegRefs map[uint32]int
+
+	// restoreFlipHookForTest, when non-nil, fires after EACH entry a
+	// restore's flip-home walk lands, outside every lock — the deterministic
+	// seam the reclaim-latch test uses to run a reclaim attempt exactly
+	// mid-walk (the overtake window is real but nanoseconds wide on an idle
+	// box). Set before the restore is driven, on the goroutine that drives
+	// it (restorePass); always nil in production.
+	restoreFlipHookForTest func()
 
 	demotions      atomic.Uint64
 	demoteDrops    atomic.Uint64 // queue-full / write-failed / publish-gate-refused demotions
@@ -117,6 +144,12 @@ type Tiered struct {
 	s3ChecksumErrs atomic.Uint64 // cold reads that failed verification (object rot — distinct from the device counter)
 	s3Blocks       atomic.Int64  // s3-resident (retire-flipped) blocks — Int64: removals decrement
 	s3Bytes        atomic.Int64
+	s3SegRestores  atomic.Uint64 // whole-segment restores completed (entries flipped home)
+	s3RestoreErrs  atomic.Uint64 // failed restores (download/adopt) — entries stayed s3-only, still served
+	s3RestoreSkips atomic.Uint64 // queue-full / latch-busy / no-headroom restore refusals
+	s3GCs          atomic.Uint64 // dead segment objects dropped
+	s3GCErrs       atomic.Uint64 // failed drops (orphaned — the bucket lifecycle rule reaps)
+	s3GCSkips      atomic.Uint64 // queue-full / latch-busy GC refusals (also orphan-safe)
 	reclaims       atomic.Uint64
 	reclaimSkips   atomic.Uint64
 	readBusy       atomic.Uint64
@@ -131,20 +164,37 @@ type promoteReq struct {
 	ref *nvmeRef
 }
 
+// restoreReq is one 2nd-cold-hit whole-segment restore trigger. Same shape
+// as promoteReq, different destination: promotion copies ONE block to DRAM;
+// a restore adopts the block's whole segment back onto the volume.
+type restoreReq struct {
+	k   dram.Key
+	ref *nvmeRef
+}
+
+// promoteMinGap: a frame-boundary re-fetch (the transport re-GETs a block
+// that didn't fit the frame) arrives within microseconds and must not count
+// as a second touch (ladder finding) — 2nd-hit triggers on BOTH tiers
+// require a minimum gap between qualifying hits.
+const promoteMinGap = int64(10 * time.Millisecond)
+
 // NewTiered assembles the orchestrator over an already-built dram tier and
 // opened volumes, seeding the NVMe index from recovery's findings. The
 // policy must be the SAME instance attached to the dram store (victims are
 // nominated once, dequeued once).
 func NewTiered(d *dram.Store, pol eviction.Policy, vols []*nvme.Volume, reports []*nvme.RecoveryReport, recovered [][]nvme.RecoveredEntry, p Params) *Tiered {
 	t := &Tiered{
-		d:       d,
-		pol:     pol,
-		vols:    vols,
-		idx:     newNvmeIndex(),
-		p:       p.withDefaults(),
-		kick:    make(chan struct{}, 1),
-		promote: make(chan promoteReq, 64),
-		stopped: make(chan struct{}),
+		d:         d,
+		pol:       pol,
+		vols:      vols,
+		idx:       newNvmeIndex(),
+		p:         p.withDefaults(),
+		kick:      make(chan struct{}, 1),
+		promote:   make(chan promoteReq, 64),
+		restoreq:  make(chan restoreReq, 4),
+		dropq:     make(chan uint32, 64),
+		s3SegRefs: make(map[uint32]int),
+		stopped:   make(chan struct{}),
 	}
 	t.now = t.p.Now
 	for _, rep := range reports {
@@ -167,11 +217,11 @@ func NewTiered(d *dram.Store, pol eviction.Policy, vols []*nvme.Volume, reports 
 	return t
 }
 
-// Start launches the demoter/reclaimer and promoter loops. The returned
-// stop func cancels and WAITS — call it after Drain, before Close.
+// Start launches the demoter/reclaimer, promoter, and restorer loops. The
+// returned stop func cancels and WAITS — call it after Drain, before Close.
 func (t *Tiered) Start(ctx context.Context) (stop func()) {
 	ctx, cancel := context.WithCancel(ctx)
-	t.loopWG.Add(2)
+	t.loopWG.Add(3)
 	go func() {
 		defer t.loopWG.Done()
 		tick := time.NewTicker(t.p.Interval)
@@ -186,6 +236,7 @@ func (t *Tiered) Start(ctx context.Context) (stop func()) {
 			t.demotePass(false)
 			t.spillPass()
 			t.reclaimPass()
+			t.gcPass()
 		}
 	}()
 	go func() {
@@ -196,6 +247,20 @@ func (t *Tiered) Start(ctx context.Context) (stop func()) {
 				return
 			case req := <-t.promote:
 				t.promoteOne(req)
+			}
+		}
+	}()
+	// Whole-segment restores get their OWN goroutine: one download can take
+	// tens of seconds and must never starve the cheap per-block promotions.
+	// The loop ctx threads into the download so stop() never waits the belt.
+	go func() {
+		defer t.loopWG.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case req := <-t.restoreq:
+				t.restoreOne(ctx, req)
 			}
 		}
 	}()
@@ -218,7 +283,10 @@ func (t *Tiered) volumeFor(key [32]byte) *nvme.Volume {
 // refundNvmeQuota returns a removed nvme-index entry's bytes to its tenant —
 // on whichever tier holds the charge: NVMe normally, S3 after a retire-flip
 // moved it (refunding NVMe there would leak the S3 charge forever and the
-// underflow heal would hide the NVMe-side double-subtract).
+// underflow heal would hide the NVMe-side double-subtract). An s3-resident
+// removal also moves the object-GC liveness count: the LAST one makes the
+// segment object a GC candidate (enqueue only — the drop itself never runs
+// on, fails, or stalls the foreground removal).
 func (t *Tiered) refundNvmeQuota(ns uint32, ref *nvmeRef) {
 	if ref == nil || ref.Len == 0 {
 		return
@@ -228,6 +296,9 @@ func (t *Tiered) refundNvmeQuota(ns uint32, ref *nvmeRef) {
 		tier = tenant.TierS3
 		t.s3Blocks.Add(-1)
 		t.s3Bytes.Add(-int64(ref.Len))
+		if t.s3SegAdd(ref.Loc.SegmentID, -1) {
+			t.enqueueObjectGC(ref.Loc.SegmentID)
+		}
 	}
 	if t.p.Quotas != nil {
 		t.p.Quotas.Refund(ns, tier, int64(ref.Len))
@@ -321,18 +392,32 @@ func (t *Tiered) GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, 
 		// COLD path: one ranged GetObject, verified before a byte escapes.
 		if data, rel, ok := t.readS3(e); ok {
 			// Same discipline as the warm path below: the §3.3 auto-lease
-			// lands under the shard lock with an identity re-check, so it
-			// orders against the delete gate and never mints a protection
-			// promise on a removed or replaced entry. No promotion probe —
-			// the cold tier feeds promotion only through lazy restore
-			// (ledgered in IMPROVEMENTS.md), never per ranged GET.
+			// and the 2nd-hit probe land under the shard lock with an
+			// identity re-check, so they order against the delete gate and
+			// never mint a promise on a removed or replaced entry. The cold
+			// 2nd hit does NOT promote one block to DRAM — it triggers the
+			// whole-segment lazy restore (one download amortizes over every
+			// entry; reads go local again), never a per-ranged-GET copy.
 			now := t.now()
+			var prev int64
+			present := false
 			t.idx.withShardLock(k, func(ref *nvmeRef) {
 				if ref != e {
 					return
 				}
+				present = true
 				extendNvmeLease(ref, now+int64(t.clampLeaseMS(0))*int64(time.Millisecond))
+				prev = ref.LastAccess.Swap(now)
 			})
+			if present && t.p.PromoteWindow > 0 && prev != 0 &&
+				now-prev <= int64(t.p.PromoteWindow) && now-prev >= promoteMinGap &&
+				e.S3Only.Load() {
+				select { // best-effort: an optimization, drop on full
+				case t.restoreq <- restoreReq{k: k, ref: e}:
+				default:
+					t.s3RestoreSkips.Add(1)
+				}
+			}
 			return data, e.XXH3, rel, "s3", protocol.StatusOK
 		}
 		// No S3 copy (or the cold read failed its deadline): a plain miss
@@ -369,11 +454,8 @@ func (t *Tiered) GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, 
 		extendNvmeLease(ref, now+int64(t.clampLeaseMS(0))*int64(time.Millisecond))
 		prev = ref.LastAccess.Swap(now)
 	})
-	// 2nd hit within the window promotes — but a frame-boundary re-fetch
-	// (the transport re-GETs a block that didn't fit the frame) arrives
-	// within microseconds and must not count as a second touch (ladder
-	// finding): require a minimum gap between qualifying hits.
-	const promoteMinGap = int64(10 * time.Millisecond)
+	// 2nd hit within the window promotes (promoteMinGap filters the
+	// frame-boundary re-fetch — see its declaration).
 	if present && t.p.PromoteWindow > 0 && prev != 0 &&
 		now-prev <= int64(t.p.PromoteWindow) && now-prev >= promoteMinGap {
 		select { // best-effort: promotion is an optimization, drop on full
@@ -650,6 +732,15 @@ func (t *Tiered) Stats() []byte {
 			"hits_total":             t.s3Hits.Load(),
 			"read_errors_total":      t.s3ReadErrs.Load(),
 			"checksum_errors_total":  t.s3ChecksumErrs.Load(),
+			// restores_total above counts the BACKEND's downloads; this
+			// counts completed restore cycles (flip-back included) — they
+			// diverge when a flip needed no download (already-local segment).
+			"segment_restores_total": t.s3SegRestores.Load(),
+			"restore_errors_total":   t.s3RestoreErrs.Load(),
+			"restore_skips_total":    t.s3RestoreSkips.Load(),
+			"object_gcs_total":       t.s3GCs.Load(),
+			"object_gc_errors_total": t.s3GCErrs.Load(),
+			"object_gc_skips_total":  t.s3GCSkips.Load(),
 		}
 	}
 	b, err := json.Marshal(doc)
@@ -697,13 +788,28 @@ func (t *Tiered) Scrub() (bad int) {
 // DemoteNow runs one synchronous demotion pass (modeltest's deterministic
 // pressure handle) — it WAITS for every accepted append's completion, then
 // runs the spill pass (a synchronous backend completes flips inline; the
-// real async spiller just enqueues, exactly like the ticker) and a reclaim
-// pass.
+// real async spiller just enqueues, exactly like the ticker), a reclaim
+// pass, the queued whole-segment restores, and the object-GC pass.
 func (t *Tiered) DemoteNow() int {
 	n := t.demotePass(true)
 	t.spillPass()
 	t.reclaimPass()
+	t.restorePass()
+	t.gcPass()
 	return n
+}
+
+// restorePass drains queued restore triggers synchronously — DemoteNow's
+// (and the tests') deterministic stand-in for the restorer goroutine.
+func (t *Tiered) restorePass() {
+	for {
+		select {
+		case req := <-t.restoreq:
+			t.restoreOne(context.Background(), req)
+		default:
+			return
+		}
+	}
 }
 
 // Close shuts the volumes down first (writer drain + readers), then the

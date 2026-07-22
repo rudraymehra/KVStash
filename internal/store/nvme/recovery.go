@@ -373,8 +373,10 @@ func listSegIDs(dir string, warn func(msg string, args ...any)) ([]uint32, error
 	return ids, nil
 }
 
-// pruneTmpFiles removes checkpoint temp files a crash-during-checkpoint
-// left behind (never matched by listCkptSeqs, so they'd accumulate forever).
+// pruneTmpFiles removes temp files a crash left behind — checkpoint temps
+// (crash-during-checkpoint) and segment-adopt temps (crash-mid-restore).
+// Neither is matched by its lister, so they'd accumulate forever; both are
+// non-durable by construction (the rename is the publish).
 func pruneTmpFiles(dir string, warn func(msg string, args ...any)) {
 	des, err := os.ReadDir(dir)
 	if err != nil {
@@ -382,9 +384,9 @@ func pruneTmpFiles(dir string, warn func(msg string, args ...any)) {
 	}
 	for _, de := range des {
 		name := de.Name()
-		if strings.HasSuffix(name, ".kvbi.tmp") {
+		if strings.HasSuffix(name, ".kvbi.tmp") || strings.HasSuffix(name, ".kvbs.tmp") {
 			if err := os.Remove(filepath.Join(dir, name)); err != nil {
-				warn("nvme: prune orphaned checkpoint tmp", "name", name, "err", err)
+				warn("nvme: prune orphaned tmp file", "name", name, "err", err)
 			}
 		}
 	}

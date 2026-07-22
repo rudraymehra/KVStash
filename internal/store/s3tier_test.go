@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
@@ -290,6 +291,10 @@ func TestS3FlipStrandAbortsRetire(t *testing.T) {
 type tripwireRestore struct{}
 
 func (tripwireRestore) ReadRange(context.Context, uint64, int64, int64, []byte) error {
+	panic("EXISTS (or another index-only path) touched the S3 backend")
+}
+
+func (tripwireRestore) RestoreSegment(context.Context, uint64, func(io.Reader) error) error {
 	panic("EXISTS (or another index-only path) touched the S3 backend")
 }
 func (tripwireRestore) Stats() (uint64, uint64) { return 0, 0 }

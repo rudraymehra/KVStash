@@ -361,7 +361,7 @@ func TestCheckpointReferencingReclaimedSegment(t *testing.T) {
 	if v.ckpts.Load() == 0 {
 		t.Fatal("fixture wrote no checkpoint")
 	}
-	id, entries, ok := v.OldestSealed()
+	id, entries, ok := v.OldestSealed(0)
 	if !ok {
 		t.Fatal("nothing sealed")
 	}

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -57,6 +58,16 @@ func (c *capSpill) ReadRange(_ context.Context, segID uint64, off, n int64, dst 
 	}
 	copy(dst, obj[off:off+n])
 	return nil
+}
+
+func (c *capSpill) RestoreSegment(_ context.Context, segID uint64, sink func(io.Reader) error) error {
+	c.mu.Lock()
+	obj, ok := c.objs[segID]
+	c.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("no object %d", segID)
+	}
+	return sink(bytes.NewReader(obj))
 }
 
 type capRestore struct{ *capSpill }
@@ -192,7 +203,7 @@ func spillFlipTrial(t *testing.T, trial int) (drift, ghost int) {
 				runtime.Gosched()
 			}
 			for i := 0; i < 512; i++ {
-				if tt.reclaimSegment(vol) {
+				if out, _ := tt.reclaimSegment(vol, 0); out == reclaimRetired {
 					return
 				}
 			}

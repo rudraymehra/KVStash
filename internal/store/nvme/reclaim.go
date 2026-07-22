@@ -18,14 +18,17 @@ import (
 //	               stragglers — POSIX, linux+darwin), waits for the read
 //	               count to drain, closes the fd, forgets the segment.
 
-// OldestSealed returns the lowest-ID sealed segment and a copy of its entry
-// table, or ok=false when nothing is reclaimable.
-func (v *Volume) OldestSealed() (id uint32, entries []footerEntry, ok bool) {
+// OldestSealed returns the lowest-ID sealed segment at or above from, with a
+// copy of its entry table, or ok=false when nothing at or above that floor is
+// reclaimable. from=0 is the true FIFO head; the tiered store's reclaim pass
+// raises the floor past latch-busy candidates so one segment mid-spill or
+// mid-restore cannot head-of-line-block every reclaim behind it.
+func (v *Volume) OldestSealed(from uint32) (id uint32, entries []footerEntry, ok bool) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	found := false
 	for sid, s := range v.segs {
-		if !s.sealed || s.dying.Load() {
+		if sid < from || !s.sealed || s.dying.Load() {
 			continue
 		}
 		if !found || sid < id {

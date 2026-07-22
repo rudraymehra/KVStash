@@ -700,13 +700,22 @@ mismatch counts a checksum error and answers a miss, and a slow S3 hits the
 `s3_read_timeout_ms` deadline (default 2 s) as a per-key outcome — never a
 frame stall. PIN_HARD's synchronous promote reads through the same verified
 path, so an s3-resident block a GET can serve is never refused a pin. The
-2nd-hit promotion TRIGGER, though, is warm-tier only — cold ranged GETs do
-not feed it (repeatedly-hot cold blocks are the lazy whole-segment restore's
-case, ledgered in IMPROVEMENTS.md). Whole-segment
-restore is singleflight per segment (two concurrent cold misses trigger
-exactly one 256 MB download). **BATCH_EXISTS never touches S3** — both
-indexes are node-local map lookups, the same contract the NVMe spy test
-enforces for the device.
+2nd-hit trigger is tier-split: a warm 2nd hit promotes ONE block to DRAM; a
+cold 2nd hit inside the promote window triggers the LAZY WHOLE-SEGMENT
+RESTORE — a cold segment's blocks come back together or not at all (one
+download amortizes over every entry): the segment object is downloaded back
+into the volume, its entries flip nvme-resident (reads go local again), and
+the object is RETAINED — the adopted segment republishes spilled=true, so
+its next reclaim FLIPS the entries back to s3-residency against that same
+object instead of deleting them (dropping the object on restore was a
+reproduced pre-release data-loss bug: a reclaim landing before the next
+spill-ack deleted the entries with the object already gone). A failed or
+refused restore changes nothing — entries stay s3-resident and keep serving
+per-read. Whole-segment restore is singleflight per segment (two concurrent
+cold misses trigger exactly one 256 MB download), and the per-segment latch
+also excludes spill, reclaim, and object GC while it runs. **BATCH_EXISTS
+never touches S3** — both indexes are node-local map lookups, the same
+contract the NVMe spy test enforces for the device.
 
 **Restart semantics are per-life, and honest.** Spilled state is
 memory-only: after a restart every sealed segment re-spills, and the
@@ -714,11 +723,17 @@ whole-object PUT is idempotent (same key, same bytes — sealed segments are
 write-once), so a crash costs one duplicate upload, never correctness.
 Entries that were retire-flipped are honestly LOST at restart — the local
 bytes are gone and recovery rebuilds only from local checkpoints and footers
-— a miss, never corruption, exactly the crash contract's shape. Retired
-objects are not synchronously deleted: an orphaned object costs cents, the
-bucket lifecycle rule is the recorded backstop, and reclaim never fails over
-S3 cleanup (the backend carries DeleteObject plumbing for a future
-object-GC pass).
+— a miss, never corruption, exactly the crash contract's shape. Dead
+objects are garbage-collected ASYNCHRONOUSLY, on by default: per-segment
+liveness counting (each retire-flip +1, each s3-resident removal or
+flip-home −1) nominates an object once its LAST s3-resident entry leaves
+and no live spilled segment still claims it; removals only enqueue the
+candidate — the demoter tick drops a bounded few per pass
+(deadline-bounded, never inline on a foreground op, never a memory-ladder
+stall), each drop re-checking deadness under the per-segment latch. A
+lost, failed, or refused drop merely orphans the object: it costs cents,
+the bucket lifecycle rule remains the recorded backstop, and reclaim still
+never fails over S3 cleanup.
 
 **Config and wiring.** Inert until `s3_bucket` is set — byte-for-byte the
 two-tier daemon otherwise; requires the NVMe tier. Keys: `s3_bucket`,
@@ -730,10 +745,12 @@ by `internal/store/s3spill`.
 
 **Observability.** STATS gains an `"s3"` sub-document (resident
 blocks/bytes, spilled segments, drops, put errors, ranged gets, restores,
-hits, read errors) whose residency split sums with the nvme sub-document to
-the index — matching the per-tenant ledger's tier split; the scrape side
-adds the `kvb_s3_*` families and tier="s3" to `kvb_blocks` /
-`kvb_store_bytes`.
+hits, read errors, checksum errors, plus the restore/GC set: segment
+restores completed, restore errors, restore skips, object GCs, object GC
+errors, object GC skips) whose residency split sums with the nvme
+sub-document to the index — matching the per-tenant ledger's tier split;
+the scrape side adds the `kvb_s3_*` families and tier="s3" to `kvb_blocks`
+/ `kvb_store_bytes`.
 
 **Real-S3 latencies (measured 2026-07-20, in-region us-east-1 m7g.xlarge,
 the daemon's own spill/restore code paths via s3probe).** Whole-segment PUT

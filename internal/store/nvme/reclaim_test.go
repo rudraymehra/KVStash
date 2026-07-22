@@ -14,7 +14,7 @@ func TestReclaimRetireProtocol(t *testing.T) {
 	for i := range locs {
 		locs[i], sums[i] = appendWait(t, v, i, 60<<10) // ≥2 sealed segments
 	}
-	id, entries, ok := v.OldestSealed()
+	id, entries, ok := v.OldestSealed(0)
 	if !ok || len(entries) == 0 {
 		t.Fatal("nothing sealed to reclaim")
 	}

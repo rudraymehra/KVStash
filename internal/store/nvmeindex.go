@@ -33,10 +33,11 @@ type nvmeRef struct {
 
 	LeaseUntil atomic.Int64
 	TTLUntil   atomic.Int64
-	// LastAccess is the last NVMe GET-hit (unix nanos), 0 until the first
-	// hit after demotion — the promotion window tracker, deliberately NOT
-	// seeded from the DRAM ref (a fresh demotion must take two real NVMe
-	// hits to earn promotion).
+	// LastAccess is the last GET-hit below DRAM (unix nanos; warm NVMe reads
+	// and cold s3 reads both count), 0 until the first hit after demotion —
+	// the 2nd-hit window tracker for BOTH promotion (warm) and whole-segment
+	// restore (cold), deliberately NOT seeded from the DRAM ref (a fresh
+	// demotion must take two real hits to earn either).
 	LastAccess atomic.Int64
 	PinFlags   uint8 // guarded by the nvme index shard lock
 }
@@ -107,6 +108,15 @@ func (idx *nvmeIndex) put(k dram.Key, ref *nvmeRef) {
 func (idx *nvmeIndex) putThen(k dram.Key, ref *nvmeRef, fn func()) {
 	s := idx.shardFor(k)
 	s.mu.Lock()
+	// Overwriting an s3-resident ref would orphan its S3 charge and its
+	// object-GC liveness count (no refund, no decrement ever runs).
+	// Unreachable today — Put refuses keys the index holds and the
+	// dual-residency demote path completes without republishing — but
+	// s3SegRefs widened what a silent overwrite would leak, so the debug
+	// build trips the moment some future path makes it reachable.
+	if old := s.m[k]; old != nil {
+		assertf(!old.S3Only.Load(), "putThen: overwriting s3-resident ref %v (charge+liveness would leak)", k)
+	}
 	s.m[k] = ref
 	if fn != nil {
 		fn()

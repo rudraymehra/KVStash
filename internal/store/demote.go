@@ -256,33 +256,90 @@ func (t *Tiered) promoteSync(k dram.Key, e *nvmeRef) protocol.Status {
 	}
 }
 
+// reclaimOutcome separates reclaimSegment's "this candidate is latch-owned,
+// try the next-oldest" from its genuine pass-enders. Collapsing both into one
+// false let a single mid-spill oldest segment (owned for seconds to tens of
+// seconds; a leaked latch entry, forever) head-of-line-block EVERY reclaim on
+// the volume — pinned ≥100%, Appends refusing, demotions dropping — because
+// OldestSealed is FIFO and kept handing back the same owned id.
+type reclaimOutcome uint8
+
+const (
+	reclaimStop    reclaimOutcome = iota // no candidate, or a refused gate — the pass legitimately ends
+	reclaimBusy                          // candidate latch-owned (spill/restore/GC) — skip it, try the next-oldest
+	reclaimRetired                       // one segment retired
+)
+
+// reclaimSkipBudget bounds how many latch-owned segments one pass steps over
+// per volume. The spiller queue (default depth 8) is the only holder that
+// owns several segments at once, so 8 covers a full backlog; anything deeper
+// waits for the next tick exactly as every busy segment used to. Each skip
+// is one OldestSealed scan plus a failed LoadOrStore — no I/O — so the pass
+// stays cheap even when it spends the whole budget.
+const reclaimSkipBudget = 8
+
 // reclaimPass frees whole segments FIFO while a volume sits above 90% of
 // its budget (bounded per pass — reclaim shares the demoter goroutine).
 // It also re-arms volumes left write-dead by a failed rotation.
+//
+// FIFO bends in exactly one case: a latch-busy candidate is skipped, not a
+// pass-ender — the floor moves past it and the next-oldest is tried. The
+// floor is a per-pass skip-set in disguise: segment ids are minted
+// monotonically and every probe takes the lowest id ≥ floor, so the ids
+// below it are exactly the latch-busy ones already skipped this pass (an
+// AdoptSegment can resurface a lower id mid-pass; it just waits for the next
+// tick's fresh floor). The legitimate enders are unchanged: headroom
+// reached, no candidate, a refused gate.
 func (t *Tiered) reclaimPass() {
 	for _, vol := range t.vols {
-		for i := 0; i < 4; i++ {
+		var from uint32
+		retired, skipped := 0, 0
+		for retired < 4 && skipped < reclaimSkipBudget {
 			if vol.MaxBytes() <= 0 || vol.UsedBytes()*100 <= vol.MaxBytes()*90 {
 				break
 			}
-			if !t.reclaimSegment(vol) {
+			out, id := t.reclaimSegment(vol, from)
+			if out == reclaimStop {
 				break
 			}
+			if out == reclaimBusy {
+				from, skipped = id+1, skipped+1
+				continue
+			}
+			retired++
 		}
 		vol.TryRecoverWrites()
 	}
 }
 
-// reclaimSegment retires the oldest sealed segment through the R-protocol:
-// pre-gate (any live-protected entry → skip the whole segment — the
-// documented choice), dying flag, shard-locked gate+remove per entry
-// (abort restores service if protection landed mid-retire), unlink-with-
-// open-fd, drain, close.
-func (t *Tiered) reclaimSegment(vol *nvme.Volume) bool {
-	id, entries, ok := vol.OldestSealed()
+// reclaimSegment retires the oldest sealed segment at or above the caller's
+// floor through the R-protocol: pre-gate (any live-protected entry → skip
+// the whole segment — the documented choice), dying flag, shard-locked
+// gate+remove per entry (abort restores service if protection landed
+// mid-retire), unlink-with-open-fd, drain, close. The returned id is the
+// candidate examined — on reclaimBusy the caller bumps its floor past it.
+func (t *Tiered) reclaimSegment(vol *nvme.Volume, from uint32) (reclaimOutcome, uint32) {
+	id, entries, ok := vol.OldestSealed(from)
 	if !ok {
-		return false
+		return reclaimStop, 0
 	}
+	// The spillInflight latch covers the WHOLE RetireBegin→RetireFinish
+	// window: a concurrent whole-segment restore owns the segment while it
+	// holds this latch, and interleaving its flip-home walk with our
+	// flip-out walk would tear the liveness/quota pairing (an entry flipped
+	// home after our walk visited it retires as a ghost, its object
+	// GC-eligible while still needed). Try-acquire like every other holder —
+	// on busy THIS segment is skipped (the caller tries the next-oldest;
+	// the next tick retries from the head); a segment mid-spill (ack not
+	// landed) is likewise left alone until the ack settles its flags. The
+	// latch is taken OUTSIDE every mutex here (before RetireBegin's volume
+	// lock, before any shard lock) and nothing ever blocks on it, so the
+	// documented lock order gains no edge; s3SegMu stays a leaf.
+	if _, loaded := t.spillInflight.LoadOrStore(id, struct{}{}); loaded {
+		t.reclaimSkips.Add(1)
+		return reclaimBusy, id
+	}
+	defer t.spillInflight.Delete(id)
 	now := t.now()
 	for i := range entries {
 		k := dram.Key{NS: entries[i].NS, Hash: entries[i].Key}
@@ -299,13 +356,14 @@ func (t *Tiered) reclaimSegment(vol *nvme.Volume) bool {
 		})
 		if protected {
 			t.reclaimSkips.Add(1)
-			return false // segment skipped this round (retry when the lease lapses)
+			return reclaimStop, id // segment skipped this round (retry when the lease lapses)
 		}
 	}
 	if !vol.RetireBegin(id) {
-		return false
+		return reclaimStop, id
 	}
-	if t.p.Spill != nil && vol.IsSpilled(id) {
+	flip := t.p.Spill != nil && vol.IsSpilled(id)
+	if flip {
 		// The FLIP: this segment's bytes live on S3 byte-identically, so
 		// retiring the local file loses nothing — entries stay in the index
 		// (Loc now addresses the object), the tenant charge moves
@@ -318,7 +376,7 @@ func (t *Tiered) reclaimSegment(vol *nvme.Volume) bool {
 		if t.s3FlipRetired(vol, id) > 0 {
 			vol.RetireAbort(id)
 			t.reclaimSkips.Add(1)
-			return false
+			return reclaimStop, id
 		}
 	} else {
 		for i := range entries {
@@ -336,13 +394,20 @@ func (t *Tiered) reclaimSegment(vol *nvme.Volume) bool {
 			if st == protocol.StatusErrLeased {
 				vol.RetireAbort(id) // reads resume; already-removed entries were unprotected (legal evictions)
 				t.reclaimSkips.Add(1)
-				return false
+				return reclaimStop, id
 			}
 		}
 	}
 	if err := vol.RetireFinish(id); err != nil {
-		return false
+		return reclaimStop, id
 	}
 	t.reclaims.Add(1)
-	return true
+	if flip {
+		// A flipped retire whose entries were ALL deleted beforehand leaves
+		// an object no liveness transition will ever nominate — hand it to
+		// the GC pass, which re-checks deadness (a segment that flipped live
+		// entries has count > 0 and is skipped).
+		t.enqueueObjectGC(id)
+	}
+	return reclaimRetired, id
 }

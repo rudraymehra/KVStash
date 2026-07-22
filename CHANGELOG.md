@@ -5,13 +5,26 @@ Format: Keep a Changelog (https://keepachangelog.com), SemVer after v0.1.0.
 
 ## [Unreleased]
 
-> In flight, pending merge (not yet on main): **lazy whole-segment restore**
-> (repeated cold hits pull the whole segment back to NVMe and flip its
-> entries home) + **S3 object GC** (delete a retired segment's object once
-> its last s3-resident entry is gone). Tracked with revisit triggers in
-> `docs/IMPROVEMENTS.md`.
+## [0.5.0] - 2026-07-22
+
+_The cold tier completed — spilled segments now come home, and dead objects
+are collected._
 
 ### Added
+- Lazy whole-segment restore: repeated cold hits pull the whole segment back
+  to NVMe and flip its entries home (one download amortized over every entry).
+  The restored segment is adopted `spilled=true` and RETAINS its S3 object, so
+  a later reclaim flips it rather than deletes it — closing a data-loss window
+  where adopting as unspilled plus an inline object drop lost the restored
+  blocks on every tier if a reclaim landed before the next spill-ack. Reclaim
+  now takes the per-segment spill latch and skips latch-busy candidates to the
+  next-oldest, so one mid-upload segment cannot head-of-line-block a volume's
+  reclaim.
+- S3 object GC: a retired segment's object is deleted once its last s3-resident
+  entry is gone (refund-driven liveness, bounded per pass on the demoter tick);
+  best-effort, backstopped by the bucket lifecycle rule. Trade-offs and
+  residual orphan channels tracked with revisit triggers in
+  `docs/IMPROVEMENTS.md`.
 - `python/vllm_kvblockd`: native vLLM integration — a KVConnector-v1
   connector with no LMCache in the path, plus `KvblockdTierManager` for
   vLLM's offloading/tiering altitude. Model-fingerprinted keys pinned by

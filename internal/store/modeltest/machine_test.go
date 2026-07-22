@@ -53,6 +53,7 @@ type fakeS3 struct {
 	spilled    uint64
 	putErrors  uint64
 	rangedGets uint64
+	restores   uint64
 }
 
 func newFakeS3() *fakeS3 { return &fakeS3{objects: map[uint64][]byte{}} }
@@ -103,8 +104,23 @@ func (f fakeRestore) ReadRange(_ context.Context, segID uint64, off, n int64, ds
 	return nil
 }
 
+// RestoreSegment streams the whole object inline — DemoteNow's restore pass
+// completes deterministically, so the machine's cold 2nd hits exercise the
+// real adopt/flip-back/GC path against the model's invariants.
+func (f fakeRestore) RestoreSegment(_ context.Context, segID uint64, sink func(io.Reader) error) error {
+	obj, ok := f.objects[segID]
+	if !ok {
+		return fmt.Errorf("fakeS3: no object for seg %d", segID)
+	}
+	if err := sink(bytes.NewReader(obj)); err != nil {
+		return err
+	}
+	f.restores++
+	return nil
+}
+
 func (f fakeRestore) Stats() (rangedGets, restores uint64) {
-	return f.rangedGets, 0
+	return f.rangedGets, f.restores
 }
 
 // sutStore is what both kinds under test satisfy (the model is tier-blind).
@@ -863,4 +879,102 @@ func TestStoreModel(t *testing.T) {
 			},
 		})
 	})
+}
+
+// TestColdRestoreFires is the deterministic companion the random walks
+// cannot promise: it drives the exact 2nd-cold-hit sequence against the
+// SAME fakes the machine uses and asserts the backend's restore counter
+// actually moved — so "restore never triggers" (a dead trigger wire, a
+// promote-window regression) can never pass this package silently.
+func TestColdRestoreFires(t *testing.T) {
+	cur := startNanos
+	coldTier := newFakeS3()
+	pol, err := eviction.New("s3fifo", 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arena, err := dram.NewArena(arenaBytes, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds := dram.New(arena, dram.Params{
+		LeaseDefaultMS: leaseDefaultMS, LeaseMaxMS: leaseMaxMS,
+		Now: func() int64 { return cur },
+	})
+	ds.AttachPolicy(pol)
+	vol, _, ents, err := nvme.OpenVolume(nvme.VolumeParams{
+		Dir: t.TempDir(), SegmentBytes: segBytes, MaxBytes: volMaxS3,
+		ReadWorkers: 2, CkptEverySegs: 2, MaxBlobLen: maxBlobLen,
+		Now: func() int64 { return cur },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tt := store.NewTiered(ds, pol, []*nvme.Volume{vol}, nil,
+		[][]nvme.RecoveredEntry{ents}, store.Params{
+			LeaseDefaultMS: leaseDefaultMS, LeaseMaxMS: leaseMaxMS,
+			PromoteWindow: time.Hour,
+			Now:           func() int64 { return cur },
+			Spill:         fakeSpill{coldTier}, Restore: fakeRestore{coldTier},
+			S3ReadTimeout:      time.Second,
+			DemoteWatermarkPct: 50, DemoteBatchPct: 40,
+		})
+	defer func() { _ = tt.Close() }()
+
+	key := func(i int) [32]byte {
+		var k [32]byte
+		k[0], k[1], k[31] = byte(i), byte(i>>8), 0xD7 //nolint:gosec // G115: test index mixing
+		return k
+	}
+	blob := func(i int) []byte {
+		return bytes.Repeat([]byte{byte(i), byte(0x91 ^ i)}, junkSize/2) //nolint:gosec // G115: test payload pattern
+	}
+	// Fill past the tight volume budget so reclaim retire-flips spilled
+	// segments — the machine's own three-tier pressure shape.
+	for i := 0; i < 48; i++ {
+		if st := tt.Put(3, key(i), blob(i), xxh3.Hash(blob(i))); st != protocol.StatusOK {
+			t.Fatalf("put %d: %s", i, st)
+		}
+		cur += int64(time.Second)
+		tt.DemoteNow()
+	}
+	// Find a cold-served key (its GET is the 1st hit, arming the window).
+	cold := -1
+	for i := 0; i < 48 && cold < 0; i++ {
+		if _, _, rel, tier, st := tt.GetRefTier(3, key(i)); st == protocol.StatusOK {
+			if tier == "s3" {
+				cold = i
+			}
+			rel()
+		}
+	}
+	if cold < 0 {
+		t.Fatal("no key served from the cold tier — the fill never flipped a segment")
+	}
+	// The 2nd cold hit ≥ the min gap later + one synchronous pass = restore.
+	for try := 0; try < 10; try++ {
+		cur += int64(20 * time.Millisecond)
+		_, _, rel, tier, st := tt.GetRefTier(3, key(cold))
+		if st != protocol.StatusOK {
+			t.Fatalf("cold key vanished (try %d): %s", try, st)
+		}
+		rel()
+		if tier != "s3" {
+			break // restored home
+		}
+		tt.DemoteNow() // drains the restore queue synchronously
+	}
+	if _, restores := (fakeRestore{coldTier}).Stats(); restores == 0 {
+		t.Fatal("the 2nd cold hit never triggered a whole-segment restore (restores=0)")
+	}
+	// And the restored key serves locally again, byte-identical.
+	data, _, rel, tier, st := tt.GetRefTier(3, key(cold))
+	if st != protocol.StatusOK || tier != "nvme" {
+		t.Fatalf("post-restore get: %s tier=%q, want OK nvme", st, tier)
+	}
+	if !bytes.Equal(data, blob(cold)) {
+		rel()
+		t.Fatal("post-restore bytes differ")
+	}
+	rel()
 }

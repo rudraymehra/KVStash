@@ -83,7 +83,7 @@ func TestCheckpointExcludesDyingCoverage(t *testing.T) {
 	for i := range sums {
 		_, sums[i] = appendWait(t, v, i, 60<<10) // several sealed segments
 	}
-	id, entries, ok := v.OldestSealed()
+	id, entries, ok := v.OldestSealed(0)
 	if !ok || len(entries) == 0 {
 		t.Fatal("nothing sealed")
 	}

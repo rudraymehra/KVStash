@@ -139,7 +139,7 @@ func TestVolumeRotationAndSeal(t *testing.T) {
 	if v.seals.Load() == 0 {
 		t.Fatal("no seal recorded")
 	}
-	id, entries, ok := v.OldestSealed()
+	id, entries, ok := v.OldestSealed(0)
 	if !ok || id != 0 || len(entries) == 0 {
 		t.Fatalf("OldestSealed: id=%d ok=%v entries=%d", id, ok, len(entries))
 	}
