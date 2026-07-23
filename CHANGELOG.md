@@ -5,6 +5,49 @@ Format: Keep a Changelog (https://keepachangelog.com), SemVer after v0.1.0.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-23
+
+_The v1 cut, complete: all three tiers (DRAM → NVMe → S3, restore-back and
+object GC included), tenancy with enforced DRAM quotas, four connector
+paths (LMCache, native vLLM, SGLang HiCache, NIXL native + S3-compat), and
+every published number measured against a drawn ceiling._
+
+### Added
+- Operations surface: an importable Grafana dashboard over the existing
+  `kvb_*` scrape families (tier residency, per-tenant bytes vs quota,
+  cold-tier health, reclaim/demote pressure) and a Helm chart mirroring the
+  systemd/scratch-image conventions, with fail-fast guards for
+  render-but-cannot-boot misconfigurations (s3 node-id collision,
+  hugepages half-configurations, unbudgeted persistence, empty tenant
+  registry). The chart's default image reference carries a dated staging
+  note until a release is published at that path.
+- `bench/e2e/isolation_demo.sh`: the runnable structural-isolation claim —
+  two tenants on one daemon; tenant A hits its own quota wall while tenant
+  B keeps writing; cross-tenant reads answer `NOT_FOUND` (no existence
+  oracle). Under 10 seconds on a laptop, exits nonzero on any violation,
+  and refuses to attribute a result to a daemon it did not start.
+- `tools/calculator/index.html`: self-contained recompute-tax calculator in
+  lockstep with `bench/e2e/economics.py` (per-hit cost, break-even
+  bandwidth, cross-AZ egress warning); provider figures cited to primary
+  sources and labeled as vendor-claimed.
+- `scripts/triplet-snapshot.sh`: one-command deploy-provenance JSON
+  (kvblockd version+SHA, adapter package versions, engine versions).
+
+### Fixed
+- Model-harness oracle: a block that legitimately survives a crash on NVMe
+  answers `OK_EXISTS` on a re-put of identical bytes; the oracle's put
+  truth table had no arm for that legal outcome and failed the deep
+  gauntlet on it. The new arm accepts a survivor hit only when the digest
+  matches the key's committed history (tighter, not looser), with a
+  deterministic regression pinning the exact failure. Test-only; the store
+  was verified correct.
+
+### Changed
+- Docs truthed for GA: README status/comparison table, ROADMAP, and
+  INTEGRATIONS now state exactly what ships on `main` versus what is
+  staged, deferred, or beta — including that the S3 tier shipped in v0.2.0
+  and the three follow-on connectors are on `main`, validation-gated.
+
 ## [0.5.0] - 2026-07-22
 
 _The cold tier completed — spilled segments now come home, and dead objects
