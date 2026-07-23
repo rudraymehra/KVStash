@@ -1,0 +1,21 @@
+apiVersion: v2
+name: kvblockd
+description: >-
+  kvblockd — KV-cache block store daemon: batched multi-stream TCP,
+  DRAM->NVMe->S3 tiering, namespace multi-tenancy. A plain chart, no
+  operator (locked non-goal): one StatefulSet, config from a ConfigMap,
+  namespaces/tokens from a Secret.
+type: application
+version: 0.1.0
+appVersion: "0.5.0"
+home: https://github.com/kvstash/kvblockd
+sources:
+  - https://github.com/kvstash/kvblockd
+keywords:
+  - kv-cache
+  - llm
+  - inference
+  - vllm
+maintainers:
+  - name: Rudray Mehra
+    email: rudraymehra@gmail.com

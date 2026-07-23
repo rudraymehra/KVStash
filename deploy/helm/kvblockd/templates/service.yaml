@@ -1,0 +1,41 @@
+# Two services: a headless one so StatefulSet pods get stable DNS names
+# (adapters pin a specific daemon), and a client-facing one for the data
+# plane + metrics scrape.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kvblockd.fullname" . }}-headless
+  labels:
+    {{- include "kvblockd.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "kvblockd.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: data
+      port: {{ .Values.service.dataPort }}
+      targetPort: data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kvblockd.fullname" . }}
+  labels:
+    {{- include "kvblockd.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "kvblockd.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: data
+      port: {{ .Values.service.dataPort }}
+      targetPort: data
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+    {{- if .Values.s3compat.enabled }}
+    - name: s3compat
+      port: {{ .Values.s3compat.port }}
+      targetPort: s3compat
+    {{- end }}

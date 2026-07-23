@@ -1,0 +1,143 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "kvblockd.fullname" . }}
+  labels:
+    {{- include "kvblockd.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  serviceName: {{ include "kvblockd.fullname" . }}-headless
+  selector:
+    matchLabels:
+      {{- include "kvblockd.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kvblockd.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Config/token changes roll the pods (the daemon reads both at start).
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.namespaces.existingSecret }}
+        checksum/namespaces: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kvblockd.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        # The scratch image runs as 65532 (distroless "nonroot" convention);
+        # fsGroup makes the NVMe PVC writable for it.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kvblockd
+          image: {{ include "kvblockd.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config", "/etc/kvblockd/kvblockd.yaml"]
+          ports:
+            - name: data
+              containerPort: {{ .Values.service.dataPort }}
+            - name: metrics
+              containerPort: {{ .Values.service.metricsPort }}
+            {{- if .Values.s3compat.enabled }}
+            - name: s3compat
+              containerPort: {{ .Values.s3compat.port }}
+            {{- end }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # /healthz answers 503 until the arena is prefaulted and the
+          # listener accepts — readiness gates traffic on exactly that.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              {{- toYaml .Values.resources.requests | nindent 14 }}
+            limits:
+              {{- .Values.resources.limits | toYaml | nindent 14 }}
+              {{- if .Values.hugepages.enabled }}
+              hugepages-2Mi: {{ mul (int64 .Values.hugepages.count) 2 }}Mi
+              {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kvblockd/kvblockd.yaml
+              subPath: kvblockd.yaml
+              readOnly: true
+            - name: namespaces
+              mountPath: /etc/kvblockd/namespaces.yaml
+              subPath: namespaces.yaml
+              readOnly: true
+            {{- if .Values.persistence.enabled }}
+            - name: nvme
+              mountPath: /var/lib/kvblockd/nvme
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "kvblockd.fullname" . }}
+        - name: namespaces
+          secret:
+            secretName: {{ default (printf "%s-namespaces" (include "kvblockd.fullname" .)) .Values.namespaces.existingSecret }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: nvme
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.persistence.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

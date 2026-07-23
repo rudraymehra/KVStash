@@ -1,0 +1,35 @@
+kvblockd {{ .Chart.AppVersion }} deployed as {{ include "kvblockd.fullname" . }}.
+
+Data plane (KVB1):  {{ include "kvblockd.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.dataPort }}
+Metrics / healthz:  {{ include "kvblockd.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.metricsPort }}
+{{- if .Values.s3compat.enabled }}
+S3-compat (obj):    {{ include "kvblockd.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.s3compat.port }}
+{{- end }}
+
+{{- if eq .Values.image.repository "ghcr.io/kvstash/kvblockd" }}
+
+NOTE: no public image is published at ghcr.io/kvstash/kvblockd yet (latest
+published source release: v0.2.0) — set image.repository/image.tag to a
+registry you pushed to, or the pods (and the smoke test below) cannot pull.
+{{- end }}
+
+Smoke test from inside the cluster:
+
+  kubectl -n {{ .Release.Namespace }} run kvbctl --rm -it --restart=Never \
+    --image={{ include "kvblockd.image" . }} --command -- /kvblockd --version
+
+  # with a kvbctl binary:
+  kvbctl put -addr {{ include "kvblockd.fullname" . }}:{{ .Values.service.dataPort }} \
+    -ns demo -token demo-token hello - <<< "world"
+
+Remember:
+- The demo namespace/token in values.yaml is a quickstart credential —
+  change or remove it before pointing real traffic here.
+- The data port speaks the KVB1 wire protocol for same-AZ/VPC clients;
+  never expose it to the internet.
+- Grafana: import deploy/grafana/kvblockd-dashboard.json and scrape
+  port {{ .Values.service.metricsPort }}.
+{{- if not .Values.persistence.enabled }}
+- DRAM-only mode: blocks live in the arena and die with the pod (honest
+  loss, never corruption). Enable persistence for the NVMe tier.
+{{- end }}

@@ -1,0 +1,362 @@
+<!doctype html>
+<!--
+  kvblockd recompute-tax calculator — STAGED artifact: in-repo only, not
+  wired to GitHub Pages. Single self-contained page, vanilla JS, no CDN.
+
+  The economics are the SAME formulas as bench/e2e/economics.py (keep them
+  in lockstep — that script is the reviewed source of truth):
+    bytes/token       = kv_mult * layers * kv_heads * head_dim * dtype_bytes
+                        (presets below use the honest GQA/MLA counts, never
+                         the MHA miscount)
+    recompute $/hit   = prefix_tokens / prefill_tok_s * gpu_usd_per_sec
+    fetch $/hit       = bytes_moved / GB * transfer_usd_per_gb
+    break-even GB/s   = bytes_per_token * prefill_tok_s   (B*; N cancels)
+  Sizes are binary MiB; bandwidth and transfer $ are decimal GB — the same
+  split economics.py documents, so numbers line up with iperf3/rig output.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kvblockd — recompute-tax calculator</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:           #f9f9f7;
+    --surface-1:      #fcfcfb;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --hairline:       #e1e0d9;
+    --border:         rgba(11,11,11,0.10);
+    --accent:         #2a78d6;   /* categorical slot 1 (blue) */
+    --good-text:      #006300;   /* delta-good success text (light) */
+    --warn:           #d03b3b;   /* status critical */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:           #0d0d0d;
+      --surface-1:      #1a1a19;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --hairline:       #2c2c2a;
+      --border:         rgba(255,255,255,0.10);
+      --accent:         #3987e5;
+      --good-text:      #0ca30c;
+      --warn:           #e66767;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:           #0d0d0d;
+    --surface-1:      #1a1a19;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --hairline:       #2c2c2a;
+    --border:         rgba(255,255,255,0.10);
+    --accent:         #3987e5;
+    --good-text:      #0ca30c;
+    --warn:           #e66767;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text-primary);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  .sub { color: var(--text-secondary); margin: 0 0 28px; }
+  .grid { display: grid; grid-template-columns: 340px 1fr; gap: 20px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px;
+  }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+             color: var(--text-muted); margin: 0 0 14px; font-weight: 600; }
+  label { display: block; font-size: 13px; color: var(--text-secondary); margin: 12px 0 4px; }
+  label:first-of-type { margin-top: 0; }
+  input[type=number], select {
+    width: 100%; padding: 7px 9px; font: inherit;
+    color: var(--text-primary); background: var(--page);
+    border: 1px solid var(--hairline); border-radius: 6px;
+  }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .rangerow { display: flex; align-items: center; gap: 10px; }
+  .rangeval { min-width: 52px; text-align: right; font-variant-numeric: tabular-nums; }
+  .hint { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+  .tile {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .tile .k { font-size: 12px; color: var(--text-muted); }
+  .tile .v { font-size: 26px; font-weight: 650; margin-top: 2px; }
+  .tile .d { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+  .v.saving { color: var(--good-text); }
+  .v.losing { color: var(--warn); }
+  table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 14px; }
+  th { text-align: left; color: var(--text-muted); font-weight: 600; font-size: 12px;
+       border-bottom: 1px solid var(--hairline); padding: 6px 8px; }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--hairline);
+       font-variant-numeric: tabular-nums; }
+  td:first-child { font-variant-numeric: normal; color: var(--text-secondary); }
+  .warnbox {
+    display: none; margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--warn); color: var(--warn); font-size: 13px;
+  }
+  .formulas { font-size: 13px; color: var(--text-secondary); }
+  .formulas code { font-size: 12px; }
+  footer { margin-top: 28px; font-size: 12px; color: var(--text-muted);
+           border-top: 1px solid var(--hairline); padding-top: 14px; }
+  footer p { margin: 6px 0; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>The recompute tax</h1>
+  <p class="sub">What re-prefilling cached context costs you per month — and what serving
+  the same KV blocks out of <strong>kvblockd</strong> over plain TCP costs instead.
+  Same formulas as <code>bench/e2e/economics.py</code>.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Your deployment</h2>
+
+      <label for="preset">Model preset (honest GQA/MLA byte counts)</label>
+      <select id="preset">
+        <option value="131072,15000">Llama-3.1-8B (GQA) — 0.125 MiB/token</option>
+        <option value="327680,2000">Llama-3-70B (GQA) — 0.313 MiB/token</option>
+        <option value="70272,8000">DeepSeek-V3 (MLA) — 0.067 MiB/token</option>
+        <option value="custom">Custom…</option>
+      </select>
+      <div class="hint">bytes/token = kv_mult × layers × kv_heads × head_dim × dtype.
+      The widely-miscited MHA "2.5&nbsp;MB/token" is deliberately absent.</div>
+
+      <label for="bpt">KV cache bytes per token</label>
+      <input type="number" id="bpt" value="131072" min="1" step="1">
+
+      <label for="prefill">GPU prefill rate (tokens/s)</label>
+      <input type="number" id="prefill" value="15000" min="1" step="100">
+
+      <label for="gpu">GPU price ($/hr)</label>
+      <input type="number" id="gpu" value="1.39" min="0" step="0.01">
+      <div class="hint">defaults: RunPod A100 80GB $1.39/hr (economics.py basis)</div>
+
+      <label for="prefix">Reused prefix length (tokens)</label>
+      <input type="number" id="prefix" value="80000" min="1" step="1000">
+      <div class="hint">80k = a long agentic prefix, the target workload</div>
+
+      <label for="reqs">Requests per day</label>
+      <input type="number" id="reqs" value="100000" min="0" step="1000">
+
+      <label for="hit">Cache hit rate</label>
+      <div class="rangerow">
+        <input type="range" id="hit" min="0" max="100" value="54" step="1">
+        <span class="rangeval" id="hitval">54%</span>
+      </div>
+      <div class="hint">54–62% = measured Alibaba Bailian band; 90% is marketing —
+      label it as such if you use it</div>
+
+      <label for="net">Network bandwidth to kvblockd (GB/s, decimal)</label>
+      <input type="number" id="net" value="10" min="0.01" step="0.1">
+      <div class="hint">kvblockd targets 10+ GB/s on commodity TCP; use your measured number</div>
+
+      <label for="xfer">Transfer price ($/GB, decimal)</label>
+      <input type="number" id="xfer" value="0" min="0" step="0.001">
+      <div class="hint">same-AZ private IP = $0; cross-AZ = $0.01/GB <em>each way</em>
+      (a public/Elastic IP silently bills even in one AZ)</div>
+    </div>
+
+    <div>
+      <div class="tiles">
+        <div class="tile">
+          <div class="k">Recompute tax / month</div>
+          <div class="v" id="taxMonth">—</div>
+          <div class="d">GPU $ burned re-prefilling context you already computed (30 days)</div>
+        </div>
+        <div class="tile">
+          <div class="k">Serve-from-kvblockd / month</div>
+          <div class="v" id="serveMonth">—</div>
+          <div class="d">transfer $ for the same hits (same-AZ = $0)</div>
+        </div>
+        <div class="tile">
+          <div class="k">Net saved / month</div>
+          <div class="v saving" id="savedMonth">—</div>
+          <div class="d" id="savedDetail">—</div>
+        </div>
+        <div class="tile">
+          <div class="k">Break-even bandwidth B*</div>
+          <div class="v" id="breakeven">—</div>
+          <div class="d">move KV faster than the GPU re-makes it and loading wins;
+          B* = bytes/token × prefill rate (context-length independent)</div>
+        </div>
+      </div>
+
+      <div class="warnbox" id="bwWarn"></div>
+      <div class="warnbox" id="costWarn"></div>
+
+      <div class="card" style="margin-top:12px">
+        <h2>Per cache hit (prefix of <span id="prefixEcho">80,000</span> tokens)</h2>
+        <table>
+          <thead><tr><th></th><th>Recompute on GPU</th><th>Serve from kvblockd</th></tr></thead>
+          <tbody>
+            <tr><td>time</td><td id="tRe">—</td><td id="tKv">—</td></tr>
+            <tr><td>cost</td><td id="cRe">—</td><td id="cKv">—</td></tr>
+            <tr><td>KV bytes moved</td><td>—</td><td id="bKv">—</td></tr>
+          </tbody>
+        </table>
+        <div class="hint" style="margin-top:8px" id="speedup"></div>
+      </div>
+
+      <div class="card formulas" style="margin-top:12px">
+        <h2>The formulas (nothing hidden)</h2>
+        <p><code>recompute $/hit = prefix_tokens ÷ prefill_tok_s × (gpu_$/hr ÷ 3600)</code></p>
+        <p><code>serve $/hit = prefix_tokens × bytes/token ÷ 10⁹ × transfer_$/GB</code></p>
+        <p><code>tax/month = req/day × hit_rate × recompute_$/hit × 30</code> — the GPU seconds
+        you pay for again whenever a hit is <em>not</em> served from cache.</p>
+        <p><code>B* (GB/s) = bytes/token × prefill_tok_s ÷ 10⁹</code> — sizes in binary MiB,
+        bandwidth/transfer in decimal GB, exactly as economics.py documents.</p>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <p><strong>Provider-scale sanity check:</strong> DeepSeek's API prices cached-prefix
+    hits roughly 50–120× cheaper than misses — ~50× on V4-Flash, up to ~120× on
+    V4-Pro, per DeepSeek's published KV-cache docs
+    (<a href="https://api-docs.deepseek.com/guides/kv_cache/">api-docs.deepseek.com/guides/kv_cache</a>)
+    and pricing page
+    (<a href="https://api-docs.deepseek.com/quick_start/pricing">api-docs.deepseek.com/quick_start/pricing</a>),
+    as of Jul 2026. A vendor/provider-claimed figure, not our measurement, but it
+    is the same hit/miss cost gap this page models.</p>
+    <p>Formula sources (verified 2026-07, see <code>bench/e2e/economics.py</code>):
+    KV formula &amp; MLA — arxiv.org/html/2505.09343v2; break-even framing —
+    arxiv.org/abs/2510.09665 (LMCache), arxiv.org/abs/2410.03065 (Cake);
+    GPU $/hr — runpod.io/pricing; transfer $ — AWS on-demand
+    (same-AZ private IP $0/GB, cross-AZ $0.01/GB each way).</p>
+    <p>Honesty notes: below ~40% hit rate the savings may not clear amortized infra
+    cost; byte counts here are honest GQA/MLA, never the 64-head MHA miscount;
+    latency wins assume same-AZ deployment.</p>
+  </footer>
+</main>
+
+<script>
+"use strict";
+(function () {
+  var GBd = 1e9; // decimal GB — matches iperf3 / economics.py bandwidth units
+  var $ = function (id) { return document.getElementById(id); };
+
+  function fmtUSD(x, tiny) {
+    if (!isFinite(x)) return "—";
+    var sign = x < 0 ? "−" : ""; // minus sign BEFORE the $: −$399,653 not $-399653.28
+    var a = Math.abs(x);
+    if (tiny) return sign + "$" + a.toFixed(a < 0.01 ? 6 : 4);
+    if (a >= 1000) return sign + "$" + Math.round(a).toLocaleString("en-US");
+    return sign + "$" + a.toFixed(2);
+  }
+  function fmtTime(s) {
+    if (!isFinite(s)) return "—";
+    if (s < 1) return (s * 1000).toFixed(1) + " ms";
+    return s.toFixed(2) + " s";
+  }
+  function fmtBytes(b) {
+    var MiB = 1048576, GiB = MiB * 1024;
+    return b >= GiB ? (b / GiB).toFixed(2) + " GiB" : (b / MiB).toFixed(2) + " MiB";
+  }
+
+  function recalc() {
+    var bpt     = +$("bpt").value;      // bytes per token
+    var prefill = +$("prefill").value;  // tok/s
+    var gpuHr   = +$("gpu").value;      // $/hr
+    var prefix  = +$("prefix").value;   // tokens reused per hit
+    var reqs    = +$("reqs").value;     // requests/day
+    var hit     = +$("hit").value / 100;
+    var net     = +$("net").value;      // GB/s decimal
+    var xfer    = +$("xfer").value;     // $/GB decimal
+
+    $("hitval").textContent = Math.round(hit * 100) + "%";
+    $("prefixEcho").textContent = prefix.toLocaleString("en-US");
+
+    var gpuSec = gpuHr / 3600;
+    var bytesMoved = bpt * prefix;
+
+    // economics.py section 3: per-hit costs
+    var recomputeHit = prefix / prefill * gpuSec;
+    var serveHit = bytesMoved / GBd * xfer;
+
+    // economics.py section 2: break-even bandwidth (N cancels)
+    var bstar = bpt * prefill / GBd;
+
+    // times
+    var tRe = prefix / prefill;
+    var tKv = bytesMoved / (net * GBd);
+
+    var hitsDay = reqs * hit;
+    var taxDay = hitsDay * recomputeHit;
+    var serveDay = hitsDay * serveHit;
+    var savedDay = taxDay - serveDay;
+    var gpuHrsDay = hitsDay * tRe / 3600;
+
+    $("taxMonth").textContent = fmtUSD(taxDay * 30);
+    $("serveMonth").textContent = fmtUSD(serveDay * 30);
+    var sm = $("savedMonth");
+    sm.textContent = fmtUSD(savedDay * 30);
+    sm.className = "v " + (savedDay >= 0 ? "saving" : "losing");
+    $("savedDetail").textContent = isFinite(gpuHrsDay)
+      ? "≈ " + gpuHrsDay.toFixed(1) + " GPU-hours/day of prefill handed back to serving"
+      : "—"; // prefill=0 → Infinity (or NaN with hit=0): same guard as the $ tiles
+    $("breakeven").textContent = isFinite(bstar) ? bstar.toFixed(2) + " GB/s" : "—";
+
+    $("tRe").textContent = fmtTime(tRe);
+    $("tKv").textContent = fmtTime(tKv);
+    $("cRe").textContent = fmtUSD(recomputeHit, true);
+    $("cKv").textContent = fmtUSD(serveHit, true);
+    $("bKv").textContent = fmtBytes(bytesMoved);
+    // isFinite(tKv) too: net=0 typed makes tKv Infinity and the ratio a
+    // finite 0.0 — "0.0× sooner at 0 GB/s" is nonsense, show nothing.
+    $("speedup").textContent = (isFinite(tRe / tKv) && isFinite(tKv) && tKv > 0)
+      ? "Prefix ready " + (tRe / tKv).toFixed(1) + "× sooner from cache at " +
+        net + " GB/s (time-to-first-token headroom, before layer-wise overlap)."
+      : "";
+
+    var bw = $("bwWarn");
+    if (net <= bstar) {
+      bw.style.display = "block";
+      bw.textContent = "At " + net + " GB/s you are BELOW this model's break-even (" +
+        bstar.toFixed(2) + " GB/s): the GPU re-makes KV faster than the network " +
+        "delivers it, so loading loses on latency here. The $ column can still " +
+        "favor caching, but be honest about which one you are buying.";
+    } else { bw.style.display = "none"; }
+
+    var cw = $("costWarn");
+    if (serveHit > recomputeHit && recomputeHit > 0) {
+      cw.style.display = "block";
+      cw.textContent = "Transfer at $" + xfer + "/GB costs MORE per hit than " +
+        "recomputing — the cross-AZ failure mode economics.py §5 warns about. " +
+        "Deploy same-AZ on private IPs.";
+    } else { cw.style.display = "none"; }
+  }
+
+  $("preset").addEventListener("change", function () {
+    if (this.value === "custom") return;
+    var p = this.value.split(",");
+    $("bpt").value = p[0];
+    $("prefill").value = p[1];
+    recalc();
+  });
+  ["bpt", "prefill", "gpu", "prefix", "reqs", "hit", "net", "xfer"].forEach(function (id) {
+    $(id).addEventListener("input", function () {
+      if (id === "bpt" || id === "prefill") $("preset").value = "custom";
+      recalc();
+    });
+  });
+  recalc();
+})();
+</script>
+</body>
+</html>

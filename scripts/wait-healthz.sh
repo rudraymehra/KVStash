@@ -5,7 +5,7 @@ ADDR="${1:?usage: wait-healthz.sh host:port [timeout_s]}"
 TIMEOUT="${2:-30}"
 deadline=$(( $(date +%s) + TIMEOUT ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  if curl -fsS "http://${ADDR}/healthz" >/dev/null 2>&1; then
+  if curl -fsS --max-time 2 "http://${ADDR}/healthz" >/dev/null 2>&1; then
     echo "healthz OK: $ADDR"; exit 0
   fi
   sleep 0.3

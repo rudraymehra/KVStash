@@ -1,0 +1,52 @@
+{{- if and .Values.s3.enabled (not .Values.persistence.enabled) }}
+{{- fail "s3.enabled requires persistence.enabled (the cold tier spills sealed NVMe segments)" }}
+{{- end }}
+{{- if and .Values.s3.enabled (gt (int .Values.replicaCount) 1) }}
+{{- fail "s3.enabled with replicaCount > 1: pods would share s3_node_id and overwrite each other's objects — run one replica per release (no per-pod node-id override exists yet)" }}
+{{- end }}
+{{- if and .Values.persistence.enabled (le (int64 .Values.persistence.maxBytes) 0) }}
+{{- fail "persistence.enabled requires persistence.maxBytes > 0 (the daemon refuses nvme_paths without a budget); size it below persistence.size" }}
+{{- end }}
+{{- if and .Values.config.dramHugepages (not .Values.hugepages.enabled) }}
+{{- fail "config.dramHugepages requires hugepages.enabled (without the hugepages-2Mi resource the pod's hugetlb limit is 0, MAP_HUGETLB fails at startup, and the pod CrashLoops)" }}
+{{- end }}
+{{- if and .Values.hugepages.enabled (lt (mul (int64 .Values.hugepages.count) 2097152) (int64 .Values.config.dramArenaBytes)) }}
+{{- fail (printf "hugepages reservation too small: hugepages.count x 2Mi = %d bytes < config.dramArenaBytes = %d — the arena cannot be mapped; set hugepages.count >= dramArenaBytes / 2097152" (mul (int64 .Values.hugepages.count) 2097152) (int64 .Values.config.dramArenaBytes)) }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kvblockd.fullname" . }}
+  labels:
+    {{- include "kvblockd.labels" . | nindent 4 }}
+data:
+  kvblockd.yaml: |
+    # Rendered by the kvblockd Helm chart. Reference: internal/config/example.yaml.
+    listen_addr: ":{{ .Values.service.dataPort }}"
+    # Probes and Prometheus reach the pod IP, so the ops endpoint must not
+    # bind loopback (the binary's default) inside the container.
+    metrics_addr: "0.0.0.0:{{ .Values.service.metricsPort }}"
+    {{- if .Values.s3compat.enabled }}
+    s3compat_addr: "0.0.0.0:{{ .Values.s3compat.port }}"
+    {{- end }}
+    namespaces_path: "/etc/kvblockd/namespaces.yaml"
+    dram_arena_bytes: {{ int64 .Values.config.dramArenaBytes }}
+    dram_hugepages: {{ .Values.config.dramHugepages }}
+    {{- if .Values.persistence.enabled }}
+    nvme_paths: ["/var/lib/kvblockd/nvme"]
+    nvme_max_bytes: {{ int64 .Values.persistence.maxBytes }}
+    {{- end }}
+    {{- if .Values.s3.enabled }}
+    s3_bucket: {{ .Values.s3.bucket | quote }}
+    {{- with .Values.s3.region }}
+    s3_region: {{ . | quote }}
+    {{- end }}
+    s3_node_id: {{ default (include "kvblockd.fullname" .) .Values.s3.nodeId | quote }}
+    {{- with .Values.s3.endpointOverride }}
+    s3_endpoint_override: {{ . | quote }}
+    {{- end }}
+    s3_path_style: {{ .Values.s3.pathStyle }}
+    {{- end }}
+    {{- with .Values.config.extra }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}

@@ -1,0 +1,124 @@
+# kvblockd chart values. The daemon's own reference config is
+# internal/config/example.yaml; this chart renders a subset of it plus the
+# tenancy file. Byte sizes are plain integers, exactly like the config file.
+
+replicaCount: 1
+
+# ---------------------------------------------------------------------------
+# STAGING NOTE (as of Jul 2026): no public image is published at this default
+# reference yet — pulling it will fail. The name below is kept as the default
+# because it is the repo's canonical convention, not because it resolves.
+# To deploy today: build and push your own image, then set image.repository /
+# image.tag to your registry. Latest published source release: v0.2.0.
+# ---------------------------------------------------------------------------
+image:
+  repository: ghcr.io/kvstash/kvblockd
+  # Defaults to the chart appVersion. The image is FROM scratch: no shell,
+  # ca-certificates baked in for the S3 tier's TLS.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  dataPort: 9440    # KVB1 frames (never expose to the internet — same-AZ/VPC only)
+  metricsPort: 9442 # /metrics, /healthz, /debug/pprof
+
+serviceAccount:
+  create: true
+  name: ""
+  # IRSA-style S3 credentials (EKS): annotate the service account with the
+  # role and the ambient AWS chain inside the pod picks it up — kvblockd
+  # never reads credentials from its config file.
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/kvblockd-s3
+  annotations: {}
+
+config:
+  # The hot tier: one mmap'd arena outside the Go heap. resources.limits
+  # memory must exceed this by the daemon's small overhead.
+  dramArenaBytes: 1073741824 # 1 GiB
+  # Linux MAP_HUGETLB. Requires hugepages.enabled below (the kubelet must
+  # schedule the pod onto pre-reserved 2Mi pages).
+  dramHugepages: false
+  # Any other top-level config keys from internal/config/example.yaml,
+  # rendered verbatim into kvblockd.yaml (eviction knobs, socket buffers,
+  # ceilings, stream timeouts ...):
+  extra: {}
+  #   eviction_policy: s3fifo
+  #   sock_sndbuf: 16777216
+
+# Namespaces + bearer tokens (the tenancy file). Either inline entries —
+# rendered into a Secret — or an existing Secret carrying the same YAML.
+# Prefer token_sha256 entries so no plaintext credential lives in values
+# (echo -n SECRET | shasum -a 256). ids are operator-assigned, nonzero,
+# stable across restarts; never reuse an id for a different tenant.
+namespaces:
+  # existingSecret: ""            # secret with key "namespaces.yaml"; wins over entries
+  entries:
+    - name: demo
+      id: 1
+      token: demo-token # CHANGE OR REMOVE before exposing the daemon
+    # - name: team-a
+    #   id: 2
+    #   token_sha256: "64-hex-chars"
+    #   quota_dram: 8589934592
+    #   pin_quota: 1073741824
+
+# The NVMe warm tier: a PVC per pod (volumeClaimTemplates), mounted at
+# /var/lib/kvblockd/nvme. Disabled = DRAM-only daemon (the recommended
+# first run). maxBytes is REQUIRED when enabled (the daemon refuses
+# nvme_paths without a budget) and must fit inside size.
+persistence:
+  enabled: false
+  storageClassName: "" # pick the local-NVMe class for real numbers; "" = cluster default
+  size: 100Gi
+  maxBytes: 0 # e.g. 96Gi of a 100Gi PVC: 103079215104
+  annotations: {}
+
+# The S3 cold tier (requires persistence.enabled). Credentials come ONLY
+# from the ambient AWS chain — IRSA annotation above, or extraEnv AWS_* vars.
+s3:
+  enabled: false
+  bucket: ""
+  region: ""
+  # Unique per daemon (it namespaces this node's object keys). Defaults to
+  # the release fullname; the chart refuses replicaCount > 1 with s3 enabled
+  # because pods would share it and overwrite each other's segments.
+  nodeId: ""
+  endpointOverride: "" # MinIO-compatible targets: "http://minio:9000"
+  pathStyle: false
+
+# Optional S3-compat listener (the zero-code NIXL/vLLM obj path).
+s3compat:
+  enabled: false
+  port: 9500
+
+# 2Mi hugepages for the arena. The node must have vm.nr_hugepages reserved;
+# count must cover dramArenaBytes (count = arena / 2Mi).
+hugepages:
+  enabled: false
+  count: 512 # 512 x 2Mi = 1 GiB
+
+# Memory limit must exceed config.dramArenaBytes + overhead; with
+# hugepages.enabled the arena moves to the hugepages-2Mi resource instead.
+resources:
+  requests:
+    cpu: "1"
+    memory: 2Gi
+  limits:
+    memory: 2Gi
+
+extraEnv: []
+#  - name: KVBLOCKD_MAX_CONNS
+#    value: "2048"
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+terminationGracePeriodSeconds: 30 # SIGTERM starts a graceful drain; must exceed the drain budget
