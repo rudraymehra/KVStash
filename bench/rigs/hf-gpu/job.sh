@@ -329,7 +329,17 @@ python3 "$HERE/run_ttft.py" --phase populate \
   --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
   --model "$MODEL" --lengths "$LENGTHS" --reps "$REPS" --warmup "$WARMUP" \
   --state "$STATE_JSON" --put-wait-s "$PUT_WAIT_S" --drain-s "$DRAIN_S" \
-  || die "populate failed — kvblockd never received the blocks, so there is nothing honest to measure (see FATAL(populate) above)"
+  || {
+    # The engine's own log is where the cache library reports which backends it
+    # built. Without this, a populate failure says only that no bytes arrived —
+    # never whether a remote backend was created at all, which is the single
+    # most useful fact when diagnosing a severed store path.
+    log "engine log: backend/connector lines"
+    grep -inE 'remote|plugin|connector|backend|Traceback|Error' "$WORK/vllm-populate.log" 2>/dev/null | tail -40 >&2 || true
+    log "engine log: last 120 lines"
+    tail -120 "$WORK/vllm-populate.log" >&2 || true
+    die "populate failed — kvblockd never received the blocks, so there is nothing honest to measure (see FATAL(populate) above)"
+  }
 
 # ---- 10. RESTART: fresh engine = no local KV anywhere; kvblockd keeps blocks -
 log "restarting vLLM: a fresh engine has no local KV, so a warm hit can only be a kvblockd TCP read"
