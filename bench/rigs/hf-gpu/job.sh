@@ -173,8 +173,13 @@ PYTHONHASHSEED=0 vllm serve "$MODEL" --port "$VLLM_PORT" --dtype bfloat16 \
   --kv-transfer-config "$(cat "$WORK/kv_transfer.json")" \
   > "$WORK/vllm.log" 2>&1 &
 VLLM_PID=$!
-# generous: first boot downloads ~15 GB of weights
-bash "$ROOT/scripts/wait-http.sh" "http://127.0.0.1:$VLLM_PORT/health" 2400
+# generous: first boot downloads ~15 GB of weights. Passing the pid makes a
+# crashed server fail in seconds instead of burning the whole deadline.
+if ! bash "$ROOT/scripts/wait-http.sh" "http://127.0.0.1:$VLLM_PORT/health" 2400 "$VLLM_PID"; then
+  log "FATAL: vLLM never became healthy; last 60 lines of its log:"
+  tail -60 "$WORK/vllm.log" >&2
+  exit 1
+fi
 
 # ---- 8. the sweep ------------------------------------------------------------
 LMCACHE_VER="$(python3 -c 'import lmcache; print(lmcache.__version__)')"
