@@ -246,7 +246,14 @@ VLLM_LOG=""
 start_vllm() {  # $1 = log file, $2 = health timeout seconds
   VLLM_LOG="$1"
   log "starting vLLM: $MODEL (max_len=$MAX_MODEL_LEN, gpu_util=$GPU_MEM_UTIL) -> $VLLM_LOG"
-  PYTHONHASHSEED=0 vllm serve "$MODEL" --port "$VLLM_PORT" --dtype bfloat16 \
+  # LMCACHE_CONFIG_FILE is load-bearing: vLLM spawns the engine core in a
+  # separate process, and passing the path only through --kv-transfer-config
+  # left that process reading LMCache's defaults — it initialised, logged its
+  # CUDA backends, and never mentioned a plugin, so nothing was ever stored
+  # remotely. The environment variable reaches every child.
+  PYTHONHASHSEED=0 LMCACHE_CONFIG_FILE="$WORK/lmcache_kvblockd.yaml" \
+  LMCACHE_LOG_LEVEL="${LMCACHE_LOG_LEVEL:-INFO}" \
+  vllm serve "$MODEL" --port "$VLLM_PORT" --dtype bfloat16 \
     --max-model-len "$MAX_MODEL_LEN" --max-num-seqs 1 \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --no-enable-prefix-caching \
@@ -255,6 +262,13 @@ start_vllm() {  # $1 = log file, $2 = health timeout seconds
   VLLM_PID=$!
   # Passing the pid makes a crashed server fail in seconds instead of burning
   # the whole deadline (scripts/wait-http.sh).
+  # Report what LMCache actually loaded, so a silent local-only fallback is
+  # visible in the log instead of being inferred from an absence of lines.
+  ( sleep 20
+    echo "=== LMCache config as the server sees it ==="
+    grep -icE 'plugin://kvblockd|remote_storage_plugin' "$VLLM_LOG" 2>/dev/null \
+      | sed 's/^/  plugin mentions in vllm log: /'
+  ) &
   if ! bash "$ROOT/scripts/wait-http.sh" "http://127.0.0.1:$VLLM_PORT/health" "$2" "$VLLM_PID"; then
     # vLLM reports the engine-core failure as "See root cause above": the
     # worker process writes its real error well before the API-server
