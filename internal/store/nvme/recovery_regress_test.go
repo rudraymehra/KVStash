@@ -7,10 +7,10 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-// Regression tests for the Week-6 review-ladder findings. Each pins a
-// confirmed defect with the exact scenario that exposed it.
+// Regression tests for confirmed recovery/checkpoint defects. Each pins a
+// fixed bug with the exact scenario that exposed it.
 
-// TestCheckpointRoundTripAcrossRestarts pins the ladder's BLOCKER: a
+// TestCheckpointRoundTripAcrossRestarts pins a data-loss bug: a
 // checkpoint-trusted segment recovered with a nil entry table poisoned the
 // NEXT checkpoint into dropping every one of its blocks — sealed, fsync'd
 // data silently lost on the SECOND restart. All prior tests covered only a
@@ -72,7 +72,7 @@ func TestCheckpointRoundTripAcrossRestarts(t *testing.T) {
 	}
 }
 
-// TestCheckpointExcludesDyingCoverage pins ladder blocker B1b: a segment
+// TestCheckpointExcludesDyingCoverage pins a related data-loss bug: a segment
 // mid-retire is excluded from the checkpoint's entries, so it must also cap
 // maxSealedSegID — otherwise an ABORTED retire leaves a live segment that
 // the next recovery "trusts" with zero entries.
@@ -113,7 +113,7 @@ func TestCheckpointExcludesDyingCoverage(t *testing.T) {
 	}
 }
 
-// TestSameSegmentLatestWins pins the ladder HIGH: two generations of one
+// TestSameSegmentLatestWins pins a fixed recovery bug: two generations of one
 // key inside the SAME segment (delete + re-put before rotation) must
 // recover to the LATER offset — the old code kept the first footer entry
 // and served superseded bytes.
@@ -168,7 +168,7 @@ func TestSameSegmentLatestWins(t *testing.T) {
 	}
 }
 
-// TestGeometryChangeSurvivesRetune pins the ladder HIGH: retuning
+// TestGeometryChangeSurvivesRetune pins a fixed recovery bug: retuning
 // nvme_segment_bytes must NOT delete existing sealed segments — geometry is
 // per-file, only genuinely partial creates are dropped.
 func TestGeometryChangeSurvivesRetune(t *testing.T) {
@@ -202,7 +202,7 @@ func TestGeometryChangeSurvivesRetune(t *testing.T) {
 	}
 }
 
-// TestJunkFilenamesIgnored pins the ladder MED: non-canonical names that
+// TestJunkFilenamesIgnored pins a fixed recovery bug: non-canonical names that
 // Sscanf would happily parse (seg-0.kvbs aliasing seg-00000000.kvbs) must
 // be ignored, not double-counted.
 func TestJunkFilenamesIgnored(t *testing.T) {
@@ -232,7 +232,7 @@ func TestJunkFilenamesIgnored(t *testing.T) {
 	}
 }
 
-// TestCloseFiresQueuedAppendCallbacks pins the ladder MED: appends still in
+// TestCloseFiresQueuedAppendCallbacks pins a fixed shutdown leak: appends still in
 // the queue when Close runs must get their OnWritten(ok=false) — the
 // demoter's arena refs leak otherwise.
 func TestCloseFiresQueuedAppendCallbacks(t *testing.T) {

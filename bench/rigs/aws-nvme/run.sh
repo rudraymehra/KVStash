@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rig N: run the nvmeprobe matrix on the instance-store NVMe. A3 verdict input.
+# Rig N: run the nvmeprobe matrix on the instance-store NVMe (device-gate input).
 set -euo pipefail
 STATE="$(dirname "$0")/.rig-state"; source "$STATE"
 SSH="ssh -i $HOME/.ssh/kvbench.pem -o StrictHostKeyChecking=accept-new ec2-user"
@@ -11,4 +11,4 @@ $SSH@"$N_PUB" 'sudo mkfs.xfs -f /dev/nvme1n1 >/dev/null 2>&1 && sudo mkdir -p /m
 for op in read write; do for bs in 131072 1048576; do for qd in 8 32; do
   $SSH@"$N_PUB" "/tmp/nvmeprobe --backend=threadpool --path=/mnt/nvme/probe.dat --file-size=$((32*1024*1024*1024)) --op=$op --bs=$bs --qd=$qd --duration=30s" | tee -a "$OUT"
 done; done; done
-echo "[run] results in $OUT — A3 gate: any read config >= 6.0 gbytes_per_s (and compare vs fio ceiling)"
+echo "[run] results in $OUT — NVMe device gate: any read config >= 6.0 gbytes_per_s (and compare vs fio ceiling)"

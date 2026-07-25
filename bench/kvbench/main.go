@@ -1,4 +1,4 @@
-// Command kvbench is the storage-level benchmark harness (SPEC-4): grid
+// Command kvbench is the storage-level benchmark harness: grid
 // sweeps and trace replays against kvblockd, Redis/Valkey, and an NVMe-fs
 // floor, with coordinated-omission-safe open-loop latency, deterministic
 // incompressible payloads, corruption-checked GETs, and one JSONL record

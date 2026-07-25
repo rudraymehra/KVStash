@@ -59,7 +59,7 @@ type Config struct {
 	NamespacesPath string `yaml:"namespaces_path"`
 
 	// SockSndBuf / SockRcvBuf are per-connection socket buffer requests in
-	// bytes. 16 MiB is the value the A1 rig saturated 50 GbE with; the kernel
+	// bytes. 16 MiB is the value the benchmark rig saturated 50 GbE with; the kernel
 	// silently clamps on untuned hosts (the transport logs the effective size).
 	SockSndBuf int `yaml:"sock_sndbuf"`
 	SockRcvBuf int `yaml:"sock_rcvbuf"`
@@ -81,7 +81,8 @@ type Config struct {
 	PinnedBytesCap int64 `yaml:"pinned_bytes_cap"`
 
 	// EvictionPolicy selects the pressure policy: "s3fifo" (default),
-	// "sampled-lru", or "none" (the Week-3 hard-wall behavior).
+	// "sampled-lru", or "none" (hard wall: a full arena refuses writes
+	// with ERR_QUOTA_BYTES instead of evicting).
 	EvictionPolicy string `yaml:"eviction_policy"`
 	// EvictionWatermarkPct triggers an eviction batch at this arena
 	// occupancy; EvictionBatchPct is how far below it one batch frees.
@@ -381,7 +382,7 @@ func (c Config) Validate() error {
 	if len(c.NvmePaths) > 0 {
 		// Paths are compared NORMALIZED: "/a" vs "/a/" (or "./x" vs "x")
 		// naming the same directory would put two volumes on one segment
-		// log — interleaved appends destroy the data (ladder finding).
+		// log — interleaved appends destroy the data.
 		// Nested paths are rejected for the same reason. Symlink aliases
 		// remain the operator's responsibility (documented; paths may not
 		// exist yet at validation time). NOTE also that key→volume
@@ -404,9 +405,9 @@ func (c Config) Validate() error {
 			}
 		}
 		nVols := int64(len(c.NvmePaths))
-		// The EXACT bound OpenVolume enforces — the ladder caught the two
-		// layers computing slightly different minima (a config in the gap
-		// validated, then failed at startup).
+		// The EXACT bound OpenVolume enforces — the two layers used to
+		// compute slightly different minima (a config in the gap
+		// validated, then failed at startup; sharing one function fixed it).
 		minSeg := nvme.MinSegmentBytes(c.MaxBlobLen)
 		check(c.NvmeSegmentBytes >= minSeg && c.NvmeSegmentBytes%4096 == 0 && c.NvmeSegmentBytes < int64(^uint32(0)),
 			"nvme_segment_bytes %d: must be a 4096-multiple in [%d (one max_blob_len record + footer), 4 GiB)",

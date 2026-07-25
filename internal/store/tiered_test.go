@@ -45,8 +45,8 @@ func newFixture(t *testing.T, volMaxBytes int64, backend nvme.IOBackend) *fixtur
 // newFixtureAdmit passes AdmitMinHits through NewTiered — the CONSTRUCTOR
 // path, where the zero-vs-default clamp bug lived. Regression tests must
 // use this, never a post-construction t.p write (which bypasses
-// withDefaults entirely — two reviewers proved the bypassed form passes
-// against the buggy code).
+// withDefaults entirely — the bypassed form demonstrably passes even
+// against the buggy code, so it pins nothing).
 func newFixtureAdmit(t *testing.T, volMaxBytes int64, backend nvme.IOBackend, admitMinHits uint32) *fixture {
 	t.Helper()
 	cur := &atomic.Int64{}
@@ -411,7 +411,7 @@ func (fx *fixture) putColdRange(t *testing.T, start, n, sz int) {
 // must genuinely admit never-read blocks — a withDefaults clamp silently
 // turned 0 into 1, and a pure-PUT fill was then DELETED at the demote
 // watermark with no counter (the 20 GiB rig fill vanished; the probe
-// caught it). Same trap class as the PromoteWindow ladder finding.
+// caught it). Same trap class as the PromoteWindow zero-vs-default bug.
 func TestAdmitMinHitsZeroAdmitsColdFill(t *testing.T) {
 	// The clamp lived in withDefaults — pin it directly, forever.
 	if got := (Params{AdmitMinHits: 0}).withDefaults().AdmitMinHits; got != 0 {

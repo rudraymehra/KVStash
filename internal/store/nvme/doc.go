@@ -20,7 +20,7 @@
 //     only never-acked keys (must never EXISTS) and byte-identity of
 //     whatever EXISTS.
 //   - I/O goes through the IOBackend seam. The default is the measured
-//     pinned-thread pread/pwrite engine (the recorded A3 decision); an
+//     pinned-thread pread/pwrite engine (a recorded design decision); an
 //     io_uring backend remains pluggable behind the kvb_uring build tag
 //     (stub only — giouring is incompatible with Go 1.26 linkname rules).
 //   - darwin is a correctness backend only: F_NOCACHE is not O_DIRECT and

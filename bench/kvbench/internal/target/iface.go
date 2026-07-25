@@ -1,4 +1,4 @@
-// Package target abstracts the stores under test behind SPEC-4 §2.1's
+// Package target abstracts the stores under test behind the harness's
 // interface, so the sweep and the trace replayer drive kvblockd, Redis/
 // Valkey, and the NVMe-fs floor with the SAME op stream.
 package target
@@ -18,7 +18,7 @@ const (
 
 // Wrote reports whether a PUT status moved payload bytes (goodput counts
 // only genuine writes — an idempotent OK_EXISTS ack moved nothing, and
-// crediting it payload bytes was the ladder's confirmed PUT-inflation bug).
+// crediting it payload bytes was a confirmed PUT-inflation bug here).
 func (s Status) Wrote() bool { return s == OK }
 
 // Target is the store under test. dst buffers in BatchGet are caller-owned

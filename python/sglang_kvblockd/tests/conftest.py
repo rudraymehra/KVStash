@@ -1,5 +1,6 @@
 """Module fixture: build the real kvblockd daemon and run a DRAM-only
-instance the backend tests exchange live frames with (the W5 test pattern).
+instance the backend tests exchange live frames with (the same pattern as
+the LMCache connector suite).
 Skips cleanly when the Go toolchain is absent (wheel-only CI legs)."""
 
 from __future__ import annotations

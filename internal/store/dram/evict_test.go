@@ -234,7 +234,7 @@ func TestEvictorPutRetry(t *testing.T) {
 		}
 	}
 	// One more block: without the evictor this is ERR_QUOTA_BYTES (the
-	// Week-3 wall test); with it, reclamation makes room.
+	// hard-wall behavior); with it, reclamation makes room.
 	fresh := evKey(0xAA)
 	blob := bytes.Repeat([]byte{0xAA}, blk)
 	if st := s.Put(1, fresh, blob, xxh3.Hash(blob)); st != protocol.StatusOK {

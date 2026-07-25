@@ -1,7 +1,7 @@
 """The 32-byte metadata prefix that rides INSIDE each stored block so a
 GET can reconstruct the MemoryObj (LMCache carries memory_format + dtype +
 shape out of band; the opaque server won't). Layout keeps the block fully
-opaque to kvblockd (T3): the client-computed XXH3 covers prefix + tensor, the
+opaque to kvblockd: the client-computed XXH3 covers prefix + tensor, the
 server never parses either.
 
     <4s 4B 4I I I>  — exactly 32 bytes

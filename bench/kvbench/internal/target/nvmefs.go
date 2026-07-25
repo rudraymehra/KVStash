@@ -128,9 +128,9 @@ func (t *FS) Close() error { return nil }
 
 // each fans fn across the worker pool preserving index order in the
 // returned statuses; the first hard error wins. It ALWAYS waits for the
-// launched goroutines before returning (even on ctx cancel) — the ladder
-// caught a return-before-wg.Wait that let goroutines write out/errs after
-// the caller reclaimed the slices (a data race).
+// launched goroutines before returning (even on ctx cancel) — an earlier
+// version had a return-before-wg.Wait that let goroutines write out/errs
+// after the caller reclaimed the slices (a data race).
 func (t *FS) each(ctx context.Context, n int, fn func(i int) (Status, error)) ([]Status, error) {
 	out := make([]Status, n)
 	errs := make([]error, n)

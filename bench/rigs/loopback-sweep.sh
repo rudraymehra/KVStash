@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Local loopback sweep for xferspike — a developer-machine sanity check, NOT the
-# A1 gate (that is bench/rigs/aws-transport on the c6in pair).
+# Local loopback sweep for xferspike — a developer-machine sanity check, NOT
+# the transport gate (that is bench/rigs/aws-transport on the c6in pair).
 #
 # Raises the fd limit and spaces runs so rapid sequential loopback runs don't
-# exhaust ephemeral ports / pile up TIME_WAIT sockets (finding F-a1-2). Emits CSV.
+# exhaust ephemeral ports / pile up TIME_WAIT sockets (a failure mode hit and
+# recorded during the first loopback sessions). Emits CSV.
 #
 # Usage: bench/rigs/loopback-sweep.sh [duration] [port]
 set -euo pipefail

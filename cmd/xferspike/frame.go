@@ -39,13 +39,6 @@ func putHeader(buf []byte, h frameHeader) {
 	binary.LittleEndian.PutUint32(buf[12:16], h.length)
 }
 
-// encodeHeader allocates a fresh headerSize buffer and writes h into it.
-func encodeHeader(h frameHeader) []byte {
-	buf := make([]byte, headerSize)
-	putHeader(buf, h)
-	return buf
-}
-
 // decodeHeader parses a headerSize buffer, returning errBadMagic if the frame
 // does not begin with the expected magic value.
 func decodeHeader(buf []byte) (frameHeader, error) {

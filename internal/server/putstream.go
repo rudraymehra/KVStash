@@ -13,8 +13,8 @@ import (
 // Per-connection PUT_STREAM resource bounds. BEGIN reserves NOTHING (staging
 // grows lazily as CHUNKs arrive), and both the live-stream count and the total
 // staged bytes are capped — so a client cannot pin server memory with cheap
-// BEGIN-only frames (the amplification the review found: 4 KiB of BEGINs pinned
-// ~191 MiB). Excess is refused with ERR_BUSY (backpressure), not accepted.
+// BEGIN-only frames (a measured amplification: 4 KiB of BEGINs could otherwise
+// pin ~191 MiB). Excess is refused with ERR_BUSY (backpressure), not accepted.
 const (
 	maxLiveStreams   = 256
 	maxStagedPerConn = 256 << 20 // 256 MiB of in-flight PUT staging per connection
@@ -132,8 +132,8 @@ func (s *session) putBegin(c *transport.Conn, h protocol.Header, body []byte) {
 		// buf and digest are nil: both are allocated lazily on the FIRST
 		// non-empty CHUNK (see putChunk). Allocating at BEGIN would let a
 		// client pin a ~1.2 KiB Hasher (and, if we sized buf here, up to
-		// max_blob_len) per cheap BEGIN — the amplification DoS the review
-		// killed. A stream that never gets a real chunk owns nothing.
+		// max_blob_len) per cheap BEGIN — the amplification DoS the staging
+		// caps close. A stream that never gets a real chunk owns nothing.
 	}
 	s.respondStatus(c, h, protocol.StatusOK)
 }

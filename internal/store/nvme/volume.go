@@ -226,7 +226,7 @@ func (v *Volume) Read(loc Loc, ns uint32, key [32]byte, want uint64) (data []byt
 		return nil, nil, ReadBusy
 	}
 	// readStop unblocks a caller whose request was queued when shutdown
-	// drained the pool (the ladder's Read-vs-Close hang/panic trap). A
+	// drained the pool (the Read-vs-Close hang/panic trap). A
 	// worker that already picked the request up replies on done regardless
 	// (buffered — its send never blocks; a raced buf is impossible because
 	// queued requests own no buffer yet).
@@ -293,7 +293,7 @@ func (v *Volume) Close() error {
 // failQueuedAppends drains the append queue after the writer exited, firing
 // every abandoned request's callback with ok=false. Without this, the
 // demoter's arena reader-refs held across the queue would leak at shutdown
-// (the ladder's abandoned-OnWritten MED).
+// (the abandoned-OnWritten leak).
 func (v *Volume) failQueuedAppends() {
 	for {
 		select {
@@ -377,8 +377,8 @@ func (v *Volume) openActive() error {
 
 // TryRecoverWrites re-arms a write-dead volume once conditions may have
 // changed (reclaim freed space, transient FS error passed): if the volume
-// is read-only with NO active segment (a failed rotation — the ladder's
-// permanently-write-dead MED), it retries opening one. Called from the
+// is read-only with NO active segment (a failed rotation — otherwise a
+// permanently write-dead tier), it retries opening one. Called from the
 // tiered store's maintenance tick.
 func (v *Volume) TryRecoverWrites() {
 	if v.closed.Load() {

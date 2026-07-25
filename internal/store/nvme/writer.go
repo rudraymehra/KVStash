@@ -235,8 +235,8 @@ func (v *Volume) rotate() bool {
 // sealActive writes the footer (entry table + trailer), fdatasyncs, and
 // marks the segment immutable. Runs on the writer goroutine. A nil active
 // segment is a no-op — after a failed rotation the retry path must reach
-// openActive, not dead-loop on "nothing to seal" (the ladder's write-dead
-// MED).
+// openActive, not dead-loop on "nothing to seal" (a write-dead-tier bug,
+// since fixed).
 func (v *Volume) sealActive() error {
 	seg := v.activeSeg()
 	if seg == nil {
@@ -264,7 +264,7 @@ func (v *Volume) sealActive() error {
 // recovered tail prefix in place): entry-table chunk at dataEnd, trailer in
 // the file's final 4 KiB, one fdatasync. All device writes go through
 // explicitly page-aligned buffers — heap slices only HAPPEN to be aligned
-// under today's allocator (ladder finding).
+// under today's allocator, and O_DIRECT punishes the gamble.
 func writeSeal(f File, segBytes int64, segID, dataEnd uint32, entries []footerEntry) error {
 	table := encodeEntries(entries)
 	tr := trailer{

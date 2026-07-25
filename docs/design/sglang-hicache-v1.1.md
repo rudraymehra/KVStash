@@ -1,6 +1,6 @@
 # SGLang HiCache backend — verdict: DEFER (v1.1 revisit doc)
 
-**Date:** 2026-07-20 · **Decision rule:** week-12 Day-4 "SHIP or
+**Date:** 2026-07-20 · **Decision rule:** "SHIP or
 DEFER-with-blocker, no limbo" · **Branch taken:** DEFER.
 
 ## Verdict
@@ -8,18 +8,17 @@ DEFER-with-blocker, no limbo" · **Branch taken:** DEFER.
 `sglang-kvblockd` is **built and CPU-validated but not "supported"**: the
 package, keymap, CPU unit suite, and CI tripwire leg merge now (the gate
 requires them on BOTH branches); the PyPI publish and the
-`docs/INTEGRATIONS.md` section wait for a green GPU e2e (C-4 makes the
-publish unconditional on the SHIP branch only).
+`docs/INTEGRATIONS.md` section wait for a green GPU e2e (the
+publish happens on the SHIP branch only).
 
 ## The exact blocker
 
-**No GPU budget this sprint.** The SHIP gate is pre-registered as: e2e green
+**No GPU budget at verdict time.** The SHIP gate is pre-registered as: e2e green
 on a Linux x86 RTX 4090 box — token-identical multi-turn output vs a no-L3
-baseline, plus remote PUT-then-GET hits visible in kvblockd `/metrics`
-(week-12 DoD). No GPU session ran, so no validated x86 run exists; per
-week-12 risk #5 that reads as an honest DEFER, and per C-32 the SGLang spike
-is the week's *acceptable-DEFER* item (the revenue work is not). Not a
-technical failure: `bench/e2e/sglang/NOTES.md` contains zero failure lines
+baseline, plus remote PUT-then-GET hits visible in kvblockd `/metrics`.
+No GPU session ran, so no validated x86 run exists; that reads as an
+honest DEFER, not a technical failure:
+`bench/e2e/sglang/NOTES.md` contains zero failure lines
 because nothing was attempted on GPU.
 
 **Secondary (structural, pre-registered):** the HiCache **v2** controller
@@ -65,14 +64,14 @@ doesn't explode) but no v2 data path exists.
 
 ## Revisit trigger (whichever fires first)
 
-1. **GPU budget line reopens** (wk-13 buffer or a later sprint): get the
-   tree onto the pod first — the repo is PRIVATE, so a deploy-key/token
-   `git clone` or an rsync from the laptop; there are no fetchable release
-   artifacts. Then run the already-written rig —
+1. **GPU budget reopens:** get the tree onto the pod first — the repo is
+   public (`git clone https://github.com/rudraymehra/KVStash`), and release
+   artifacts are fetchable from that repo's releases page. Then run the
+   already-written rig —
    `bench/e2e/sglang/runpod_up.sh` (installs the pinned Go toolchain and
    builds the daemon from that tree) → `run_multiturn.sh` (baseline +
-   kvblockd) → `runpod_down.sh`; ~2 sessions × 5h × $0.69/hr ≈ $7. Green ⇒
-   execute the SHIP branch (tag v0.1.0, publish, INTEGRATIONS.md section,
+   kvblockd) → `runpod_down.sh`. Green ⇒
+   execute the SHIP branch (tag, publish, INTEGRATIONS.md section,
    CHANGELOG).
 2. **Upstream stabilizes v2:** #18239 resolved and `PoolTransfer` shipping
    unchanged in a tagged release for one minor cycle ⇒ re-pin, implement

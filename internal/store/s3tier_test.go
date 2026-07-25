@@ -173,9 +173,9 @@ func driveToS3Residency(t *testing.T, fx *s3Fixture) (key [32]byte, blob []byte)
 }
 
 // TestS3FlipStrandAbortsRetire is the deterministic white-box pin for the
-// strand-abort branch (the Fable-5 vetting review found it shipped with zero
-// executing coverage — only the probabilistic ack-vs-reclaim hunt touched it,
-// and that never fires on a quiet box). It drives a segment to
+// strand-abort branch (it originally shipped with zero executing coverage —
+// only the probabilistic ack-vs-reclaim hunt touched it, and that never
+// fires on a quiet box). It drives a segment to
 // sealed+spilled+LIVE (demote + spill, NO reclaim), soft-pins one of its
 // entries, then calls s3FlipRetired directly — sidestepping the advisory
 // pre-gate exactly as a lease/pin landing mid-retire would. The pinned entry

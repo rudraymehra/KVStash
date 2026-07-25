@@ -133,8 +133,8 @@ func TestGoldenVectors(t *testing.T) {
 
 // TestGoldenCRCsMatchSpec ASSERTS the values PROTOCOL.md §11–12 quote, so the
 // doc, the codec, and the committed vectors are pinned to each other. (An
-// earlier version only logged these — a calibration drill demonstrated that a
-// log-only "check" is exactly how a regenerated-around-a-bug golden slips by.)
+// earlier version only logged these — a log-only "check" is exactly how a
+// golden regenerated around a bug slips through unnoticed.)
 func TestGoldenCRCsMatchSpec(t *testing.T) {
 	frames := goldenFrames()
 	want := []struct {

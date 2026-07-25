@@ -1,8 +1,8 @@
 # kvblockd benchmark scoreboard
 
-Honest, reproducible loopback numbers for the Week-2 wire path. **Loopback is
+Honest, reproducible loopback numbers for the wire path. **Loopback is
 a developer sanity check, not the quotable figure** — the AWS 50 GbE pair is
-the real gate (per `docs/notes/a1-log.md`). Every number here is a *ratio
+the real gate (see the REAL-NIC section below). Every number here is a *ratio
 against a same-shape ceiling* where one exists; absolute GB/s on a laptop
 varies ±15% with thermal state.
 
@@ -23,7 +23,8 @@ Deterministic metrics (allocs, ns — thermal-stable) and throughput *ratios*
 Not improved, honestly: GET absolute GB/s (already at the kernel copy ceiling —
 needs the real NIC rig); codec ns (in-place-descriptor candidate measured
 *slower*, rejected). Also fixed this pass: 3 HIGH bugs (tombstone-Hasher memory
-DoS, lendBuf credit-window pin, client deadlocks), 1 CI flake, panel MED/LOW.
+DoS, lendBuf credit-window pin, client deadlocks), 1 CI flake, and assorted
+medium/low findings.
 
 ## How to reproduce
 
@@ -99,8 +100,9 @@ Loopback is a dev sanity check; this is the real one. iperf3 link ceiling
 integrity), NIC-bound not code-bound. Throughput RISES with streams (8→64:
 4.70→6.37) — the parallel-streams thesis, opposite to loopback. **xxh3 verify
 is FREE on a real network** (ON == OFF) — it overlaps network latency; the ~12%
-loopback verify cost was a loopback-only artifact. A1 gate PASS (≥12 GB/s
-loopback [14.1] AND ≥85% of ceiling [~100%]). Run cost ~$2, $0 residue.
+loopback verify cost was a loopback-only artifact. Transport gate PASS — the
+pre-registered rule was ≥12 GB/s loopback [14.1] AND ≥85% of the link ceiling
+[~100%]. Run cost ~$2, $0 residue.
 
 ## GET (read path) — the headline (loopback)
 
@@ -120,7 +122,7 @@ Reading: the protocol stack (framing, auth, credit, descriptors, dispatch)
 runs at **~parity with a plain raw socket** doing the same work — the ratio is
 robust even though absolutes drift with thermal state. The verify-on default
 pays for xxh3 integrity (dialable via `SkipVerify`). The ceiling is the kernel
-loopback copy path; even raw sockets can't beat it. Started the week at
+loopback copy path; even raw sockets can't beat it. This path started at
 ~7.4 GB/s median; the tuning passes moved the *ratio* to parity (was ~0.7
 of the same-shape ceiling before). **Quote the ratio + the bare-metal Linux
 rig, never a laptop absolute.**
@@ -176,8 +178,9 @@ All zero-alloc: MarshalHeader 7.8 ns · ParseHeader 13.9 ns · DecodeKeyList(32)
 ## Two-kernel confirmation
 
 Linux 6.10 (Docker VM, carries virtualization overhead — shape only):
-codecs zero-alloc; GET peaks at 4 streams and declines at 16 (the a1-log
-inverted-stream curve, independent of macOS); ~2× PUT/GET ratio holds.
+codecs zero-alloc; GET peaks at 4 streams and declines at 16 (the same
+inverted loopback stream curve macOS shows, confirmed on a second kernel);
+~2× PUT/GET ratio holds.
 
 ## Honesty notes (things caught and NOT reported as real)
 
@@ -187,7 +190,7 @@ inverted-stream curve, independent of macOS); ~2× PUT/GET ratio holds.
 - An "unexpected EOF" at 2.5 MB was a `pkill`→rebind race in the harness, not a
   block-path bug (5 clean consecutive runs, empty server log).
 - Inline hashing (vs the sidecar) measured *slower* (6.9 vs 9.75) — rejected.
-- The 14.1 GB/s Week-1 xferspike figure is a one-way single-buffer blast, a
+- The earlier 14.1 GB/s xferspike figure is a one-way single-buffer blast, a
   different workload shape; not comparable to the GET round trip.
 
 ## Verification levers deferred to the real-NIC rigs (evidence-backed)

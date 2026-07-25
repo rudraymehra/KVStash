@@ -468,7 +468,7 @@ func BenchmarkAlloc(b *testing.B) {
 	b.Run("2.5MB", func(b *testing.B) { benchAllocFree(b, 2560<<10) })
 }
 
-// BenchmarkAllocParallel models the Day-5 tier: the allocator behind a mutex,
+// BenchmarkAllocParallel models the DRAM tier: the allocator behind a mutex,
 // contended from all procs (run with -cpu=1,16).
 func BenchmarkAllocParallel(b *testing.B) {
 	mu := make(chan struct{}, 1)
@@ -489,7 +489,7 @@ func BenchmarkAllocParallel(b *testing.B) {
 }
 
 // ---------------------------------------------------------------------------
-// Ladder findings — regression pins.
+// Regression pins for confirmed allocator bugs.
 
 // TestStaleFreeRejected / TestFailedAllocSentinel live in tagged siblings:
 // release asserts the silent no-op, kvbdebug asserts the loud panic
@@ -540,8 +540,8 @@ func TestAllocatorNonBinExactCapacity(t *testing.T) {
 
 // BenchmarkAllocChurn measures the realistic fragmented steady state the
 // Alloc+Free pair benchmark cannot: prefill to ~70%, then free-one-random /
-// alloc-one forever (a ladder finding: the pair benchmark only ever touches
-// the pristine single-free-node fast path).
+// alloc-one forever (the pair benchmark only ever touches
+// the pristine single-free-node fast path, so it measures nothing real).
 func BenchmarkAllocChurn(b *testing.B) {
 	a := NewAllocator(binExactCapacity(1 << 30))
 	sizes := []uint32{400 << 10, 1 << 20, 2560 << 10}

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""A7 economics model: does loading KV cache beat recomputing it, and does the
+"""Economics model: does loading KV cache beat recomputing it, and does the
 cost pencil out?  Pure stdlib, every formula printed — no hidden math.
 
-Decides kill-gate A7: same-AZ KV fetch cost < recompute cost at >=40% hit rate.
+Pre-registered decision rule: same-AZ KV fetch cost < recompute cost at
+>=40% hit rate, AND deliverable bandwidth > every honest model's break-even.
 
 Sources (verified 2026-07):
   KV formula & MLA:  arxiv.org/html/2505.09343v2 (DeepSeek-V3)
@@ -60,10 +61,12 @@ GPU_USD_PER_HR = 1.39          # RunPod A100 80GB PCIe
 GPU_USD_PER_SEC = GPU_USD_PER_HR / 3600
 XFER_SAME_AZ = 0.0             # $/GB, private IP in-VPC
 XFER_CROSS_AZ = 0.01           # $/GB each direction
-# Deliverable bandwidth used for the A7 bandwidth check. This is the target /
-# loopback figure (loopback already hit ~14); REPLACE with the measured cloud
-# GB/s after the transport rig runs. The verdict genuinely depends on it.
-DELIVERABLE_GBPS = 10.0
+# Deliverable bandwidth used for the bandwidth check: the MEASURED cloud
+# figure, conservatively the 50 GbE pair (kvblockd GET, verify on, NIC-bound
+# at ~102% of the iperf3 ceiling — bench/BENCHMARKS.md). The 100 GbE pair
+# measured 12.67 GB/s; the verdict clears with either. The verdict genuinely
+# depends on this number — re-measure before re-quoting.
+DELIVERABLE_GBPS = 6.37
 HIT_RATES = [0.40, 0.54, 0.62, 0.90]  # 54-62 = Alibaba Bailian band; 90 = marketing (labeled)
 REUSED_TOKENS = 80_000         # a long agentic prefix (the workload we target)
 
@@ -122,7 +125,7 @@ def main():
         verdict = "cross-AZ still cheaper than recompute" if cross_az < recompute else "cross-AZ COSTS MORE than recompute"
         print(f"  {m.name:32s} recompute ${recompute:.5f} vs cross-AZ ${cross_az:.5f}  -> {verdict}")
 
-    hr("A7 VERDICT")
+    hr("VERDICT")
     # Real two-part gate (no longer a foregone conclusion): the deliverable
     # bandwidth must exceed EVERY honest (GQA/MLA) model's break-even, AND the
     # same-AZ fetch must be cheaper than recompute. Flip DELIVERABLE_GBPS below
@@ -141,10 +144,11 @@ def main():
     ok = bw_ok and cost_ok
     print(f"  bandwidth check (live gate): deliverable {DELIVERABLE_GBPS:.1f} GB/s > max break-even {max_breakeven:.2f} GB/s -> {bw_ok}")
     print(f"  cost check (guard):          same-AZ fetch ${same_az_fetch:.5f} (=$0 by construction) < recompute ${recompute:.5f} -> {cost_ok}")
-    print(f"  A7 {'PASS' if ok else 'FAIL'}")
+    print(f"  VERDICT: {'PASS' if ok else 'FAIL'}")
     print("  Caveats: (1) same-AZ private IP only; (2) GQA/MLA byte counts, never the MHA 2.5MB;")
     print("           (3) <40% hit rate may not clear amortized infra cost;")
-    print("           (4) DELIVERABLE_GBPS is the target/loopback figure — replace with measured cloud GB/s.")
+    print("           (4) DELIVERABLE_GBPS is the measured 50 GbE cloud figure (bench/BENCHMARKS.md);")
+    print("               it is link-bound, so re-measure on your link before quoting.")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@
 # over stdin into a 0600 env file removed in the same session — never on a
 # command line (ps-visible) and never in this repo.
 #
-# Usage: BOX_IP=<public-ip> CREDS_JSON=/tmp/kvb-e2e-creds.json bash run.sh
+# Usage: BUCKET=<your-bucket> BOX_IP=<public-ip> CREDS_JSON=/tmp/kvb-e2e-creds.json bash run.sh
 #
 # Teardown (same session, verify $0):
 #   aws s3 rm s3://$BUCKET --recursive && aws s3api delete-bucket --bucket $BUCKET
@@ -15,7 +15,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-BUCKET="${BUCKET:-kvb-week9-e2e-057996826223}"
+# No default: bucket names are account-specific (a globally-unique name you
+# created with the 1-day lifecycle rule). Suggested shape: kvb-e2e-<suffix>.
+BUCKET="${BUCKET:?set BUCKET to your e2e bucket (create it with a 1-day lifecycle rule first)}"
 BOX_IP="${BOX_IP:?set BOX_IP to the in-region box public IP}"
 CREDS_JSON="${CREDS_JSON:-/tmp/kvb-e2e-creds.json}"
 SSHOPTS=(-i "$HOME/.ssh/kvbench.pem" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)

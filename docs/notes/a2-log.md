@@ -29,7 +29,7 @@ gc_pause_p999_ms         5.24288   → tail outlier at the 5 ms line; note hones
 ## Next
 - Next: launch the 24 h soak on a standing Linux box (Hetzner/c7g) with `vm.nr_hugepages` set (expect `hugepages:true`), larger arena, GOGC/GOMEMLIMIT sweep → the A2 verdict of record in `docs/DESIGN.md`.
 
-## Review-ladder outcome (2026-07-15, 7-agent full ladder + CTO gate)
+## Review outcome (2026-07-15)
 
 Verdict: FIX-FIRST → all applied. **Core A2 mechanism verified HONEST** by the gate: off-heap is genuine (5× runs: heap ~60–110 MB while RSS tracks the arena), and the GC-pause math (correct `/sched/pauses/total/gc:seconds` metric, deep-copied counts, conservative upper-bucket-bound) can only false-FAIL, never false-PASS. The lies lived on the *reporting* side — now fixed:
 

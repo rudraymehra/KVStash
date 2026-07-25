@@ -151,9 +151,9 @@ func (s *Store) evictOnce(cfg EvictorConfig) int64 {
 	}
 
 	// Pass 2 — the policy pass, split across tenants proportionally to
-	// their resident bytes (strict pressure isolation arrives with the
-	// Week-6 per-namespace quotas; proportionality bounds each tenant's
-	// loss to its own footprint share until then).
+	// their resident bytes: proportionality bounds each tenant's loss to
+	// its own footprint share (the per-namespace byte quotas bound the
+	// footprint itself).
 	if freed < needBytes {
 		freed += s.policyPass(now, needBytes-freed)
 	}

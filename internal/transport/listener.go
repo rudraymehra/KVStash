@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -41,7 +42,7 @@ type Config struct {
 	// WriteChunkBytes caps how many payload bytes a single writev SYSCALL
 	// covers within a flush (0 = unchunked). Coalescing still batches frames
 	// per flush; this only slices the flush's iovec vector into ≥1 MiB-class
-	// syscall windows. Rationale: the A1 loopback sweep measured 14.1 GB/s at
+	// syscall windows. Rationale: the loopback transfer sweep measured 14.1 GB/s at
 	// 1 MiB-per-writev vs 6.9 GB/s at 16 MiB-per-writev on the same stream —
 	// giant single copies stall the kernel pipe; ~1 MiB windows keep the
 	// producer/consumer copy pipeline overlapped, and are still far past the
@@ -67,6 +68,12 @@ type Config struct {
 	// GrantTick is how often an otherwise-idle writer ships pending credit
 	// grants in an unsolicited NOP/CREDIT frame (§8 rule 4). Zero → 100 ms.
 	GrantTick time.Duration
+
+	// MaxConns caps concurrently live accepted connections (0 = unlimited) —
+	// the cheap DoS floor config's max_conns documents. A connection beyond
+	// the cap is closed at accept, before any of its loops start; the slot
+	// frees when a live connection fully finishes (Done).
+	MaxConns int
 }
 
 // minStallTimeout floors WriteStallTimeout so a misassembled Config can never
@@ -104,9 +111,12 @@ func (cfg Config) grantTickInterval() time.Duration {
 
 // Listener accepts kvblockd connections.
 type Listener struct {
-	ln     net.Listener
-	cfg    Config
-	logged atomic.Bool // guards the one-shot effective-buffer log across concurrent Accept
+	ln      net.Listener
+	cfg     Config
+	logged  atomic.Bool  // guards the one-shot effective-buffer log across concurrent Accept
+	capLog  atomic.Bool  // guards the one-shot at-capacity warning
+	live    atomic.Int64 // connections accepted and not yet Done (MaxConns accounting)
+	refused atomic.Uint64
 }
 
 // Listen opens the data-plane listener. The only listening-socket option is
@@ -144,13 +154,70 @@ func (l *Listener) Addr() net.Addr { return l.ln.Addr() }
 
 // Accept blocks for the next connection, tunes it, and starts its loops with
 // the given buffer source and handler. Safe to call from multiple goroutines.
+//
+// Transient accept failures — fd-table exhaustion (EMFILE/ENFILE), kernel
+// buffer/memory pressure (ENOBUFS/ENOMEM), a peer aborting between SYN and
+// accept (ECONNABORTED/ECONNRESET) — are retried here with a capped backoff,
+// so a returned error is TERMINAL (the listener is closed): callers may stop
+// their accept loop on any error without permanently killing the data plane
+// over a passing fd spike. Connections beyond MaxConns are refused (closed
+// immediately, never returned).
 func (l *Listener) Accept(bs BufferSource, h FrameHandler) (*Conn, error) {
-	nc, err := l.ln.Accept()
-	if err != nil {
-		return nil, err
+	backoff := 5 * time.Millisecond
+	for {
+		nc, err := l.ln.Accept()
+		if err != nil {
+			if !isTransientAcceptError(err) {
+				return nil, err
+			}
+			slog.Warn("transport: transient accept error — retrying", "err", err, "backoff", backoff)
+			time.Sleep(backoff)
+			if backoff *= 2; backoff > time.Second {
+				backoff = time.Second
+			}
+			continue
+		}
+		backoff = 5 * time.Millisecond
+		if limit := l.cfg.MaxConns; limit > 0 && l.live.Add(1) > int64(limit) {
+			l.live.Add(-1)
+			_ = nc.Close()
+			l.refused.Add(1)
+			if l.capLog.CompareAndSwap(false, true) {
+				slog.Warn("transport: max_conns reached — refusing connections (logged once; see Refused())",
+					"max_conns", limit, "remote", nc.RemoteAddr())
+			}
+			continue
+		}
+		l.tune(nc)
+		c := startConn(nc, bs, h, l.cfg)
+		if l.cfg.MaxConns > 0 {
+			go func() { <-c.Done(); l.live.Add(-1) }() // free the slot when fully done
+		}
+		return c, nil
 	}
-	l.tune(nc)
-	return startConn(nc, bs, h, l.cfg), nil
+}
+
+// Refused reports how many connections the MaxConns cap has closed at accept.
+func (l *Listener) Refused() uint64 { return l.refused.Load() }
+
+// isTransientAcceptError reports whether an accept failure is worth staying
+// alive for: fd exhaustion, kernel memory pressure, an aborted handshake, or
+// an interrupted syscall. A closed listener (net.ErrClosed) — or anything
+// unrecognized — is terminal.
+func isTransientAcceptError(err error) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	for _, e := range []error{
+		syscall.ECONNABORTED, syscall.ECONNRESET, syscall.EMFILE,
+		syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM, syscall.EINTR,
+	} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // Close stops accepting. Existing connections are unaffected.

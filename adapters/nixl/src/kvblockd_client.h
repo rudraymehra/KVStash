@@ -1,6 +1,6 @@
 // kvblockd_client.h — C++ wire client for the kvblockd KVB1 protocol.
 //
-// This is the shared native client core (SPEC 5 cross-adapter note #1): a
+// This is the shared native client core: a
 // blocking-socket implementation of docs/PROTOCOL.md v1, byte-identical to
 // internal/protocol (Go) and python/kvblockd (Python). The golden hex vectors
 // in internal/protocol/testdata/frames are the shared oracle; test_protocol.cpp

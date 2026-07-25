@@ -6,9 +6,9 @@ Metrics / healthz:  {{ include "kvblockd.fullname" . }}.{{ .Release.Namespace }}
 S3-compat (obj):    {{ include "kvblockd.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.s3compat.port }}
 {{- end }}
 
-{{- if eq .Values.image.repository "ghcr.io/kvstash/kvblockd" }}
+{{- if eq .Values.image.repository "ghcr.io/rudraymehra/kvblockd" }}
 
-NOTE: no public image is published at ghcr.io/kvstash/kvblockd yet (latest
+NOTE: no public image is published at ghcr.io/rudraymehra/kvblockd yet (latest
 published source release: v0.2.0) — set image.repository/image.tag to a
 registry you pushed to, or the pods (and the smoke test below) cannot pull.
 {{- end }}

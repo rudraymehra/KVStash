@@ -1,11 +1,12 @@
-// Command xferspike is the A1 transport measurement rig. It blasts
+// Command xferspike is the transport measurement rig. It blasts
 // fixed-size frames over N parallel TCP connections and reports aggregate
 // throughput (GB/s), frame rate, and CPU cores consumed as one JSON line — the
-// evidence behind the A1 kill-gate (>=12 GB/s loopback, >=85% of the iperf3
-// ceiling on the cloud pair). The --mode=soak variant additionally backs the A2
-// kill-gate: it serves blobs from an off-heap mmap arena and reports GC-pause
-// percentiles, proving a large cache doesn't cause GC stalls. It is a throwaway
-// rig kept forever for reproducibility; it is NOT the product.
+// evidence behind the transport targets (>=12 GB/s loopback, >=85% of the
+// iperf3 ceiling on the cloud pair; docs/notes/a1-log.md). The --mode=soak
+// variant backs the GC-pause claim (docs/notes/a2-log.md): it serves blobs
+// from an off-heap mmap arena and reports GC-pause percentiles, proving a
+// large cache doesn't cause GC stalls. It is a throwaway rig kept forever for
+// reproducibility; it is NOT the product.
 package main
 
 import (

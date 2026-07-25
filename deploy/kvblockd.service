@@ -20,7 +20,7 @@
 
 [Unit]
 Description=kvblockd — KV-cache block store daemon
-Documentation=https://github.com/kvstash/kvblockd
+Documentation=https://github.com/rudraymehra/KVStash
 After=network-online.target
 Wants=network-online.target
 

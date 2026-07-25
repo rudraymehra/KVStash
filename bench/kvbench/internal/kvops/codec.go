@@ -69,7 +69,7 @@ func NewWriter(w io.Writer, blobBytes uint32, meta Meta) (*Writer, error) {
 	}
 	if len(mb) > maxMetaLen {
 		// The reader enforces this cap; refuse to WRITE a file no reader
-		// will accept (the ladder's asymmetry L4).
+		// will accept (a writer/reader asymmetry caught in review).
 		return nil, fmt.Errorf("kvops: meta %d bytes exceeds the %d cap", len(mb), maxMetaLen)
 	}
 	bw := bufio.NewWriterSize(w, 1<<20)

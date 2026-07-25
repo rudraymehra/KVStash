@@ -70,7 +70,7 @@ func candidateSizeRange(anyOf []histRec) (lo, hi int64) {
 
 // model is the reference: plain maps, no tiers, no eviction of its own.
 //
-// Resurrection (the tiered machine's crash semantics, a ladder finding):
+// Resurrection (the tiered machine's crash semantics):
 // an NVMe DELETE is not crash-durable — recovery replays footers and
 // checkpoints, so a deleted key whose bytes ever reached a segment may
 // come BACK after a crash, carrying any content that was ever legitimately

@@ -144,7 +144,7 @@ func RunOpen(ctx context.Context, clk Clock, cfg OpenConfig, issue Issuer, recs 
 				sched := ts[i]
 				clk.SleepUntil(sched)
 				now := clk.Now()
-				// HARD wall-clock cutoff (the ladder's confirmed throughput-
+				// HARD wall-clock cutoff (a confirmed throughput-
 				// inflation fix): a run must NOT drain its whole backlog past
 				// the measurement window and then divide by the nominal
 				// duration — that reports achieved throughput ABOVE the

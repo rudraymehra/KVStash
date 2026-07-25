@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// The sweep grid (SPEC-4 §2.2). Blob sizes are EXACT byte counts, 4 KiB
+// The sweep grid. Blob sizes are EXACT byte counts, 4 KiB
 // multiples, printed everywhere — "0.44 MiB" is a band label, 462848 is
 // the number (the 16-token vLLM block for an 8B-class model; 2.5 MiB for
 // 70B-class). Sizes are fixed per run, never mixed (the fixed-size-chunk

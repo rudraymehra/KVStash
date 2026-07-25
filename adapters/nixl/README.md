@@ -85,7 +85,7 @@ Descriptor convention (obj-plugin style): local side `DRAM_SEG`
 (addr/len of registered host memory); remote side `OBJ_SEG` with
 `metaInfo` = the 32-byte kvblockd block key, either 32 raw bytes or 64 hex
 chars (the s3compat object-key convention), `addr` (offset) = 0. Keys are
-opaque to the server (T3) and owned by the caller's key schema — the plugin
+opaque to the server and owned by the caller's key schema — the plugin
 never derives them.
 
 ### Tuned defaults (`get_backend_options`)

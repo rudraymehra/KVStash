@@ -1,5 +1,5 @@
 """Key derivation: LMCache CacheEngineKey → the 32-byte opaque wire key the
-server stores blind (T3). The canonical serialization is length-prefixed (not
+server stores blind. The canonical serialization is length-prefixed (not
 separator-joined) because model names legally contain '/' and '@'; BLAKE3-256
 over a domain-separated blob gives the wire key. pkg/client.WireKey (Go) uses
 the identical encoding — hash_chain.json is the shared oracle.

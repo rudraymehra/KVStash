@@ -24,7 +24,7 @@ xxhash_inc = include_directories('third_party/xxhash') # vendored v0.8.3, BSD-2-
 
 repo_root = meson.project_source_root() / '..' / '..'
 
-# --- the shared native client core (SPEC 5: SGLang reuses this in Week 12) ---
+# --- the shared native client core — no NIXL dependency ---
 kvb_core = static_library('kvb_core',
   ['src/kvblockd_client.cpp', 'src/executor.cpp'],
   include_directories: [src_inc, xxhash_inc],

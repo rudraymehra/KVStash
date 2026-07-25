@@ -12,17 +12,18 @@ import (
 
 // Arena is a GC-invisible anonymous mmap region: blob bytes obtained straight
 // from the kernel, bypassing the Go allocator, so they never appear in
-// HeapAlloc and the GC never scans them (the A2-verified mechanism).
+// HeapAlloc and the GC never scans them (the mechanism the GC-pause soak
+// verifies: docs/notes/a2-log.md).
 //
 // LOAD-BEARING CONTRACT:
 //
 //   - Arena bytes cross API boundaries ONLY as (offset, len) + refcount.
 //     Views are materialized on demand by Bytes and must never be stored in
-//     heap structures or round-tripped through uintptr (go-learning-track
-//     gotcha #8: uintptr conversions are only legal within one expression).
+//     heap structures or round-tripped through uintptr (uintptr conversions
+//     are only legal within a single expression).
 //   - The caller must drain all outstanding Bytes views (tier refcount == 0)
-//     BEFORE Close; Close does not wait. The tier's refcount gate (Day 5)
-//     makes munmap-under-reader structurally impossible — until then the
+//     BEFORE Close; Close does not wait. The tier's refcount gate
+//     makes munmap-under-reader structurally impossible — beyond that the
 //     atomically-niled base turns a post-Close stale use into a loud panic
 //     (a use RACING Close is excluded only by the drain contract itself).
 type Arena struct {
@@ -96,7 +97,7 @@ func NewArena(bytes int64, huge bool) (*Arena, error) {
 // Close has swapped it to nil, a contract-violating stale call panics loudly
 // instead of fabricating a wild slice. (A call racing Close may still observe
 // the pre-swap pointer; the drain-before-Close contract is what excludes that
-// window, and the Day-5 tier refcount gate enforces it mechanically.)
+// window, and the tier's refcount gate enforces it mechanically.)
 // Panics on out-of-range views or a closed arena: both are tier bugs, and a
 // loud panic beats a silent wild pointer.
 func (a *Arena) Bytes(off uint64, n uint32) []byte {

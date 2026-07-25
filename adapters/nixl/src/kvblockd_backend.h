@@ -13,7 +13,7 @@
 //   local  side: DRAM_SEG descs — addr/len of registered host memory.
 //   remote side: OBJ_SEG descs — metaInfo carries the 32-byte kvblockd block
 //     key, either as 32 raw bytes or as 64 hex characters. The key is opaque
-//     to the server (T3) and computed by whoever owns the key schema (KVBM /
+//     to the server and computed by whoever owns the key schema (KVBM /
 //     the caller); this backend never derives keys. addr MUST be 0: kvblockd
 //     blocks are write-once whole objects, there are no ranged writes, and v1
 //     of this backend does not implement ranged reads.

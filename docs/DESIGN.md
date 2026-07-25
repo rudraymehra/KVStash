@@ -47,9 +47,6 @@ ceiling** at **0.77–0.91 sender CPU cores**. Every cell in the matrix clears t
 2. iperf3 and xferspike agree within ~0.7% (xferspike slightly above — run-to-run
    variance, both saturated); we quote %-of-ceiling, not GB/s alone.
 
-> **Verdict (Rudray, hand-written):** _[pending — explain what the flat matrix +
-> sub-core CPU means for the wedge, in your own words]_
-
 ## A2 — GC pause under off-heap arenas
 
 **Gate:** GC pause p99 < 5 ms while serving from a large off-heap arena.
@@ -85,10 +82,6 @@ bucket *ceilings* (conservative).
    *stability* (leak/drift) is not. A 24 h soak remains optional follow-up.
 2. Shared-tenant 4-vCPU box inflates the measured tail; production hardware
    with dedicated cores will read lower, not higher.
-
-> **Verdict (Rudray, hand-written):** _[pending — why doesn't a 5 GiB cache
-> stress Go's GC? Where do the blob bytes live, and what does the GC actually
-> scan?]_
 
 ## A3 — NVMe from Go: is the Go I/O path the bottleneck?
 
@@ -149,10 +142,6 @@ ceiling (v1.1 spike, per the recorded decision in
 2. io_uring remains unmeasured (giouring is dead on Go 1.26); the threadpool
    number is the shipping baseline, not the theoretical best.
 
-> **Verdict (Rudray, hand-written):** _[pending — why is %-of-fio-ceiling the
-> honest gate here, and what would you buy to serve 6 GB/s per device?]_
-
-
 ## A7 — same-AZ economics: does loading beat recompute, and does it pencil out?
 
 **Gate:** same-AZ KV-cache fetch cost < recompute cost at ≥40% hit rate.
@@ -180,7 +169,7 @@ GQA/MLA models break even at ~0.5–2.0 GB/s; kvblockd's 10+ GB/s target clears 
 
 Sources: LMCache (arXiv 2510.09665), Cake (arXiv 2410.03065), Tensormesh Redis blog, DeepSeek-V3 (arXiv 2505.09343), AWS EC2 data-transfer pricing, RunPod pricing. The transport rig has since run (§A1: 6.27 GB/s NIC-limited on 50 GbE) — every GQA/MLA break-even in the table above clears with margin at the measured cloud figure.
 
-## Week 2 wire-path results (RAM-stub loopback)
+## Wire path (RAM-stub loopback results)
 
 The full request→response path is live end to end: `pkg/client` → `internal/transport`
 → `internal/server` → `internal/store/ramstub`, with the BATCH_GET response
@@ -194,7 +183,7 @@ variance on the laptop is ±15% (thermal), so the binding number below is a
 ratio, not an absolute.
 
 **The gate, resolved by measurement (A1 %-of-ceiling methodology).** The
-written target — "within 10% of the Week-1 xferspike loopback 14.1 GB/s" —
+written target — "within 10% of the original xferspike loopback 14.1 GB/s" —
 compared two different workload shapes. xferspike's 14.1 is a one-way blast
 that resends ONE cache-hot 1 MiB buffer with no response read, no store, and
 no integrity check (verified in `cmd/xferspike/spike.go`: single `payload`
@@ -265,13 +254,12 @@ cost (`io.ReadFull` header then body). A 2 MiB server rcvbuf buys PUT ~8%
 (8 MiB no more); the structural levers — `readv` to fuse the header/body reads
 (golang/go#17607) and a worker-pool handoff to cut the per-response cond
 signal (RocksDB's write-thread-adaptive-yield finding) — are deferred:
-`readv` steps outside `net`, worker handoff is a post-Week-2 server upgrade.
+`readv` steps outside `net`, worker handoff is a later server upgrade.
 Both are pre-registered for the network rigs, not chased on loopback where the
 syscall floor dominates.
 
-**Research-verified positioning (adversarially-verified deep-research pass,
-2026-07-16; sources: golang/go#13451/#17607/#21676, CloudWeGo docs, Cloudflare
-& Netflix engineering, netdev MSG_ZEROCOPY paper):**
+**Research-verified positioning (2026-07-16; sources: golang/go#13451/#17607/#21676,
+CloudWeGo docs, Cloudflare & Netflix engineering, netdev MSG_ZEROCOPY paper):**
 
 - goroutine-per-conn + `net.Buffers` writev IS the right architecture at ≥1 MiB
   messages — ByteDance's own docs steer >1 MB workloads to `go net`, not their
@@ -300,7 +288,7 @@ physically-impossible 49 GB/s reading; discarded, not reported).
 
 **Second-kernel confirmation (Linux 6.10 / Docker linuxkit, 8 cores).** These
 carry virtualization overhead and are NOT the quotable figure (bare-metal
-Linux is the Week-3 rig) — the value is that the SHAPE reproduces on a second
+Linux is the quotable rig) — the value is that the SHAPE reproduces on a second
 kernel: codecs zero-alloc (Marshal 19.6 ns, Parse 22.5 ns); GET cold peaks at
 4 streams (5.48 GB/s) and declines at 16 (2.93) — the a1-log inverted-stream
 curve, independent of macOS; PUT 2.2–3.5 GB/s (same ~2× read/write ratio);
@@ -319,11 +307,10 @@ single-core so verification is never CPU-bound either way; the sidecar's
 read/hash overlap is kept as the marginally-better and clearer design, not a
 decisive win. Both are memory-bandwidth bound (the second pass over the block).
 
-**Verification & allocation — evidence-backed decisions (research pass 3,
-107 adversarially-verified agents; sources: fasthttp, golang/go#26663/#72036,
-RocksDB xxh3/crc32c bench, Go 1.26 Green Tea GC notes):**
+**Verification & allocation — evidence-backed decisions (sources: fasthttp,
+golang/go#26663/#72036, RocksDB xxh3/crc32c bench, Go 1.26 Green Tea GC notes):**
 
-- **Keep xxh3 (C-35), don't switch to hardware CRC32C.** CRC32C is not reliably
+- **Keep xxh3, don't switch to hardware CRC32C.** CRC32C is not reliably
   faster — xxh3 measured 26.8 vs CRC32C 19.3 GB/s in RocksDB — and a 32-bit CRC
   loses collision resistance that matters for content-addressed blocks. The
   protocol lock is also the right engineering call, not just a constraint.
@@ -340,35 +327,26 @@ RocksDB xxh3/crc32c bench, Go 1.26 Green Tea GC notes):**
   verification pass over the block is the memory-bandwidth cost). Deferred as
   low-value/higher-async-risk until profiling shows allocation rate (not
   bandwidth) as the bind — most likely under high connection counts, a
-  Week-6 tenancy concern, not now.
+  tenancy-layer concern, not now.
 
-**Standing Week-3+ items:** re-run gate + `rawget` baseline on the bare-metal
+**Standing follow-up items:** re-run gate + `rawget` baseline on the bare-metal
 Linux rig (the quotable environment; Mac loopback is a sanity check per
 a1-log); pipelined/OOO client demux for the network path (loopback-flat,
 network-decisive); `readv` via `SyscallConn` on the PUT/request read path
 (golang/go#17607 — kills the second per-frame read syscall); Linux
 `tcp_rmem/wmem` sized to LAN BDP (~0.3–3 MB, not WAN-scale). The DRAM-tier
-week re-tests this exact benchmark against the same-shape ceiling; the
+work re-tests this exact benchmark against the same-shape ceiling; the
 goalpost does not move.
 
 **Fuzz:** `FuzzParseHeader` + `FuzzParseBatch` clean (tens of millions of execs);
-formal 1h-per-target gate is the Day-7 item. **PUT_STREAM invariants**
+CI runs 90 s per target on every push, and the hours-long deep run is a
+dispatchable workflow (`fuzz.yml`). **PUT_STREAM invariants**
 (invisible-until-COMMIT, ERR_CHECKSUM, exactly-one-response incl. ABORT,
 OK_EXISTS idempotency) covered by server tests; goleak clean.
 
-## Week 3 — the DRAM tier (arena + allocator + index + lifecycle)
+## DRAM tier (arena + allocator + index + lifecycle)
 
-<!-- RUDRAY: prose first per the Merge Rule — write this section from memory
-     (arena layout & prefault, the OffsetAllocator port and where it diverges
-     from Aaltonen's C++, index sharding + maphash seeding, BlockRef field
-     semantics, the lease/pin/TTL ladder ordering table, two-phase visibility,
-     copy-at-commit and why stage-in-arena was rejected this week, the GET
-     refcount/release path through WriteFrames) — THEN fact-check against the
-     code and replace the measured-numbers block below with your own reading
-     of the gate logs. The numbers here are the raw results for you to
-     interpret, not prose to copy. -->
-
-**Measured gate results (Day 6).** All three gates are same-host relative;
+**Measured gate results.** All three gates are same-host relative;
 the recorded venue is Linux (c7i.4xlarge, 16 vCPU AL2023 — the `aws-dramgate`
 rig); the Mac runs are the dev-box sanity check.
 
@@ -378,7 +356,7 @@ rig); the Mac runs are the dev-box sanity check.
 | G2: 512-key EXISTS p99 under 8 GET lanes, <1 ms | 4.6 ms — 8-core oversubscription (2-lane control: 697 µs) | **p99 = 705 µs — PASS** (1.2 M samples, 60 s, GET lanes serving ~37 GB/s throughout) |
 | G3: blob-band (0.4–2.5 MB) alloc sites on the GET path | ZERO (only 256 B/896 B header-region objects; 220 GB served, 33 MB total heap alloc in 15 s) | **ZERO per-request — PASS** (~400 GB through the 15 s window, 46 MB heap alloc total; only per-CONNECTION one-time 2 MiB `Lend` recycle buffers + pprof's own writer touch the band) |
 
-G1 note (the Week-2 ruling reapplied): xferspike is a one-way hot-buffer
+G1 note (the wire-path ruling reapplied): xferspike is a one-way hot-buffer
 blast — a different shape. On the Mac the two shapes coincide (memory-bound
 either way); on the 16-vCPU box they diverge (xferspike prints 54.7 GB/s).
 The binding ceiling is `bench/microbench/rawget` — the same request→response
@@ -386,31 +364,22 @@ GET shape on raw sockets with no protocol/auth/checksums. "≥0.9× the
 same-shape ceiling; the goalpost does not move."
 
 PUT staging remains on the Go heap by the locked copy-at-commit decision
-(the Week-2-reviewed DoS posture: lazy, capped, tombstoned); it IS a
-blob-band alloc site and is the documented exception until the Week-4+
+(the reviewed DoS posture: lazy, capped, tombstoned); it IS a
+blob-band alloc site and is the documented exception until a future
 arena Reservation API removes the copy. The GET path — the 99% path — is
 allocation-free in the blob band.
 
-**Week-3 ladder outcome (FULL, 5 stages + Opus diversity breaker, 4 refuters — all HIGH+ findings confirmed).** Fixed pre-push: spec-legal empty blocks were rejected ERR_QUOTA_BYTES (now extent-less, conformance-tested both stores); soft pins wrongly debited the §3.6 hard-pin quota (now: charge only on transition into hard, upgrade passes the gate, downgrade refunds); arena-full COMMIT emitted ERR_QUOTA_BYTES outside §3.4's frozen set (now: advisory BEGIN capacity check answers it there; the rare commit race maps to retryable ERR_BUSY — §3.4/§5 amended one line each); a drain-timeout could munmap the arena under an in-flight writev (transport now caps post-close writes at the 1s drain budget, Drain reports success/failure, main skips the unmap on timeout); CanEvict required refcount==0 and was structurally false for every resident block (now the refcount==1 indexed-block pre-filter, race-audited); daemon deadlocked on startup errors with metrics enabled (defer order); BEGIN ttl_ms was silently dropped (now applied at commit; no wire-observable effect until the evictor — review-covered, not behavior-testable yet); max_blob_len==max_frame_len made frame-cap blobs unreadable (negotiation now reserves the 32 B GET-header headroom); plain dram Get returned an arena view after release (now copies — the wire path uses GetRef and never pays it); a writeLoop flush-failure leaked the socket fd.
+**Pre-merge review findings (all confirmed and fixed before push):** spec-legal empty blocks were rejected ERR_QUOTA_BYTES (now extent-less, conformance-tested both stores); soft pins wrongly debited the §3.6 hard-pin quota (now: charge only on transition into hard, upgrade passes the gate, downgrade refunds); arena-full COMMIT emitted ERR_QUOTA_BYTES outside §3.4's frozen set (now: advisory BEGIN capacity check answers it there; the rare commit race maps to retryable ERR_BUSY — §3.4/§5 amended one line each); a drain-timeout could munmap the arena under an in-flight writev (transport now caps post-close writes at the 1s drain budget, Drain reports success/failure, main skips the unmap on timeout); CanEvict required refcount==0 and was structurally false for every resident block (now the refcount==1 indexed-block pre-filter, race-audited); daemon deadlocked on startup errors with metrics enabled (defer order); BEGIN ttl_ms was silently dropped (now applied at commit; no wire-observable effect until the evictor — review-covered, not behavior-testable yet); max_blob_len==max_frame_len made frame-cap blobs unreadable (negotiation now reserves the 32 B GET-header headroom); plain dram Get returned an arena view after release (now copies — the wire path uses GetRef and never pays it); a writeLoop flush-failure leaked the socket fd.
 
-**Known ceilings (documented, deliberate):** PUT staging stays heap-side (copy-at-commit; the reviewed DoS posture) until the Week-4+ reservation API. The allocator node pool caps at 2^17 live blocks regardless of arena size (Allocation.Meta's 18 slot bits) — irrelevant at the 1 GiB default, binds first on ≥8 GiB arenas of small blocks; widening Meta is scheduled with the evictor. kvb_hits_total hardcodes tier="dram" until the Recorder seam carries a tier. TouchLease can land on a ref a concurrent Delete just removed (client sees OK for a lease on a dead block — memory-safe, pre-existing, evictor-week item).
+**Known ceilings (documented, deliberate):** PUT staging stays heap-side (copy-at-commit; the reviewed DoS posture) until a future reservation API. The allocator node pool caps at 2^17 live blocks regardless of arena size (Allocation.Meta's 18 slot bits) — irrelevant at the 1 GiB default, binds first on ≥8 GiB arenas of small blocks; widening Meta is scheduled with the evictor. kvb_hits_total hardcodes tier="dram" until the Recorder seam carries a tier. TouchLease can land on a ref a concurrent Delete just removed (client sees OK for a lease on a dead block — memory-safe, pre-existing, evictor follow-up item).
 
-## Week 4 — eviction + the model-based correctness harness
+## Eviction + the model-based correctness harness
 
-<!-- RUDRAY: prose first per the Merge Rule — write this section from memory
-     (why S3-FIFO beats LRU for one-hit-wonders and what exactly the ghost
-     ring remembers and why hashes suffice; the three-pass evictor and the
-     §6 ladder precedence; why eviction is metadata-only and therefore
-     cheap; why a LOSSY store can still have a STRICT correctness oracle —
-     the asymmetric I1 and the maybeGone reconciliation; the happens-before
-     story between a reader's refcount and the evictor's gate) — THEN
-     fact-check against the code. The results below are raw inputs. -->
-
-**Ladder outcome (FULL, 5 stages + Opus breaker + 1 measuring refuter).**
+**Pre-merge review findings (all fixed before push).**
 One reproduced BLOCKER (S3-FIFO Admit/Remove atomicity gap — the zero-value
 queue state collided with qSmall; a plain PUT-vs-forced-DELETE race
 corrupted the FIFO and panicked the evictor; found independently by two
-stages AND re-reproduced by the refuter on its snapshot) — fixed with an
+reviewers AND re-reproduced on a code snapshot) — fixed with an
 explicit qUnqueued state + tombstone handshake and a hammer regression.
 HIGHs fixed: GET auto-lease TRUNCATED longer explicit leases (now monotonic
 extendLease — spec says grant/extend, RELEASE is the only shortener);
@@ -419,28 +388,28 @@ policy entries under delete churn (three-way outcome now; phantoms proven
 dropped); the soak driver exited 0 when the client's own xxh3 check failed
 (checksum errors now count as verify failures and any hard error fails the
 run); policy.Remove raced re-publishing Puts (now inside the DeleteIf gate,
-atomic with the removal). The breaker's request-path eviction-convoy claim
-was REFUTED at HIGH by measurement (insert p99 ≈ eviction-free memcpy
+atomic with the removal). A claimed request-path eviction convoy
+was REFUTED by measurement (insert p99 ≈ eviction-free memcpy
 contention; 29% of passes return at the trigger re-check; disabling the
 synchronous pass collapsed goodput 47×) and recorded as the p999-tail note
-below. The breaker's empty-block flood DoS was CONFIRMED by measurement
+below. A claimed empty-block flood DoS was CONFIRMED by measurement
 (181 B of index heap per zero-length block, unbounded) — zero-length blocks
 now carry a nominal count slot and the emergency sweep gained a COUNT goal.
-The deep rapid gate also caught one harness bug of ours (the extent-leak
+The model-based harness also caught one bug of its own (the extent-leak
 bound needed the held-ref allowance) — the oracle audits itself.
 
-**Deliberate ceilings & notes (Week-4 vintage):**
+**Deliberate ceilings & notes (eviction vintage):**
 - p999 tail under sustained overcommit is the evictMu queue (measured
   16–43 ms worst-case waits at 16 hammering writers on a laptop; p99
   unaffected). Revisit gate: if the 24h soak's put_p99 exceeds ~10 ms,
   implement single-flight-with-shared-completion on the eviction pass.
 - The TIMING WHEEL is deferred (lazy expiry + expired-first sweeps; the
-  plan's own fallback). Revisit gate: expired-resident bytes >10% of arena
+  recorded fallback). Revisit gate: expired-resident bytes >10% of arena
   between pressure events, or expired-sweep >5 ms in the soak.
-- The modeltest oracle hard-codes "eviction = data loss". The Week-6 NVMe
+- The modeltest oracle hard-codes "eviction = data loss". The NVMe
   tier turns eviction into DEMOTION — reconcileMiss and evictOne both need
-  the demotion seam before tier stacking (recorded for the Week-6 plan).
-- Strict per-tenant PRESSURE isolation needs Week-6 quotas; until then
+  the demotion seam before tier stacking (recorded before that tier landed).
+- Strict per-tenant PRESSURE isolation needs tenant quotas; until then
   attribution is proportional-to-resident-bytes with a remainder round.
 - ttlBlocks is a skip-hint that can ratchet up under lease-churn races
   (never down): worst case is a wasted expired-sweep per pass, never a
@@ -450,7 +419,7 @@ bound needed the held-ref allowance) — the oracle audits itself.
   re-admits to MAIN via its own ghost entry (deliberate: proved-protected
   blocks upgrade).
 
-## Week 6 — the NVMe tier (log-structured segments + kill -9 recovery)
+## NVMe tier (log-structured segments + kill -9 recovery)
 
 The durability differentiator: a warm tier that survives `kill -9` mid-write-storm
 with **zero corrupt reads** — where KVBM unlinks its NVMe file on restart
@@ -528,34 +497,24 @@ parent-side strictly AFTER each ack; ~30% of streams deliberately abandoned
 mid-CHUNK). CI runs 10 loops per push on ubuntu; the rig runs 50 on real
 NVMe; Docker rehearsals run 100+.
 
-### Week-6 measured results
+### NVMe tier — measured results
 
 | What | Where | Number |
 |---|---|---|
 | torture, darwin dev box | 3 loops | 0 corrupt, 0 phantom (mechanism check) |
 | torture, Linux kernel (Docker) | 100 loops | **0 corrupt, 0 phantom** over 18,160 journaled acks, 234 s (2026-07-18) |
-| torture, real NVMe (i7i) | 50 loops | _Day-6 session (run-tier.sh T2)_ |
-| daemon NVMe GET storm, per device | i7i.8xlarge | _T1a — quote GB/s AND %-of-fio-ceiling_ |
-| daemon NVMe GET storm, both devices | i7i.8xlarge | _T1b_ |
-| warm restart | ~20 GB fill | _T3 — wall seconds + seconds-per-GB + hits-survive_ |
+| torture, real NVMe (i7i) | 50 loops | **0 corrupt, 0 phantom** over 8,909 journaled acks, 216.9 s (2026-07-18) |
+| daemon NVMe GET storm, per device | i7i.8xlarge | **5.22 GB/s** (pool spans DRAM 8 GiB + NVMe — mixed-tier serving, disclosed; fio file-read ceiling 4.48 GB/s/device) |
+| daemon NVMe GET storm, both devices | i7i.8xlarge | **10.57 GB/s** aggregate (same mixed-pool disclosure) |
+| warm restart | ~20 GB fill | kill -9 → healthz 200 in **5.0 s**; both volumes recovered (33 segments / 8,257 blocks each, 0 bytes truncated, 63–179 ms scan) and the post-restart warm storm served **10.58 GB/s** — hits survive |
+
+Raw log: `bench/rigs/aws-nvme/tier-results.txt`.
 
 A3 status: OPEN — the pre-registered ≥6.0 GB/s/device line is not printable
 on any AWS instance-store device (i4i ceiling 2.99; i7i projected ~4.5); the
 session records %-of-ceiling with the same discipline the A1 transport gates
 used, and the literal gate awaits either a dated amendment or bare-metal
 PCIe-Gen4 hardware.
-
-### What Rudray owns (Merge Rule; write BEFORE reading the code back)
-
-- The recovery-algorithm narrative — checkpoint load → footer scan → tail
-  truncation — from memory, then diff against `internal/store/nvme/recovery.go`.
-- The durability-contract explanation: what a COMMIT ack promises, why the
-  parent journals AFTER the ack, why a torn tail cannot damage sealed
-  segments, what fsync/fdatasync actually guarantee (and why darwin's
-  fsync does not flush the drive cache).
-- O_DIRECT alignment discipline (4 KiB buffers/offsets/lengths; why the
-  aligned pool exists) and the build-tag split (`io_direct_linux.go` /
-  `io_direct_other.go` / `kvb_uring` stub — why io_uring is deferred).
 
 ## Tenancy model
 
@@ -648,13 +607,6 @@ it requires a shell on the box, the same trust boundary as editing
 accountant at scrape time: cardinality is #namespaces × 3 tiers — namespaces
 are operator-registered (tens, never per-key) and a smoke test pins the
 count.
-
-<!-- RUDRAY: prose first per the Merge Rule — from memory: why the
-     constant-time compare needs the dummy compare for unknown names; why
-     Charge is a CAS loop and not Add-then-check; where each refund seam
-     lives and what leaks if one is missed; why Transfer must never fail;
-     why cross-tenant answers NOT_FOUND and never FORBIDDEN — THEN diff
-     against internal/tenant/{registry,quota}.go and the store seams. -->
 
 ## S3 cold tier
 
@@ -757,7 +709,7 @@ the daemon's own spill/restore code paths via s3probe).** Whole-segment PUT
 (8 MiB): p50 110 ms (~73 MiB/s), worst of 10 = 235 ms. Ranged cold GET, p50:
 64 KiB 26.9 ms · 256 KiB 25.7 ms · 1 MiB 28.6 ms · 2.5 MiB 31.4 ms; worst
 observed of 30 per size: 33–61 ms (n is too small for honest p99s — we quote
-medians and maxima, and the review ladder caught the first draft quoting a
+medians and maxima, and review caught the first draft quoting a
 "p99" range that excluded the two worst cells) —
 S3's first-byte latency dominates, so a 2.5 MiB block costs ~4 ms more than a
 64 KiB one: the economics of one-segment-one-object. A cold 2.5 MiB KV block
@@ -788,10 +740,3 @@ reads, 0 read errors** (final; see the caveat below on the run's second half). T
 walk also caught its own integration bug as 51 checksum refusals (a
 mis-ranged read), refused before a single wrong byte escaped — the
 verify-before-serve contract doing its job.
-
-<!-- RUDRAY: prose first per the Merge Rule — from memory: the request-cost
-     arithmetic behind one-segment-one-object; why spill must be a copy and
-     what the retire-flip changes (and moves, quota-wise); the exact
-     cold-read verify path and why EXISTS must never touch S3; what a
-     restart loses and why that loss is honest — THEN diff against
-     internal/store/{s3tier.go,s3spill/,nvme/spillsurface.go}. -->

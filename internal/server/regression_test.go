@@ -63,7 +63,7 @@ func assertInvisible(t *testing.T, nc net.Conn, k [32]byte) {
 
 // TestBatchGetFMoreSplit: a response larger than the negotiated max_frame_len
 // is split into F_MORE frames server-side and reassembled by the client
-// (the over-cap single-frame bug the review found).
+// (pins a fixed bug: the response used to ship as one over-cap frame).
 func TestBatchGetFMoreSplit(t *testing.T) {
 	addr, cleanup := startServer(t)
 	defer cleanup()

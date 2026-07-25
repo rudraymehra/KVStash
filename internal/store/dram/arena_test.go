@@ -6,7 +6,8 @@ import (
 	"testing"
 )
 
-// TestArenaGCInvisibility is the A2 proof in test form: pushing 1 GiB of
+// TestArenaGCInvisibility is the GC-invisibility proof in test form
+// (docs/notes/a2-log.md has the soak-rig version): pushing 1 GiB of
 // 2 MiB blobs through arena+allocator must leave the Go heap essentially
 // untouched (HeapAlloc delta < 10 MB) because the blob bytes live in the mmap
 // region the GC never sees.
@@ -125,8 +126,8 @@ func TestArenaBytesBounds(t *testing.T) {
 // TestArenaUnitsRoundTrip exercises the REAL tier-boundary conversion: an
 // allocator in AllocUnit granules over an arena, every allocation's unit
 // offset converted to bytes for Arena.Bytes, written and read back — the
-// arithmetic the Day-5 tier will live on (replaces a tautological
-// arithmetic-identity test a ladder reviewer rejected).
+// arithmetic the DRAM tier lives on (replaces a tautological
+// arithmetic-identity test that asserted nothing real).
 func TestArenaUnitsRoundTrip(t *testing.T) {
 	const arenaBytes = int64(64 << 20)
 	a, err := NewArena(arenaBytes, false)
@@ -174,10 +175,10 @@ func TestArenaUnitsRoundTrip(t *testing.T) {
 	}
 }
 
-// TestArenaBytesCloseRace pins the TOCTOU fix (a confirmed HIGH): concurrent
+// TestArenaBytesCloseRace pins the TOCTOU fix: concurrent
 // Bytes vs Close must be -race-clean on the base pointer, and every Bytes
 // outcome must be either a valid view or the loud closed-arena panic — never
-// a silent wild slice fabricated from a torn base (the W3 TOCTOU). The base
+// a silent wild slice fabricated from a torn base. The base
 // atomic is the detector: if it were a plain field, -race flags the Bytes
 // read against the Close write; nil-on-close turns a post-Close call into a
 // panic, not a wild slice.

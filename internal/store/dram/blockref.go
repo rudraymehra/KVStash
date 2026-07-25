@@ -2,8 +2,9 @@ package dram
 
 import "sync/atomic"
 
-// Tier identifies which storage tier a block currently lives in. Week 3 is
-// DRAM-only; NVMe/S3 arrive with their tiers.
+// Tier identifies which storage tier a block currently lives in. This package
+// only ever holds DRAM-resident blocks; NVMe/S3 residency is tracked by the
+// tiered orchestrator (internal/store), not through this enum.
 type Tier uint8
 
 const (
@@ -37,9 +38,9 @@ type BlockRef struct {
 	Offset      uint32 // arena offset in AllocUnit GRANULES (byte off = Offset << AllocUnitShift) — units keep uint32 spanning 16 TiB
 	Len         uint32 // exact blob length in BYTES
 	NamespaceID uint32
-	XXH3        uint64 // xxh3_64 of the blob (C-35 naming)
+	XXH3        uint64 // xxh3_64 of the blob
 	allocMeta   uint32 // Allocation.Meta — needed to Free the extent
-	ArenaID     uint8  // 0 this week (multi-arena is later)
+	ArenaID     uint8  // always 0 today (single arena); reserves the multi-arena slot
 	Tier        Tier
 	PinFlags    uint8 // guarded by the index shard lock (see const doc)
 

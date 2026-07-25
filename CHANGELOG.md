@@ -230,7 +230,7 @@ and is included in v0.2.0._
   instead of serializing read-then-hash per block.
 - Client `Options` gained `SockSndBuf`/`SockRcvBuf` socket-buffer requests.
 
-### Fixed (review ladder on the wire path)
+### Fixed (wire-path review)
 - Client: non-OK BATCH_GET responses no longer deadlock the reader (preamble
   is inspected before descriptors are awaited); F_MORE-split responses are
   reassembled; a desynchronized connection is evicted from the pool and

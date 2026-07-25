@@ -1,6 +1,6 @@
 # kvblockd benchmark methodology — the 12 honesty rules
 
-Every number kvblockd publishes obeys these rules (SPEC-4 §9). They exist so
+Every number kvblockd publishes obeys these rules. They exist so
 the charts survive HN-comment-section forensics: each rule closes a specific
 way benchmarks lie.
 

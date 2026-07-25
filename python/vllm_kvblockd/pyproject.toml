@@ -18,7 +18,7 @@ dependencies = [
 # vllm is NEVER a hard runtime dep: the plugin is loaded BY vllm
 # (kv_connector_module_path / spec_module_path), so a hard pin would make the
 # package uninstallable next to a vllm the resolver dislikes. The pin lives
-# here, as the tested window (gate A6: last 4 minors).
+# here, as the tested window (the last 4 minor releases).
 vllm = ["vllm>=0.22,<0.26"]
 test = ["pytest>=8", "torch"]
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A6-style tripwire check for the SGLang HiCache backend (socket #4).
+"""Interface-drift tripwire for the SGLang HiCache backend.
 
 Two legs:
   (default)         backend must IMPORT and INSTANTIATE with NO sglang

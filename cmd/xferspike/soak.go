@@ -25,7 +25,7 @@ const gcPauseMetric = "/sched/pauses/total/gc:seconds"
 // soak blob size band = the vLLM contiguous-block sizes kvblockd will store.
 var soakBlobSizes = []int{440 << 10, 1 << 20, 2560 << 10} // 0.44, 1, 2.5 MiB
 
-// soakResult is the A2 JSON line: proof that blob bytes live off the Go heap
+// soakResult is the soak-mode JSON line: proof that blob bytes live off the Go heap
 // (heap_alloc_bytes stays tiny while rss_bytes tracks the arena) plus the GC
 // pause distribution measured during the load window.
 type soakResult struct {
@@ -63,7 +63,7 @@ type blobRef struct {
 	len int
 }
 
-// runSoak is the A2 rig. It mmaps an off-heap arena of immutable blobs, then
+// runSoak is the GC-pause soak rig. It mmaps an off-heap arena of immutable blobs, then
 // serves them over loopback via writev (zero blob bytes on the Go heap) under
 // concurrent load, measuring GC pause percentiles across the window.
 func runSoak(cfg config) error {
@@ -86,7 +86,7 @@ func runSoak(cfg config) error {
 
 	// Carve deterministic blobs into the arena, touching every page so RSS
 	// reflects the true footprint. Only the small index plus per-client buffers
-	// live on the Go heap; the blob bytes stay in the mmap (the A2 point).
+	// live on the Go heap; the blob bytes stay in the mmap (the whole point).
 	index := carveArena(arena)
 	fmt.Fprintf(os.Stderr, "xferspike soak: arena=%d MiB, blobs=%d, hugepages=%v\n",
 		cfg.arenaBytes>>20, len(index), huge)
@@ -355,7 +355,7 @@ func maxBucket(counts []uint64, buckets []float64) float64 {
 }
 
 // pctile returns the upper bound of the first bucket whose cumulative count
-// reaches p*total — conservative for a kill-gate (never under-reports). A result
+// reaches p*total — conservative for a pass/fail gate (never under-reports). A result
 // in the top (+Inf) bucket returns +Inf, signalling "over any finite threshold".
 func pctile(counts []uint64, buckets []float64, p float64) float64 {
 	var total uint64

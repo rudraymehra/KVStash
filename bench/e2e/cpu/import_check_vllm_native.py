@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A6-tripwire check for the NATIVE vLLM adapter (vllm_kvblockd): both
+"""Interface-drift tripwire for the NATIVE vLLM adapter (vllm_kvblockd): both
 classes must IMPORT and INSTANTIATE across every pinned vLLM release —
 interface drift trips CI, not production. Mirrors import_check.py (the
 LMCache-adapter tripwire). No daemon needed (clients dial lazily).

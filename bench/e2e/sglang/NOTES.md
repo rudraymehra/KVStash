@@ -1,18 +1,18 @@
 # SGLang HiCache e2e — session notes
 
-**STATUS: NOT RUN.** No GPU session happened this sprint (no GPU budget —
-the wk-12 verdict is DEFER, see `docs/design/sglang-hicache-v1.1.md`). The
+**STATUS: NOT RUN.** No GPU session has happened yet — the first run is
+deferred until GPU access (see `docs/design/sglang-hicache-v1.1.md`). The
 scripts here are written and code-read against sglang `v0.5.15.post1` but
 have never executed on a real box. Treat every pin and flag as unverified
 until the first session log lands below.
 
 ## How to use this file
 
-Week-12 Day-3 rule: log every failure **verbatim** (command, full stderr,
-stack trace, sglang log excerpt) — these lines are the raw material for the
-blocker doc. No paraphrasing.
+Log every failure **verbatim** (command, full stderr, stack trace, sglang
+log excerpt) — these lines are the raw material for any upstream bug
+report. No paraphrasing.
 
-## Pre-registered failure suspects (from the week file, check in this order)
+## Pre-registered failure suspects (check in this order)
 
 1. **Page-layout offset math** in `batch_get_v1` — our ptr→offset
    translation vs the real `MHATokenToKVPoolHost.get_page_buffer_meta`
@@ -29,8 +29,9 @@ blocker doc. No paraphrasing.
    v0.5.15.post1 `backend_factory.py` / `cache_controller.py`; never run).
 5. **Pinned-pool registration** — `kv_buffer` must be CPU + contiguous;
    hybrid/anchor pools (`kv_buffer=None`) disable v1 paths.
-6. `sglang[all]` install vs the pod's CUDA/driver (wk-12 risk #5: fall back
-   to the community tier or defer to the wk-13 buffer).
+6. `sglang[all]` install vs the pod's CUDA/driver (known risk: if the
+   secure-tier image fights the pin, fall back to the community tier or
+   defer the session).
 
 ## Session log (verbatim; newest first)
 

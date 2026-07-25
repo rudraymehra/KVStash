@@ -2,7 +2,7 @@
 # Rig T — Chart #1 data: the kvbench GET matrix through the full daemon vs
 # every baseline, on the SAME host pair, same sysctls, same payloads, warmed
 # identically. Emits the >=10x-vs-redis-py verdict. run.sh (xferspike) still
-# owns the A1 transport ceiling; this owns the storage comparison.
+# owns the transport-ceiling verdict; this owns the storage comparison.
 #
 # Prereqs: provision.sh + tune.sh + iperf-ceiling.sh already run (.rig-state
 # exists, iperf-ceiling.txt has the ceiling). Daemon + baselines run on node B,

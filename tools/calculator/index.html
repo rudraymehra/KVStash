@@ -163,8 +163,10 @@
       label it as such if you use it</div>
 
       <label for="net">Network bandwidth to kvblockd (GB/s, decimal)</label>
-      <input type="number" id="net" value="10" min="0.01" step="0.1">
-      <div class="hint">kvblockd targets 10+ GB/s on commodity TCP; use your measured number</div>
+      <input type="number" id="net" value="6.37" min="0.01" step="0.1">
+      <div class="hint">default is the measured 6.37 GB/s on a 50 GbE pair (100% of that
+      wire); 12.67 GB/s measured on 100 GbE — see bench/BENCHMARKS.md. Use your
+      own measured number</div>
 
       <label for="xfer">Transfer price ($/GB, decimal)</label>
       <input type="number" id="xfer" value="0" min="0" step="0.001">

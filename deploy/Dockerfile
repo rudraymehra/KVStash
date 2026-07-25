@@ -6,7 +6,7 @@
 #     -v $PWD/config:/config \
 #     -e KVBLOCKD_NAMESPACES=/config/namespaces.yaml \
 #     -e KVBLOCKD_METRICS_ADDR=0.0.0.0:9442 \
-#     ghcr.io/kvstash/kvblockd:VERSION
+#     ghcr.io/rudraymehra/kvblockd:VERSION
 #
 # The env vars matter: with no namespaces file the daemon accepts no clients
 # (by design), and the default metrics bind is 127.0.0.1 — loopback INSIDE

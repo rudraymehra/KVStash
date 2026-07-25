@@ -14,7 +14,7 @@ a cross-hit):
   BLOCK CHAIN (request-level): seed = H(domain || fingerprint || lp(cache_salt)
   || lp(lora_name) || lp(mm_id_0) || lp(mm_id_1) ...), then
   key_i = H(domain || key_{i-1} || tokens of block i). The chain seed FOLDS IN
-  vLLM's per-request cache_salt (correction C-14): two requests with the same
+  vLLM's per-request cache_salt: two requests with the same
   tokens but different salts diverge at the seed, so every block key differs —
   salted isolation is structural, not a flag someone forgets (LMCache #2878).
   The LoRA adapter name folds in for the same reason: KV computed under one
@@ -75,7 +75,7 @@ def chain_seed(
     lora_name: str | None = None,
 ) -> bytes:
     """Request-level chain seed. cache_salt, the LoRA adapter name, and the
-    multimodal identifiers are folded here so the WHOLE chain diverges (C-14).
+    multimodal identifiers are folded here so the WHOLE chain diverges.
     None and "" both encode as the empty field: an unsalted/base-model request
     has exactly one identity. mm identifiers are length-prefixed ONE BY ONE —
     each _lp field is self-delimiting, so ids containing '-' (UUIDs) or any
@@ -116,15 +116,16 @@ def block_chain_keys(seed: bytes, token_ids: list[int], block_size: int) -> list
 
 def tier_wire_key(fp: bytes, offload_key: bytes) -> bytes:
     """SecondaryTierManager altitude: vLLM owns the block hash (its OffloadKey
-    already folds cache_salt via the first block's extra keys — C-14 upstream);
-    we bind it to OUR config identity: H(fingerprint || offload_key)."""
+    already folds cache_salt via the first block's extra keys — salt isolation
+    is satisfied upstream); we bind it to OUR config identity:
+    H(fingerprint || offload_key)."""
     if len(fp) != WIRE_KEY_LEN:
         raise ValueError(f"fingerprint must be {WIRE_KEY_LEN} bytes, got {len(fp)}")
     return blake3(_TIER_DOMAIN + fp + _lp(bytes(offload_key))).digest()
 
 
 # --- vLLM config extraction (duck-typed: works on real VllmConfig and on the
-# --- SimpleNamespace stubs the A6 import check instantiates with) ---
+# --- SimpleNamespace stubs the CI import check instantiates with) ---
 
 
 def get_extra_config(kv_transfer_config, key: str, default):

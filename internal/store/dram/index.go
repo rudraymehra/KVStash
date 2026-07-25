@@ -112,7 +112,7 @@ func (idx *Index) WithShardLock(k Key, fn func(ref *BlockRef)) {
 // caller drops the index reference OUTSIDE the lock: the global order
 // (shard lock first, then allocMu) would PERMIT freeing inside, but a
 // reader's Release also frees without any shard lock, so keeping every
-// Free outside the shard lock keeps one story for the Week-4 evictor.
+// Free outside the shard lock keeps one story for the evictor.
 func (idx *Index) DeleteIf(k Key, gate func(*BlockRef) protocol.Status) (*BlockRef, protocol.Status) {
 	sh := idx.shardOf(k)
 	sh.mu.Lock()

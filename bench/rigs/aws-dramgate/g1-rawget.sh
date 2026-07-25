@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rig G, session 2: the HONEST G1 ceiling. xferspike is a one-way hot-buffer
-# blast — a different shape (the Week-2 finding; DESIGN.md: "the goalpost
-# does not move"). rawget is the same GET round-trip shape on raw sockets
+# blast — a different shape (a recorded early finding; DESIGN.md: "the
+# goalpost does not move"). rawget is the same GET round-trip shape on raw sockets
 # with no protocol/auth/checksums: the binding ceiling. Interleaved pairs,
 # ratio >= 0.9x.
 set -euo pipefail

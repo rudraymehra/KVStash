@@ -24,7 +24,7 @@ import (
 // That single-producer discipline is what lets the post-close final drain
 // guarantee every release fires exactly once; an async worker that calls
 // WriteFrames from another goroutine is a server-layer design that must add
-// its own synchronization (tracked for the server week).
+// its own synchronization.
 type FrameHandler interface {
 	HandleFrame(c *Conn, h protocol.Header, body []byte)
 }
@@ -453,7 +453,8 @@ func (c *Conn) flushBy(hdrArena []byte, reqs []writeReq, iovs *net.Buffers, dead
 // with the payload it precedes (never a lone tiny write). Frame boundaries and
 // wire order are untouched — this only bounds how many bytes one writev copies
 // into the kernel at a time, which is what keeps the loopback producer/consumer
-// copy pipeline overlapped (A1: 14.1 GB/s at ~1 MiB windows vs 6.9 at 16 MiB).
+// copy pipeline overlapped (measured: 14.1 GB/s at ~1 MiB windows vs 6.9 at
+// 16 MiB — docs/notes/a1-log.md).
 func (c *Conn) writeVector(buf net.Buffers) error {
 	chunk := c.cfg.WriteChunkBytes
 	if chunk <= 0 {

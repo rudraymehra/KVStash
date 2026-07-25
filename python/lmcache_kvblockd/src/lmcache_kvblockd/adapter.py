@@ -3,7 +3,7 @@ ConnectorManager (plugin path: remote_storage_plugins + extra_config
 module_path/class_name; see docs/notes/lmcache-head-verify.md).
 
 The LMCache ConnectorAdapter base is resolved at import time; if LMCache is
-absent (the A6 import tripwire, or unit tests without lmcache) we fall back to
+absent (CI import checks, or unit tests without lmcache) we fall back to
 `object` so the module still imports and the class still instantiates."""
 
 from __future__ import annotations

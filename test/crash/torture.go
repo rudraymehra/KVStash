@@ -438,8 +438,8 @@ func verify(dataPort int, j *journal, seed int64) error {
 
 	// (b) the scrub, EXISTS-first: every key the daemon ADMITS TO must GET
 	// byte-identical. EXISTS=true followed by a persistent GET miss is a
-	// PHANTOM (index/storage divergence — the exact failure class of the
-	// ladder's checkpoint blocker, which the GET-only oracle passed
+	// PHANTOM (index/storage divergence — the exact failure class of a
+	// review-found checkpoint blocker, which the GET-only oracle passed
 	// vacuously). A single EXISTS→GET disagreement is re-probed once:
 	// legal eviction/reclaim can race the two calls, divergence cannot.
 	survived, lost, phantomRaces := 0, 0, 0

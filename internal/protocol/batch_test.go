@@ -251,6 +251,18 @@ func TestGetRespHeaderRoundTrip(t *testing.T) {
 	if g, err := DecodeGetRespHeader(AppendErrorResp(nil, StatusErrBusy)); err != nil || g.Status != StatusErrBusy {
 		t.Fatalf("non-OK: %+v, %v", g, err)
 	}
+
+	// Huge peer-controlled counts must fail the length check, never wrap it:
+	// on a 32-bit build, DescSize*Count in int math overflows for counts near
+	// MaxUint32 and a short body would slip through into a Desc(i) panic. The
+	// decode does the sizing in uint64; these pin that.
+	for _, count := range []uint32{^uint32(0), ^uint32(0)/DescSize + 1, 1 << 28} {
+		short := AppendPreamble(nil, StatusOK, count)
+		short = append(short, make([]byte, 64)...) // first_index/total_keys + a few fake descriptors
+		if _, err := DecodeGetRespHeader(short); !errors.Is(err, ErrBodyLength) {
+			t.Fatalf("count=%d with a short body accepted: %v", count, err)
+		}
+	}
 }
 
 func TestHelloReqRoundTrip(t *testing.T) {
@@ -395,6 +407,8 @@ func TestPutBodiesRoundTrip(t *testing.T) {
 
 func TestNegotiateLimits(t *testing.T) {
 	server := DefaultLimits()
+	headroom := uint32(GetRespHeaderSize(1)) //nolint:gosec // G115: constant 32
+	floorBlob := uint32(FloorMaxFrameLen) - headroom
 	cases := []struct {
 		batch, frame                   uint32
 		wantBatch, wantFrame, wantBlob uint32
@@ -403,19 +417,43 @@ func TestNegotiateLimits(t *testing.T) {
 		// Lower frame → blob clamped under frame MINUS the single-descriptor
 		// GET header (32 B): a frame-sized blob's every GET response frame
 		// would otherwise exceed max_frame_len and be over-cap to the client.
-		{128, 16 << 20, 128, 16 << 20, 16<<20 - uint32(GetRespHeaderSize(1))},       //nolint:gosec // G115: constant 32
+		{128, 16 << 20, 128, 16 << 20, 16<<20 - headroom},
 		{1024, 1 << 30, DefaultMaxBatchKeys, DefaultMaxFrameLen, DefaultMaxBlobLen}, // client higher loses; blob unchanged
+		// Sub-floor proposals clamp UP to the §4 floors — never below. Frames
+		// 1..31 would otherwise wrap frame-headroom (uint32 underflow) and skip
+		// the blob clamp entirely; frame 32 would negotiate blob=0 (a session
+		// that can never store a block).
+		{0, 1, DefaultMaxBatchKeys, FloorMaxFrameLen, floorBlob},
+		{0, 8, DefaultMaxBatchKeys, FloorMaxFrameLen, floorBlob},
+		{0, 31, DefaultMaxBatchKeys, FloorMaxFrameLen, floorBlob},
+		{0, 32, DefaultMaxBatchKeys, FloorMaxFrameLen, floorBlob},
+		{0, 33, DefaultMaxBatchKeys, FloorMaxFrameLen, floorBlob},
+		{0, FloorMaxFrameLen - 1, DefaultMaxBatchKeys, FloorMaxFrameLen, floorBlob},
+		{1, 0, FloorMaxBatchKeys, DefaultMaxFrameLen, DefaultMaxBlobLen},                     // sub-floor batch keys clamp up too
+		{127, 0, FloorMaxBatchKeys, DefaultMaxFrameLen, DefaultMaxBlobLen},                   // one below the floor
+		{1, 1, FloorMaxBatchKeys, FloorMaxFrameLen, floorBlob},                               // both degenerate at once
+		{^uint32(0), ^uint32(0), DefaultMaxBatchKeys, DefaultMaxFrameLen, DefaultMaxBlobLen}, // MaxUint32: client higher loses
 	}
 	for i, c := range cases {
 		got := NegotiateLimits(server, c.batch, c.frame)
 		if got.MaxBatchKeys != c.wantBatch || got.MaxFrameLen != c.wantFrame {
-			t.Fatalf("case %d: %+v", i, got)
+			t.Fatalf("case %d (batch=%d frame=%d): %+v", i, c.batch, c.frame, got)
 		}
 		if got.MaxBlobLen != c.wantBlob {
-			t.Fatalf("case %d: MaxBlobLen = %d, want %d (blob must stay <= frame)", i, got.MaxBlobLen, c.wantBlob)
+			t.Fatalf("case %d (batch=%d frame=%d): MaxBlobLen = %d, want %d (blob must stay <= frame)",
+				i, c.batch, c.frame, got.MaxBlobLen, c.wantBlob)
 		}
-		if got.MaxBlobLen > got.MaxFrameLen {
-			t.Fatalf("case %d: blob %d exceeds frame %d — unservable blocks", i, got.MaxBlobLen, got.MaxFrameLen)
+		// The doc-comment invariants, for EVERY client proposal:
+		if got.MaxBlobLen > got.MaxFrameLen-headroom {
+			t.Fatalf("case %d (batch=%d frame=%d): blob %d exceeds frame %d - headroom %d — unservable blocks",
+				i, c.batch, c.frame, got.MaxBlobLen, got.MaxFrameLen, headroom)
+		}
+		if got.MaxBlobLen == 0 {
+			t.Fatalf("case %d (batch=%d frame=%d): blob=0 negotiated — a session that can never store a block",
+				i, c.batch, c.frame)
+		}
+		if got.MaxFrameLen < FloorMaxFrameLen || got.MaxBatchKeys < FloorMaxBatchKeys {
+			t.Fatalf("case %d (batch=%d frame=%d): negotiated below the §4 floors: %+v", i, c.batch, c.frame, got)
 		}
 		if got.InitialCredit != server.InitialCredit {
 			t.Fatalf("case %d: credit (server-dictated) changed: %+v", i, got)

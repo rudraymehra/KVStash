@@ -134,7 +134,7 @@ func s3payload(n int) []byte {
 
 func bearer(tok string) string { return "Bearer " + tok }
 
-// sigv4 builds the aws-sdk-shaped Authorization header (the C-11 path): the
+// sigv4 builds the aws-sdk-shaped Authorization header (the NIXL path): the
 // access-key-id position carries the tenant token; the signature is noise
 // the endpoint deliberately ignores.
 func sigv4(akid string) string {
@@ -171,7 +171,7 @@ func TestS3CompatPutGetRoundTrip(t *testing.T) {
 	body := wantStatus(t, s3do(t, ts, http.MethodPut, path, bearer(s3TokenA), other, nil), http.StatusConflict)
 	wantErrCode(t, body, "ImmutableConflict")
 
-	// The SigV4-shaped header reads the same block (C-11: aws-sdk clients
+	// The SigV4-shaped header reads the same block (aws-sdk clients
 	// cannot emit Bearer; the access-key-id is the token).
 	got = wantStatus(t, s3do(t, ts, http.MethodGet, path, sigv4(s3TokenA), nil, nil), http.StatusOK)
 	if !bytes.Equal(got, data) {
@@ -288,7 +288,7 @@ func TestS3CompatAuth(t *testing.T) {
 	wantErrCode(t, wantStatus(t, realBucketWrongTok, http.StatusForbidden), "AccessDenied")
 	wantErrCode(t, wantStatus(t, ghostBucketRealTok, http.StatusForbidden), "AccessDenied")
 
-	// SigV4 with the right akid is a full-rights credential (C-11 path).
+	// SigV4 with the right akid is a full-rights credential (the NIXL path).
 	wantStatus(t, s3do(t, ts, http.MethodHead, path, sigv4(s3TokenA), nil, nil), http.StatusOK)
 }
 

@@ -214,8 +214,8 @@ def test_unsupported_dtype_is_miss(daemon):
 
 
 def test_mem_fmt_threaded_to_allocate(daemon, monkeypatch):
-    # The retrieval path must pass the stored MemoryFormat to allocate (Opus
-    # HIGH: dropping it round-trips a wrong layout). LMCache's enum is absent
+    # The retrieval path must pass the stored MemoryFormat to allocate —
+    # dropping it round-trips a wrong layout. LMCache's enum is absent
     # in this venv, so stub _memory_format to a sentinel and assert allocate
     # receives it.
     import lmcache_kvblockd.connector as conn_mod

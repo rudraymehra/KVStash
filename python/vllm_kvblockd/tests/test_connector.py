@@ -5,7 +5,7 @@ torch is required (paged-KV tensors); vllm is not.
 
 Each test uses a distinct cache_salt: kvblockd is write-once and keys are
 content-chained, so salts give tests disjoint keyspaces on the shared daemon
-— exercising the C-14 mechanism as test isolation."""
+— exercising the cache_salt isolation mechanism as test isolation."""
 
 from __future__ import annotations
 
@@ -193,7 +193,8 @@ def test_partial_prefix_hit_count(daemon):
 
 
 def test_cache_salt_isolates(daemon):
-    """C-14 end-to-end: same tokens under salt A stored, salt B NEVER hits."""
+    """cache_salt isolation end-to-end: same tokens under salt A stored,
+    salt B NEVER hits."""
     toks = list(range(60, 69))
     conn = make_connector(daemon)
     kv = fresh_kv()
@@ -447,8 +448,8 @@ def test_layout_drift_is_a_miss_not_a_scatter(daemon):
     conn.shutdown()
 
 
-def test_dtype_codes_match_w5():
-    """The blob dtype table must stay in lockstep with the W5 adapter's
+def test_dtype_codes_match_lmcache_adapter():
+    """The blob dtype table must stay in lockstep with the LMCache adapter's
     (python/lmcache_kvblockd/src/lmcache_kvblockd/meta.py)."""
     lm_meta = pytest.importorskip("lmcache_kvblockd.meta")
     assert conn_mod.DTYPE_CODES == lm_meta.DTYPE_CODES

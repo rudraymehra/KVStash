@@ -11,7 +11,7 @@ import (
 )
 
 // directBackend is the Linux engine: O_DIRECT pread/pwrite on a raw fd —
-// the measured A3 default (98%+ of the device fio ceiling at <0.25 cores).
+// the measured default (98%+ of the device fio ceiling at <0.25 cores).
 // O_DIRECT demands 4 KiB-aligned buffers/offsets/lengths; the aligned pool
 // and record padding provide that. On filesystems that reject O_DIRECT
 // (tmpfs, some overlayfs) we fall back to buffered I/O with a warning —
@@ -27,10 +27,10 @@ func (directBackend) Open(path string, forWrite bool) (File, error) {
 	if forWrite {
 		flags = unix.O_RDWR | unix.O_CREAT
 	}
-	fd, err := unix.Open(path, flags|unix.O_DIRECT, 0o600) // tenant KV-cache payloads: never world-readable (ladder finding)
+	fd, err := unix.Open(path, flags|unix.O_DIRECT, 0o600) // tenant KV-cache payloads: never world-readable
 	if errors.Is(err, unix.EINVAL) {
 		// Filesystem refuses O_DIRECT. Buffered fallback, logged once per open.
-		fd, err = unix.Open(path, flags, 0o600) // tenant KV-cache payloads: never world-readable (ladder finding)
+		fd, err = unix.Open(path, flags, 0o600) // tenant KV-cache payloads: never world-readable
 		if err == nil {
 			slog.Warn("nvme: filesystem rejected O_DIRECT — buffered fallback (correctness unchanged)", "path", path)
 		}

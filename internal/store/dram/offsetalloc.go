@@ -186,7 +186,7 @@ func NewAllocator(size uint32) *Allocator {
 }
 
 // NewAllocatorMax is NewAllocator with an explicit live-allocation budget —
-// the Day-5 tier sizes this from arenaUnits/minBlockUnits so the node pool
+// the DRAM tier sizes this from arenaUnits/minBlockUnits so the node pool
 // can never be the binding constraint before capacity is. maxAllocs is capped
 // so the 2× node pool still fits the Meta slot field.
 func NewAllocatorMax(size, maxAllocs uint32) *Allocator {

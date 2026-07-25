@@ -42,7 +42,7 @@ func ConvertMooncake(in io.Reader, traceName string, out *Writer) (ConvStats, er
 		}
 		// Reject before the 32× amplification: a hostile line of ~5M ids
 		// would drive a multi-GB allocation before Writer.Write's chain cap
-		// fires (the ladder's memory-amplification MED).
+		// fires (a memory-amplification finding from review).
 		if len(line.HashIDs)*mooncakeSubKeys > maxChain {
 			return st, fmt.Errorf("mooncake: line %d expands to %d keys (max %d)",
 				st.Requests+1, len(line.HashIDs)*mooncakeSubKeys, maxChain)

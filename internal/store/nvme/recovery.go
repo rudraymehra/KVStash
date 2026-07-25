@@ -34,14 +34,14 @@ type RecoveredEntry struct {
 //
 //  1. newest CRC-valid checkpoint → entries for segments ≤ maxSealedSegID
 //     (validated, then trusted without footer reads — the warm-restart win).
-//     The entries are ALSO attached to the in-memory segment (the review
-//     ladder's confirmed blocker: a trusted segment with a nil entry table
+//     The entries are ALSO attached to the in-memory segment (a fixed
+//     data-loss bug: a trusted segment with a nil entry table
 //     poisoned the NEXT checkpoint into dropping it, and gave reclaim
 //     nothing to gate on);
 //  2. sealed segments newer than the checkpoint → footer scan; on the same
 //     (ns, key) the LATER (segID, offset) wins — offset order matters too,
 //     because delete + re-put can land two generations of one key in the
-//     SAME segment (the ladder's confirmed serves-superseded-bytes HIGH);
+//     SAME segment (ignoring offset order served superseded bytes);
 //  3. every unsealed segment (crash-mid-rotation can leave more than one)
 //     → forward record scan, verify xxh3 per record, truncate at the first
 //     torn/short/bad record, then SEAL the recovered prefix in place — no
@@ -49,8 +49,9 @@ type RecoveredEntry struct {
 //  4. empty unsealed segments and genuinely partial creates are deleted.
 //     A sealed segment whose size differs from the CURRENT config (an
 //     operator retuned nvme_segment_bytes) is NOT deleted — geometry is
-//     read from the file itself (the ladder's config-edit-wipes-the-tier
-//     HIGH); only non-4KiB-multiple / too-small files are partial creates.
+//     read from the file itself (deleting on mismatch would let a config
+//     edit wipe the tier); only non-4KiB-multiple / too-small files are
+//     partial creates.
 //
 // Lose data, never serve corruption.
 func (v *Volume) recoverDir() (*RecoveryReport, []RecoveredEntry, error) {
@@ -201,7 +202,7 @@ func (v *Volume) recoverDir() (*RecoveryReport, []RecoveredEntry, error) {
 	// nextID must clear BOTH the present files and everything a surviving
 	// checkpoint could ever vouch for — reusing an ID ≤ maxSealedSegID
 	// would let a stale checkpoint "trust" a brand-new unsealed segment
-	// (the ladder's ID-reuse MED).
+	// (the ID-reuse trap).
 	if n := len(segIDs); n > 0 {
 		v.nextID = segIDs[n-1] + 1
 	}
@@ -349,7 +350,7 @@ func allZero(b []byte) bool {
 // listSegIDs accepts ONLY canonical segment filenames (seg-%08d.kvbs).
 // Sscanf alone also matches seg-0.kvbs / seg-007.kvbs, which would alias a
 // canonical ID, double-count used bytes, and leak the first fd (the
-// ladder's adversarial-filename MED) — the volume dir's contents are
+// adversarial-filename trap) — the volume dir's contents are
 // corruptible in the threat model.
 func listSegIDs(dir string, warn func(msg string, args ...any)) ([]uint32, error) {
 	des, err := os.ReadDir(dir)

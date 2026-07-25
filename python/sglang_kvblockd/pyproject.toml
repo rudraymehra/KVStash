@@ -1,7 +1,4 @@
-# NOT PUBLISHED: the wk-12 SGLang spike verdict is DEFER
-# (docs/design/sglang-hicache-v1.1.md). Per C-4 the PyPI publish task is
-# unconditional on the SHIP branch only — this package is twine-buildable
-# and stays local until the revisit trigger fires.
+# Not yet published to PyPI: pending GPU e2e validation (see docs/design/sglang-hicache-v1.1.md).
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

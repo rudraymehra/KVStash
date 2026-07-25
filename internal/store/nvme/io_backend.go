@@ -6,8 +6,8 @@ import (
 )
 
 // IOBackend opens segment/checkpoint files for the tier. It exists so the
-// I/O engine stays swappable (the A3 seam: threadpool today, io_uring behind
-// kvb_uring later) and so tests can inject fault/spy backends — the
+// I/O engine stays swappable (a deliberate seam: threadpool today, io_uring
+// behind kvb_uring later) and so tests can inject fault/spy backends — the
 // EXISTS-never-touches-NVMe guard test panics inside a spy File.
 type IOBackend interface {
 	// Open opens (creating if forWrite) the file at path. Write handles are

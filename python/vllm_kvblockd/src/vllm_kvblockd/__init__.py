@@ -28,8 +28,8 @@ vLLM contract):
     Importing vllm_kvblockd.tier_manager (which spec_module_path does) is
     what registers the "kvblockd" tier type with SecondaryTierFactory.
 
-Both classes import and instantiate WITHOUT vllm installed (the A6
-interface-tripwire relies on this); vllm is an optional extra, never a hard
+Both classes import and instantiate WITHOUT vllm installed (the CI
+import check relies on this); vllm is an optional extra, never a hard
 dependency — the plugin is loaded BY vllm.
 """
 

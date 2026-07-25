@@ -48,7 +48,7 @@ JSONL alone — a stranger with the results file regenerates the images.
 
 - `kvbench report --check-repeat a.jsonl b.jsonl --tolerance 0.02` — pairs
   open-loop, non-saturated cells by `(store, cell.id, rate_frac)` and fails
-  if any GET `p99_us` diverges >2% (SPEC-4 §11).
+  if any GET `p99_us` diverges >2% (bench/METHODOLOGY.md rule 7).
 - Chart 1 reads `goodput_gbytes_s` + `ratio_vs_ceiling` + `cpu` from
   `mode:"closed"` headline cells (median of 3 runs).
 - Chart 2 reads `hit_rate` (x) + GET `p50_us`/`p99_us` (y) from `kind:

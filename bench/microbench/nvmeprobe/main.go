@@ -1,9 +1,10 @@
-// Command nvmeprobe is the A3 kill-gate rig: can Go drive an NVMe device at
-// >=6 GB/s? The active engine is a pinned-thread pread/pwrite pool with
-// O_DIRECT (the pre-registered fallback the gate accepts); the io_uring engine
-// is deferred — see io_linux.go — pending a Go-1.26-compatible binding. Reports
-// honest decimal GB/s + IOPS + CPU as one JSON line. Gate rule: >=6 GB/s per
-// device passes; "undecided" is not an outcome. Throwaway rig; not the product.
+// Command nvmeprobe answers a pre-registered go/no-go question: can Go drive
+// an NVMe device at >=6 GB/s? The active engine is a pinned-thread
+// pread/pwrite pool with O_DIRECT (the pre-registered fallback the rule
+// accepts); the io_uring engine is deferred — see io_linux.go — pending a
+// Go-1.26-compatible binding. Reports honest decimal GB/s + IOPS + CPU as one
+// JSON line. Decision rule: >=6 GB/s per device passes; "undecided" is not an
+// outcome. Throwaway rig; not the product.
 package main
 
 import (

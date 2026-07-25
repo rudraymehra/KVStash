@@ -139,8 +139,8 @@ func arenaFree(t *testing.T, s *dram.Store) int64 {
 	return doc.ArenaFreeBytes
 }
 
-// TestArenaFullGraceful: a full arena answers ERR_QUOTA_BYTES and keeps
-// serving reads (the hard-but-clean wall until the Week-4 evictor).
+// TestArenaFullGraceful: with eviction disabled, a full arena answers
+// ERR_QUOTA_BYTES and keeps serving reads (the hard-but-clean wall).
 func TestArenaFullGraceful(t *testing.T) {
 	s := newTierStore(t, 8<<20) // small arena
 	blob := bytes.Repeat([]byte{9}, 1<<20)
@@ -215,8 +215,8 @@ func TestDeleteGatingThroughStore(t *testing.T) {
 
 // TestPinCapForConstructorPath: the per-namespace pin_quota override wired
 // through Params (the path main.go actually travels — a post-construction
-// field write would bypass New exactly like the withDefaults regression the
-// ladder caught once already).
+// field write would bypass New exactly like the withDefaults zero-vs-default
+// regression this suite pins elsewhere).
 func TestPinCapForConstructorPath(t *testing.T) {
 	arena, err := dram.NewArena(16<<20, false)
 	if err != nil {

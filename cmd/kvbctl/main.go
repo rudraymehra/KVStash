@@ -1,16 +1,13 @@
-// Command kvbctl is the kvblockd data-plane CLI: exists/get/put/delete/stats
-// against a live daemon over pkg/client. Stdlib flag only — no cobra
-// (dependency count is a feature).
+// Command kvbctl is the kvblockd CLI. Data plane: exists/get/put/delete/stats
+// against a live daemon over pkg/client. Ops plane (cmd_ops.go): namespace
+// add/list and quota set over the daemon's loopback admin socket
+// (admin_addr). Stdlib flag only — no cobra (dependency count is a feature).
 //
 // Key convention: block keys are [32]byte. With -hex a key argument must be
 // exactly 64 hex chars; otherwise the argument is hashed with SHA-256 — a
 // smoke-tool convenience so `kvbctl put k1 blob.bin` works out of the box.
-// (Adapters derive real keys via the BLAKE3 prefix chain; kvbctl switches to
-// it when pkg/client grows the hashchain helper in the adapter weeks.)
-//
-// Deferred (documented, not forgotten): cmd_ops.go (evict-now, namespace
-// CRUD) needs the admin socket that internal/server does not expose yet;
-// pin/lease need client verbs that arrive with the tier lifecycle.
+// (Adapters derive real wire keys via the BLAKE3 prefix chain —
+// client.WireKey; pass those with -hex.)
 //
 // Exit codes: 0 success · 1 not-found or per-key/status failure · 2 usage,
 // connect, or I/O error.

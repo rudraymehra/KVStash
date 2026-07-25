@@ -1,8 +1,8 @@
 name: ci
 
-# Cost note: the repo is PRIVATE, so Actions minutes bill (macOS at 10×).
-# Push-time CI runs ubuntu only; the macOS cross-check runs on a weekly cron
-# + manual dispatch. Flip back to per-push macОS when the repo goes public.
+# Push-time CI runs ubuntu only to keep the pipeline fast; the macOS
+# cross-check runs on a weekly cron + manual dispatch, which has been enough
+# to catch darwin-only drift.
 on:
   push:
     branches: [main]
@@ -124,7 +124,7 @@ jobs:
           AWS_REGION: us-east-1
         run: go run -tags crashtest ./test/crash -loops 5 -storm-ms 8000 -s3-endpoint http://127.0.0.1:9000 -dir "$RUNNER_TEMP/crash-s3"
 
-  # macOS cross-check: weekly + on demand only (10× billing on a private repo).
+  # macOS cross-check: weekly + on demand only.
   test-macos:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-14
@@ -238,7 +238,7 @@ jobs:
           pip install --no-deps ./python/kvblockd ./python/lmcache_kvblockd ./python/vllm_kvblockd
       - name: build daemon once (fixture reuses it)
         run: go build -o /tmp/kvbd-test ./cmd/kvblockd
-      - name: pytest vllm_kvblockd (C-14 goldens + connector + tier manager)
+      - name: pytest vllm_kvblockd (goldens + connector + tier manager)
         env:
           PYTHONHASHSEED: "0"
           KVBLOCKD_TEST_BIN: /tmp/kvbd-test

@@ -77,8 +77,8 @@ func New(arena *Arena, p Params) *Store {
 	// allocations (Allocation.Meta's 18 slot bits), so an arena above ~8 GiB
 	// of 64 KiB blocks (or ~50 GiB of 0.4 MB blocks) hits the pool before
 	// capacity and Put answers ERR_QUOTA_BYTES with free bytes remaining.
-	// Fine for the Week-3 1 GiB default; widening Meta is scheduled with the
-	// evictor work (recorded in DESIGN.md).
+	// Fine for the 1 GiB default arena; widening Meta is the recorded
+	// follow-up for larger arenas (DESIGN.md).
 	maxAllocs := units / 16
 	if maxAllocs < 1024 {
 		maxAllocs = 1024

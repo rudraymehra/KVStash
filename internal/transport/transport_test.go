@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -351,7 +352,7 @@ func TestWriteFramesAfterCloseReleases(t *testing.T) {
 // teardown-lattice family: under a handler emitting many frames against a
 // stalled peer, an external Close must never strand a release. It asserts
 // every WriteFrames release fired (Return + Grant), Done() closes promptly,
-// and the credit ledger conserves — the oracle the review panel specified.
+// and the credit ledger conserves — the full teardown oracle.
 func TestConcurrentCloseReleasesEverything(t *testing.T) {
 	cfg := testConfig()
 	cfg.WriteStallTimeout = minStallTimeout // floored; keep teardown bounded
@@ -476,5 +477,154 @@ func TestSlowReaderIsBounded(t *testing.T) {
 	case <-c.Done():
 	case <-time.After(minStallTimeout + 10*time.Second):
 		t.Fatal("server did not close a never-reading peer within the stall bound")
+	}
+}
+
+// TestMaxConnsCapRefusesAndReleases: the MaxConns accept cap (config's
+// max_conns) closes over-cap connections at accept — before any loops start —
+// and frees the slot when a live connection fully finishes.
+func TestMaxConnsCapRefusesAndReleases(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxConns = 1
+	l, err := Listen(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs := HeapSource{}
+	conns := make(chan *Conn, 4)
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			c, aerr := l.Accept(bs, &echoHandler{bs: bs})
+			if aerr != nil {
+				return
+			}
+			conns <- c
+		}
+	}()
+	defer func() {
+		_ = l.Close()
+		<-acceptDone
+		close(conns)
+		for c := range conns {
+			_ = c.Close()
+			<-c.Done()
+		}
+	}()
+
+	// First connection: under the cap; prove it is live with an echo.
+	nc1 := dial(t, l.Addr().String())
+	sendFrame(t, nc1, protocol.Header{Opcode: protocol.OpBatchExists, RequestID: 1}, []byte("k"))
+	if h, _ := readFrame(t, nc1); h.RequestID != 1 {
+		t.Fatalf("first connection echo: %+v", h)
+	}
+	c1 := <-conns
+
+	// Second connection: over the cap — refused (closed) at accept.
+	nc2 := dial(t, l.Addr().String())
+	_ = nc2.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := nc2.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("over-cap connection was not closed at accept: %v", err)
+	}
+	_ = nc2.Close()
+	if got := l.Refused(); got != 1 {
+		t.Fatalf("Refused() = %d, want 1", got)
+	}
+
+	// Closing the first connection frees the slot (asynchronously, after Done).
+	_ = nc1.Close()
+	_ = c1.Close()
+	<-c1.Done()
+	deadline := time.Now().Add(5 * time.Second)
+	for l.live.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("max_conns slot never freed after the connection finished")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	nc3 := dial(t, l.Addr().String())
+	defer nc3.Close()
+	sendFrame(t, nc3, protocol.Header{Opcode: protocol.OpBatchExists, RequestID: 3}, []byte("k"))
+	if h, _ := readFrame(t, nc3); h.RequestID != 3 {
+		t.Fatalf("post-release echo: %+v", h)
+	}
+}
+
+// flakyListener injects `remaining` transient accept errors before delegating
+// to the real listener — the EMFILE/ECONNABORTED spike a live server sees.
+type flakyListener struct {
+	net.Listener
+	remaining atomic.Int32
+}
+
+func (f *flakyListener) Accept() (net.Conn, error) {
+	if f.remaining.Add(-1) >= 0 {
+		return nil, &net.OpError{Op: "accept", Net: "tcp", Err: syscall.ECONNABORTED}
+	}
+	return f.Listener.Accept()
+}
+
+// TestAcceptSurvivesTransientErrors: transient accept failures are retried
+// inside Accept (with backoff) instead of being surfaced — a passing
+// EMFILE/ECONNABORTED spike must not permanently kill the accept loop — while
+// a closed listener remains terminal.
+func TestAcceptSurvivesTransientErrors(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fl := &flakyListener{Listener: inner}
+	fl.remaining.Store(3)
+	l := &Listener{ln: fl, cfg: testConfig()}
+	bs := HeapSource{}
+
+	got := make(chan *Conn, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		c, aerr := l.Accept(bs, &echoHandler{bs: bs})
+		if aerr != nil {
+			errCh <- aerr
+			return
+		}
+		got <- c
+	}()
+	nc := dial(t, inner.Addr().String())
+	defer nc.Close()
+	select {
+	case c := <-got:
+		_ = c.Close()
+		<-c.Done()
+	case aerr := <-errCh:
+		t.Fatalf("Accept treated a transient error as terminal: %v", aerr)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Accept never recovered from transient errors")
+	}
+
+	// A closed listener is terminal — the caller's stop-accepting signal.
+	_ = inner.Close()
+	if _, aerr := l.Accept(bs, &echoHandler{bs: bs}); !errors.Is(aerr, net.ErrClosed) {
+		t.Fatalf("closed listener: got %v, want net.ErrClosed", aerr)
+	}
+}
+
+// TestIsTransientAcceptError pins the terminal/transient classification.
+func TestIsTransientAcceptError(t *testing.T) {
+	for _, e := range []error{
+		syscall.ECONNABORTED, syscall.ECONNRESET, syscall.EMFILE,
+		syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM, syscall.EINTR,
+	} {
+		if !isTransientAcceptError(&net.OpError{Op: "accept", Net: "tcp", Err: e}) {
+			t.Errorf("%v must be transient", e)
+		}
+	}
+	if isTransientAcceptError(net.ErrClosed) {
+		t.Error("net.ErrClosed must be terminal")
+	}
+	if isTransientAcceptError(&net.OpError{Op: "accept", Net: "tcp", Err: net.ErrClosed}) {
+		t.Error("wrapped net.ErrClosed must be terminal")
+	}
+	if isTransientAcceptError(errors.New("mystery")) {
+		t.Error("unrecognized errors must be terminal")
 	}
 }

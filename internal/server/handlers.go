@@ -44,6 +44,15 @@ func (s *session) handleHello(c *transport.Conn, h protocol.Header, body []byte)
 		s.fatalHello(c, h, protocol.StatusErrMalformed)
 		return
 	}
+	if req.ProtoMin > protocol.Version1 || req.ProtoMax < protocol.Version1 {
+		// §3.1: the server supports no protocol version in the client's
+		// [proto_min, proto_max] range → ERR_UNSUPPORTED with F_FATAL, close.
+		// Checked before auth: a version mismatch is answerable without
+		// touching the token, and an inverted range (min > max) can never
+		// contain v1, so it lands here too.
+		s.fatalHello(c, h, protocol.StatusErrUnsupported)
+		return
+	}
 	id, ok := s.srv.ns.Authenticate(req.Namespace, req.Token)
 	if !ok {
 		// Bad token / unknown namespace collapse to ERR_AUTH_FAILED

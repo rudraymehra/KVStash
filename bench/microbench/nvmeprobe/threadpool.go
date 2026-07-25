@@ -9,7 +9,7 @@ import (
 
 // runThreadpool is the portable engine: qd OS-thread-pinned workers doing
 // synchronous pread/pwrite on 4096-aligned buffers. This is the known-viable
-// fallback the A3 gate accepts if io_uring misses; PegaFlow-class numbers
+// fallback the device gate accepts if io_uring misses; PegaFlow-class numbers
 // (~6+ GB/s/device) are achievable this way on modern NVMe.
 func runThreadpool(cfg probeConfig, fd int, size int64) (bytesTotal, ops, ioErrs int64) {
 	var b, n, e atomic.Int64

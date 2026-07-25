@@ -104,8 +104,8 @@ func mmapBuf(n int) ([]byte, error) {
 // alignedTemp is a one-shot page-aligned buffer for metadata I/O on direct
 // fds (seal tables, trailers, scan headers). Plain `make` slices happen to
 // be page-aligned for 4096-multiples under today's allocator, but the
-// language guarantees nothing — the ladder flagged every metadata path that
-// gambled on it. free() must be called exactly once.
+// language guarantees nothing — every metadata path used to gamble on it.
+// free() must be called exactly once.
 func alignedTemp(n int) (buf []byte, free func(), err error) {
 	b, err := mmapBuf(int(roundUpAlign(uint64(n)))) //nolint:gosec // G115: metadata sizes ≪ 4 GiB
 	if err != nil {

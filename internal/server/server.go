@@ -107,6 +107,7 @@ func New(cfg config.Config, store Store, ns *Namespaces) *Server {
 	lcfg.SndBuf = cfg.SockSndBuf
 	lcfg.RcvBuf = cfg.SockRcvBuf
 	lcfg.WriteChunkBytes = cfg.WriteChunkBytes
+	lcfg.MaxConns = cfg.MaxConns
 	return &Server{
 		cfg:        cfg,
 		store:      store,
@@ -150,7 +151,10 @@ func (s *Server) acceptLoop(ln *transport.Listener) {
 		sess := newSession(s)
 		conn, err := ln.Accept(sess, sess)
 		if err != nil {
-			return // listener closed (ctx cancel or Drain)
+			// Terminal by contract: transport.Accept retries transient accept
+			// errors (EMFILE/ECONNABORTED-class) internally, so reaching here
+			// means the listener closed (ctx cancel or Drain).
+			return
 		}
 		// track reports false if Drain has already started; this conn is
 		// invisible to Drain's snapshot (its loops are ALREADY running and

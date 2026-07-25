@@ -1,6 +1,7 @@
 name: fuzz
 
-# Cost: long fuzz + model-soak are dispatch-only while the repo is private (heavy Actions minutes); run before a release/demo.
+# Long fuzz + model-soak are heavy (hours-long) jobs and run on manual
+# dispatch only; run them before a release/demo.
 on:
   workflow_dispatch: {}
 
@@ -59,7 +60,7 @@ jobs:
           echo "fuzz target ${{ matrix.func }} crashed — see the filed issue" >&2
           exit 1
 
-  # The weekly deep run of the I1–I5 model-based harness: 20000 checks ×
+  # The deep run of the I1–I5 model-based harness: 20000 checks ×
   # up to 500 steps ≈ well past the 10^6-op gate, under -race + kvbdebug.
   # A failure shrinks to a seed under testdata/rapid/ (uploaded + issue).
   model-soak:

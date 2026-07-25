@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render both headline charts FROM COMMITTED JSONL ALONE (methodology rule
-12 / SPEC-4 §11): a stranger with the results file regenerates the README
-images, no rig access needed.
+12, bench/METHODOLOGY.md): a stranger with the results file regenerates the
+README images, no rig access needed.
 
   Chart 1  throughput bars vs the field, iperf3 ceiling drawn in, %-of-
            ceiling + cores annotated, two panels (0.44 / 2.5 MiB).
@@ -63,9 +63,9 @@ def chart1(recs, out):
     # median of runs. Two panels by blob size.
     panels = [(462848, "0.44 MiB block"), (2621440, "2.5 MiB block")]
     fig, axes = plt.subplots(1, 2, figsize=(13, 6), sharey=False)
-    max_runs = 0
+    all_nruns = []  # every bar's run count, across both panels
     for ax, (blob, title) in zip(axes, panels):
-        labels, goodputs, ratios, cores, nruns = [], [], [], [], []
+        labels, goodputs, ratios, cores, nruns, streams = [], [], [], [], [], []
         ceiling = 0.0
         for store, disp in CHART1_ORDER:
             cell = [
@@ -87,12 +87,21 @@ def chart1(recs, out):
             labels.append(disp)
             goodputs.append(gp)
             nruns.append(len(same))
+            streams.append(best.get("cell", {}).get("streams", 0))
             # ONLY annotate %-of-ceiling when a real measured ceiling exists —
-            # never fabricate one by dividing by 1 (the ladder's fabricated-
-            # annotation MED). ratio is None → no "% ceil" text.
+            # never fabricate one by dividing by 1 (an earlier review caught a
+            # fabricated annotation here). ratio is None → no "% ceil" text.
             c = best.get("ceiling_gbytes_s", 0) or 0
             ratios.append((gp / c) if c > 0 else None)
-            cores.append(best.get("cpu", {}).get("client_cores", 0))
+            # CPU: daemon cores and client cores are different claims — label
+            # whichever this record actually has, never one as the other.
+            cpu = best.get("cpu", {}) or {}
+            if cpu.get("daemon_cores"):
+                cores.append((cpu["daemon_cores"], "daemon"))
+            elif cpu.get("client_cores"):
+                cores.append((cpu["client_cores"], "client"))
+            else:
+                cores.append((0, ""))
             ceiling = max(ceiling, c)
 
         y = range(len(labels))
@@ -102,15 +111,20 @@ def chart1(recs, out):
         ax.invert_yaxis()
         ax.set_xlabel("GB/s (payload-only, decimal)")
         ax.set_title(title)
-        for i, (gp, ra, co, nr) in enumerate(zip(goodputs, ratios, cores, nruns)):
+        # Bars may sit at different best-stream points and run counts, so
+        # each bar carries its own streams and n — a single figure-wide
+        # number would overstate the thin bars.
+        for i, (gp, ra, co, nr, st) in enumerate(zip(goodputs, ratios, cores, nruns, streams)):
             note = f"{gp:.1f} GB/s"
             if ra is not None:
                 note += f"  ({ra * 100:.0f}% ceil)"
-            if co:
-                note += f"  {co:.2f} cores"
-            if nr < 3:
-                note += f"  [n={nr}]"  # honest: fewer than the median-of-3 rule
-            max_runs = max(max_runs, nr)
+            cval, cwho = co
+            if cval:
+                note += f"  {cval:.2f} {cwho} cores"
+            if st:
+                note += f"  {st}str"
+            note += f"  [n={nr}]"
+            all_nruns.append(nr)
             ax.text(gp, i, "  " + note, va="center", fontsize=8)
         # Stores in CHART1_ORDER with no data are absent by omission; note it
         # so "missing" never reads as "benchmarked at zero".
@@ -123,8 +137,14 @@ def chart1(recs, out):
             ax.axvline(ceiling, color="crimson", linestyle="--")
             ax.text(ceiling, len(labels) - 0.5, f" iperf3 ceiling {ceiling:.1f} GB/s",
                     color="crimson", fontsize=8, rotation=90, va="bottom")
-    runs_label = f"median of {max_runs}" if max_runs >= 3 else f"n={max_runs} run(s) — below the median-of-3 rule"
-    fig.suptitle(f"Throughput vs the field — same wire, same ops (GET-only, batch 32, warmed, {runs_label})\n"
+    # The title quotes the WORST-covered bar (min runs), never the best; when
+    # coverage differs per bar the exact n is on each bar.
+    lo, hi = (min(all_nruns), max(all_nruns)) if all_nruns else (0, 0)
+    runs_label = f"median of {lo}" if lo == hi else f"median per bar, n={lo}–{hi} (per-bar n shown)"
+    if lo < 3:
+        runs_label += " — below the median-of-3 rule"
+    fig.suptitle(f"Throughput vs the field — same wire, same ops (GET-only, batch 32, warmed, {runs_label};\n"
+                 "best streams per store, shown per bar as Nstr)  "
                  "Repro: bench/rigs/aws-transport/run-chart1.sh — ~$12 of spot", fontsize=11)
     fig.tight_layout()
     fig.savefig(out, dpi=140)
@@ -183,7 +203,8 @@ def chart2(recs, out):
                     "recompute wins here —\ndon't deploy a remote\ncache for this workload",
                     ha="center", va="top", fontsize=9, color="crimson")
 
-    # Conditions box read FROM the JSONL (the ladder caught this hardcoded):
+    # Conditions box read FROM the JSONL (was once hardcoded — a review
+    # caught it; never hardcode conditions):
     # the GPU harness stamps gpu/model/vllm/lmcache/tc_link into each record.
     cond = {}
     for r in recs:

@@ -39,7 +39,7 @@ The native vLLM integration — no LMCache in the loop. Config JSON for both
 altitudes is in `python/vllm_kvblockd/src/vllm_kvblockd/__init__.py`; the
 pinned upstream contract (and the SPEC-vs-merged-code delta for tier
 loading) is in `python/vllm_kvblockd/UPSTREAM.lock`. Keys are a BLAKE3 chain
-seeded by the config fingerprint + the request's `cache_salt` (C-14) —
+seeded by the config fingerprint + the request's `cache_salt` —
 golden-pinned in `python/vllm_kvblockd/tests/golden/vllm_fingerprint.json`.
 Cross-instance sharing requires `PYTHONHASHSEED=0` on every process; the
 adapter refuses to start unpinned and the error names the fix.

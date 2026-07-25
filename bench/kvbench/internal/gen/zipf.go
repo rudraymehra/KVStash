@@ -61,8 +61,8 @@ func (z *Zipfian) Draw(u float64) uint64 {
 	v := uint64(float64(z.n) * math.Pow(z.eta*u-z.eta+1.0, z.alpha)) //nolint:gosec // G115: clamped to [0,n) below
 	if v >= z.n {
 		// Float edge (u→1⁻, pow rounding to 1.0) can hit exactly n — clamp
-		// so callers never index one past the pool (the ladder's false-miss
-		// edge). Standard YCSB impls clamp here too.
+		// so callers never index one past the pool (a false-miss edge case
+		// caught in review). Standard YCSB impls clamp here too.
 		v = z.n - 1
 	}
 	return v

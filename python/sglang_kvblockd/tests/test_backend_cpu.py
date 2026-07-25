@@ -1,9 +1,10 @@
 """KvblockdHiCacheStorage CPU unit suite — fake host pools (upstream
 get_page_buffer_meta contract, ported verbatim for page_first) + a real
 kvblockd daemon subprocess. NO sglang, NO GPU: torch CPU tensors stand in
-for the pinned L2 pool, exactly the W5 fake-MemoryObj pattern.
+for the pinned L2 pool, the same fake-MemoryObj pattern as the LMCache
+connector suite.
 
-Covers the four week-12 contract points:
+Covers the four core contract points:
   (a) batch_exists returns the CONSECUTIVE-from-index-0 logical count
   (b) batch_get_v1 round-trips byte-exact into host_indices-addressed slots
   (c) 128-key batch_exists (STORAGE_BATCH_SIZE) answers <1ms p99 on loopback

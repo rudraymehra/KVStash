@@ -8,9 +8,9 @@ description: >-
 type: application
 version: 0.1.0
 appVersion: "0.5.0"
-home: https://github.com/kvstash/kvblockd
+home: https://github.com/rudraymehra/KVStash
 sources:
-  - https://github.com/kvstash/kvblockd
+  - https://github.com/rudraymehra/KVStash
 keywords:
   - kv-cache
   - llm

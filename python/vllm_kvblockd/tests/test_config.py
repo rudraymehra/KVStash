@@ -1,4 +1,4 @@
-"""Key-derivation suite. The golden file pins the exact bytes (C-14):
+"""Key-derivation suite. The golden file pins the exact bytes:
 changing them orphans every stored block, so a diff here is a migration,
 never a refactor. One vector is ALSO recomputed from first principles
 (raw blake3 calls) so the goldens can't just be parroting config.py."""
@@ -98,8 +98,9 @@ def test_first_principles_recompute():
 
 
 def test_cache_salt_diverges_whole_chain():
-    """C-14: same tokens, different salts -> EVERY key differs (isolation is
-    structural — there is no block index at which salted chains re-converge)."""
+    """cache_salt isolation: same tokens, different salts -> EVERY key differs
+    (isolation is structural — there is no block index at which salted chains
+    re-converge)."""
     fp = fingerprint({"m": "x"})
     toks = list(range(64))
     plain = block_chain_keys(chain_seed(fp, None, []), toks, 16)

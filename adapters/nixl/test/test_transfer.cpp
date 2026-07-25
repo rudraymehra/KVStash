@@ -1,7 +1,7 @@
-// test_transfer.cpp — the Week-11 gate: 32 × 2.5 MB write -> read -> verify ->
+// test_transfer.cpp — the transfer gate: 32 × 2.5 MB write -> read -> verify ->
 // abort against a REAL kvblockd daemon that this harness builds/spawns itself
-// (the W5/W12 conftest pattern: temp config, fresh ports, /healthz wait,
-// SIGTERM teardown).
+// (same harness pattern as the Python adapter suites: temp config, fresh
+// ports, /healthz wait, SIGTERM teardown).
 //
 // Two flavors from one file:
 //   * core (always built): drives the shared C++ client core (kvb::Pool +
@@ -100,8 +100,8 @@ void fill_block(uint8_t *dst, size_t len, uint64_t seed_input) {
 }
 
 Key make_key(const char *tag, size_t i) {
-    // Test keys are opaque 32-byte values (the server never inspects them —
-    // T3); derive them from xxh3 so runs are deterministic.
+    // Test keys are opaque 32-byte values (the server never inspects them);
+    // derive them from xxh3 so runs are deterministic.
     Key k;
     for (size_t w = 0; w < 4; w++) {
         std::string s = std::string(tag) + "/" + std::to_string(i) + "/" + std::to_string(w);

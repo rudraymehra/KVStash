@@ -328,10 +328,14 @@ func DecodeGetRespHeader(body []byte) (GetRespHeader, error) {
 		}
 		return GetRespHeader{Preamble: p}, nil
 	}
-	want := GetRespHeaderSize(int(p.Count))
-	if len(body) < want {
+	// Count is peer-controlled: size the header region in uint64 so
+	// DescSize*Count can never wrap the int math on a 32-bit build and slip a
+	// short body past this check into a Desc(i) panic.
+	want64 := uint64(GetRespHeaderSize(0)) + DescSize*uint64(p.Count) //nolint:gosec // G115: GetRespHeaderSize(0) is the constant 16
+	if uint64(len(body)) < want64 {
 		return GetRespHeader{}, ErrBodyLength
 	}
+	want := int(want64) //nolint:gosec // G115: fits int — want64 <= len(body), checked above
 	return GetRespHeader{
 		Preamble:   p,
 		FirstIndex: binary.LittleEndian.Uint32(body[PreambleSize:]),
@@ -390,19 +394,47 @@ func IntersectFeatures(client, server uint64) uint64 {
 // carries only the client's max_batch_keys and max_frame_len proposals
 // (blob/credit are server-dictated); a client value of 0 means "no opinion".
 // Callers guarantee the server side already satisfies the §4 floors
-// (config.Validate's job). MaxBlobLen is clamped under the negotiated frame
-// MINUS the single-descriptor GET response header: otherwise a blob equal to
-// the frame cap could be stored (chunked PUT, each chunk ≤ frame) whose every
-// GET response frame — payload plus the 32-byte header region — would exceed
-// max_frame_len and be rejected as over-cap by a conformant client parser.
+// (config.Validate's job).
+//
+// Nonzero client proposals are honored down to — never below — the §4 floors:
+// a sub-floor proposal clamps UP to the floor rather than rejecting the HELLO
+// (the floors are what a server MUST accept, so every conformant client can
+// live with them; a buggy client asking for less gets a connection that still
+// works). This keeps the invariants below true for EVERY uint32 proposal,
+// including 0, 1..31 (which would otherwise wrap frame-headroom), 32 (which
+// would otherwise negotiate blob=0 — a session that can never store a block),
+// and MaxUint32.
+//
+// MaxBlobLen is clamped under the negotiated frame MINUS the single-descriptor
+// GET response header: otherwise a blob equal to the frame cap could be stored
+// (chunked PUT, each chunk ≤ frame) whose every GET response frame — payload
+// plus the 32-byte header region — would exceed max_frame_len and be rejected
+// as over-cap by a conformant client parser.
+//
+// Post-conditions, for every input: MaxBlobLen <= MaxFrameLen - headroom,
+// MaxFrameLen >= FloorMaxFrameLen, MaxBatchKeys >= FloorMaxBatchKeys, and
+// MaxBlobLen > 0 (the 16 MiB frame floor keeps frame-headroom above the
+// 4 MiB blob floor, so a blob=0 session cannot be negotiated).
 func NegotiateLimits(server Limits, clientBatchKeys, clientFrameLen uint32) Limits {
 	l := server
-	if clientBatchKeys != 0 && clientBatchKeys < l.MaxBatchKeys {
-		l.MaxBatchKeys = clientBatchKeys
+	if clientBatchKeys != 0 {
+		if clientBatchKeys < FloorMaxBatchKeys {
+			clientBatchKeys = FloorMaxBatchKeys
+		}
+		if clientBatchKeys < l.MaxBatchKeys {
+			l.MaxBatchKeys = clientBatchKeys
+		}
 	}
-	if clientFrameLen != 0 && clientFrameLen < l.MaxFrameLen {
-		l.MaxFrameLen = clientFrameLen
+	if clientFrameLen != 0 {
+		if clientFrameLen < FloorMaxFrameLen {
+			clientFrameLen = FloorMaxFrameLen
+		}
+		if clientFrameLen < l.MaxFrameLen {
+			l.MaxFrameLen = clientFrameLen
+		}
 	}
+	// No underflow: l.MaxFrameLen >= FloorMaxFrameLen (16 MiB) > headroom (32),
+	// by the floor clamp above plus the caller's server-side floor guarantee.
 	if headroom := uint32(GetRespHeaderSize(1)); l.MaxBlobLen > l.MaxFrameLen-headroom { //nolint:gosec // G115: constant 32
 		l.MaxBlobLen = l.MaxFrameLen - headroom
 	}

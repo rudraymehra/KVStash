@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -222,6 +223,101 @@ func TestPutChecksumRejected(t *testing.T) {
 	assertInvisible(t, nc, k)
 }
 
+// TestHelloVersionRange: a HELLO whose [proto_min, proto_max] range excludes
+// v1 is answered ERR_UNSUPPORTED with F_FATAL and the connection closes
+// (PROTOCOL.md §3.1); a range containing v1 negotiates normally.
+func TestHelloVersionRange(t *testing.T) {
+	addr, cleanup := startServer(t)
+	defer cleanup()
+	cases := []struct {
+		min, max uint8
+		want     protocol.Status
+	}{
+		{2, 3, protocol.StatusErrUnsupported}, // future-only client
+		{0, 0, protocol.StatusErrUnsupported}, // pre-v1 only
+		{2, 1, protocol.StatusErrUnsupported}, // inverted range contains nothing
+		{0, 5, protocol.StatusOK},             // wide range containing v1
+		{1, 1, protocol.StatusOK},             // exactly v1
+	}
+	for _, tc := range cases {
+		nc, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := protocol.AppendHelloReq(nil, protocol.HelloReq{
+			ProtoMin: tc.min, ProtoMax: tc.max, Token: []byte(testToken), Namespace: "tenant-a",
+		})
+		writeRaw(t, nc, protocol.OpHello, 0, [32]byte{}, 1, body)
+
+		_ = nc.SetReadDeadline(time.Now().Add(3 * time.Second))
+		hb := make([]byte, protocol.HeaderSize)
+		if _, err := io.ReadFull(nc, hb); err != nil {
+			t.Fatalf("[%d,%d] read response header: %v", tc.min, tc.max, err)
+		}
+		h, err := protocol.ParseHeader(hb, protocol.DefaultMaxFrameLen)
+		if err != nil {
+			t.Fatalf("[%d,%d] parse response header: %v", tc.min, tc.max, err)
+		}
+		rb := make([]byte, h.PayloadLen)
+		if _, err := io.ReadFull(nc, rb); err != nil {
+			t.Fatalf("[%d,%d] read response body: %v", tc.min, tc.max, err)
+		}
+		if st := protocol.Status(rb[0]); st != tc.want {
+			t.Fatalf("[%d,%d] status = %s, want %s", tc.min, tc.max, st, tc.want)
+		}
+		if tc.want == protocol.StatusErrUnsupported {
+			if h.Opcode != protocol.OpHello || h.Flags&protocol.FlagFatal == 0 {
+				t.Fatalf("[%d,%d] want a HELLO response with F_FATAL, got %+v", tc.min, tc.max, h)
+			}
+			// The server closes after the fatal response.
+			if _, err := nc.Read(hb); !errors.Is(err, io.EOF) {
+				t.Fatalf("[%d,%d] connection still open after fatal HELLO: %v", tc.min, tc.max, err)
+			}
+		}
+		_ = nc.Close()
+	}
+}
+
+// TestMaxConnsWired: config max_conns reaches the transport accept cap — the
+// documented cheap DoS floor actually refuses connection #cap+1 while the
+// established connection keeps serving.
+func TestMaxConnsWired(t *testing.T) {
+	cfg := config.Default()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.StreamTimeoutMS = 5000
+	cfg.MaxConns = 1
+	srv := server.New(cfg, ramstub.New(), server.NewNamespaces("tenant-a", 7, testToken))
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer dcancel()
+		srv.Drain(dctx)
+	}()
+
+	c1 := dialClient(t, addr, 1) // occupies the only slot
+	defer c1.Close()
+
+	dctx, dcancel := context.WithTimeout(ctx, 3*time.Second)
+	defer dcancel()
+	if c2, err := client.Dial(dctx, addr, client.Options{
+		Streams: 1, Namespace: "tenant-a", Token: testToken,
+	}); err == nil {
+		c2.Close()
+		t.Fatal("second connection succeeded past max_conns=1")
+	}
+
+	// The refused dial must not have disturbed the live connection.
+	if _, _, err := c1.BatchExists(context.Background(), [][32]byte{key(1)}); err != nil {
+		t.Fatalf("live connection broken by the cap: %v", err)
+	}
+}
+
 // --- raw helpers for the low-level protocol tests ---
 
 func helloRaw(t *testing.T, nc net.Conn) {
@@ -278,7 +374,7 @@ func envBytes(name string, def int) int {
 }
 
 // BenchmarkBatchGet_32x1MB is the RAM-stub loopback throughput gate: 32×1 MiB
-// blocks per BATCH_GET. It sweeps the connection count the same way the Week-1
+// blocks per BATCH_GET. It sweeps the connection count the same way the
 // xferspike loopback sweep did (docs/notes/a1-log.md), because loopback
 // throughput is HIGHEST at few streams and declines as streams rise (kernel
 // memcpy saturates on ~2 cores; extra streams only add contention). The gate
@@ -330,7 +426,7 @@ func BenchmarkBatchGet_32x1MB(b *testing.B) {
 	// hot=false: 32 DISTINCT blocks per GET — real store traffic (source and
 	// destination are DRAM-cold; this is the honest production-shaped number).
 	// hot=true: ONE block fetched 32× — the server-side source stays
-	// cache-resident, which is what the Week-1 xferspike blast measured (it
+	// cache-resident, which is what the xferspike loopback blast measured (it
 	// resent a single buffer); this cell is the like-for-like wire-path
 	// comparison against the a1-log table.
 	for _, hot := range []bool{false, true} {

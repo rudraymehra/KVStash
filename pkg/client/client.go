@@ -1,8 +1,8 @@
 // Package client is the reference Go client for kvblockd: dial + HELLO, a small
-// connection pool, and the batch verbs. This week's subset is deliberately
+// connection pool, and the batch verbs. The design is deliberately
 // synchronous per connection (one in-flight request each) — pipelined
-// out-of-order demux and rendezvous hashing across nodes arrive in later
-// weeks. Concurrency comes from the pool: N connections serve N callers.
+// out-of-order demux and rendezvous hashing across nodes are possible
+// extensions. Concurrency comes from the pool: N connections serve N callers.
 package client
 
 import (
@@ -103,7 +103,7 @@ func (c *Client) Close() {
 func (c *Client) Limits() protocol.Limits { return c.limits }
 
 // get borrows a connection; a borrowed connection is used by exactly one caller
-// at a time (synchronous request/response for now).
+// at a time (synchronous request/response by design).
 func (c *Client) get(ctx context.Context) (*conn, error) {
 	select {
 	case cn := <-c.pool:
@@ -124,7 +124,7 @@ func (c *Client) get(ctx context.Context) (*conn, error) {
 // protocol-level *StatusError which leaves the stream in sync) re-pools the
 // connection; any framing/I/O error means the connection is desynchronized, so
 // it is closed and a fresh one dialed to replace it — a poisoned connection is
-// never handed to the next caller (the pool-desync bug the review found).
+// never handed to the next caller (re-pooling one was a real desync bug).
 func (c *Client) release(cn *conn, err error) {
 	clean := err == nil
 	if !clean {
@@ -251,8 +251,8 @@ func (cn *conn) writeFrame(op protocol.Opcode, flags uint16, key [32]byte, reqID
 }
 
 // nextHeader reads the next response frame header, transparently skipping any
-// unsolicited NOP/CREDIT frames the server interleaves (§8 rule 4). This week
-// the client does not track its own send window (its requests are tiny and the
+// unsolicited NOP/CREDIT frames the server interleaves (§8 rule 4). The
+// client does not track its own send window (its requests are tiny and the
 // server window is large), so a credit grant is simply consumed and ignored —
 // but the frame on the wire MUST be skipped or every subsequent read desyncs.
 func (cn *conn) nextHeader() (protocol.Header, error) {

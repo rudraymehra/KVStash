@@ -416,7 +416,7 @@ func (s *Set) Serve(ctx context.Context, addr string) (bound string, wait func()
 }
 
 // ---------------------------------------------------------------------------
-// Per-tenant quota series (Week-9 tenancy).
+// Per-tenant quota series (multi-tenancy).
 
 var (
 	descTenantBytes = prometheus.NewDesc("kvb_tenant_bytes",

@@ -344,8 +344,8 @@ func (t *Tiered) reclaimSegment(vol *nvme.Volume, from uint32) (reclaimOutcome, 
 	for i := range entries {
 		k := dram.Key{NS: entries[i].NS, Hash: entries[i].Key}
 		// PinFlags is guarded by the shard lock (its own documented rule —
-		// the ladder caught this pre-gate reading it bare, a data race with
-		// PinOp's locked writes). The pre-gate stays advisory; the per-entry
+		// reading it bare here would be a data race with PinOp's locked
+		// writes). The pre-gate stays advisory; the per-entry
 		// deleteIf gate below re-checks authoritatively under the same lock.
 		protected := false
 		t.idx.withShardLock(k, func(e *nvmeRef) {

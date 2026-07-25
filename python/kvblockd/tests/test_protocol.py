@@ -127,7 +127,7 @@ def test_keylist_roundtrip():
 
 def test_embedded_fallbacks_are_valid():
     # The wheel/sdist safety net: with the repo hex files absent, _EMBEDDED
-    # must still parse. SSE found 2 of 3 hand-transcribed wrong; this test
+    # must still parse. Hand-transcribed hex has been wrong before; this test
     # (which never touches the repo files) is the tripwire.
     for name, want in [
         ("example-a-request", 0x5F2EA7FF),
@@ -140,8 +140,8 @@ def test_embedded_fallbacks_are_valid():
 
 
 def test_status_enum_matches_wire():
-    # The codes are wire law (ops.go §9). Spot-check the ones the ladder found
-    # wrong, and that to_status never raises on an unknown byte.
+    # The codes are wire law (ops.go §9). Spot-check the values most easily
+    # mistranscribed, and that to_status never raises on an unknown byte.
     assert p.Status.EVICTED == 0x11
     assert p.Status.ERR_AUTH_REQUIRED == 0x20 and p.Status.ERR_AUTH_FAILED == 0x21
     assert p.Status.ERR_NAMESPACE_UNKNOWN == 0x22 and p.Status.ERR_FORBIDDEN == 0x23

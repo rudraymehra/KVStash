@@ -22,7 +22,7 @@ func openIO(path string, forWrite bool, direct bool) (int, error) {
 	}
 	if direct {
 		// Best-effort: darwin's F_NOCACHE. If it fails, keep going — this
-		// platform is only the dev smoke test, never the A3 gate.
+		// platform is only the dev smoke test, never the device gate.
 		_, _ = unix.FcntlInt(uintptr(fd), unix.F_NOCACHE, 1)
 	}
 	return fd, nil
@@ -36,8 +36,8 @@ func pwriteFull(fd int, buf []byte, off int64) (int, error) {
 	return unix.Pwrite(fd, buf, off)
 }
 
-// runUring: io_uring is Linux-only. The A3 gate runs on Linux; on the dev box
-// only the threadpool backend is available.
+// runUring: io_uring is Linux-only. The device gate runs on Linux; on the dev
+// box only the threadpool backend is available.
 func runUring(probeConfig, int, int64) (int64, int64, int64, error) {
 	return 0, 0, 0, errors.New("uring backend is linux-only; use --backend=threadpool on this platform")
 }

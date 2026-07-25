@@ -33,15 +33,15 @@ Data integrity confirmed every cell: server received-bytes == client sent-bytes 
 3. **64-stream loopback hits macOS ENOBUFS** (kernel loopback send-buffer exhaustion). This is a well-known macOS-loopback limitation, not an xferspike defect and not expected on the Linux 50 GbE gate rig. See finding below.
 4. **Bigger frames ≠ faster on loopback** (16 MB slower than 1 MB): again a memory-bandwidth/latency artifact of loopback; on a real link, larger frames amortize syscall cost and help. Re-measure on the cloud pair.
 
-## Rig findings to address (batched with the review-ladder verdict)
+## Rig findings to address (batched with the review verdict)
 
-- **F-a1-1 (resilience):** a single client stream's write error (e.g. transient ENOBUFS) returns from `runClient` and prints NO result line — losing the data from all other working streams. A measurement rig should tolerate a stream dropping and still report aggregate over survivors, and/or treat transient ENOBUFS as retry-with-backoff rather than fatal. (Confirm/priority via the ladder.)
+- **F-a1-1 (resilience):** a single client stream's write error (e.g. transient ENOBUFS) returns from `runClient` and prints NO result line — losing the data from all other working streams. A measurement rig should tolerate a stream dropping and still report aggregate over survivors, and/or treat transient ENOBUFS as retry-with-backoff rather than fatal. (Confirm/priority via review.)
 - **F-a1-2 (harness):** rapid sequential runs on loopback pile up TIME_WAIT sockets → ephemeral-port pressure. The sweep script needs `ulimit -n` raised + spacing between cells (already applied in the re-run). The real cloud rig uses long-lived connections on fresh instances, so this is a local-harness concern only.
 
 ## Next
 - Next: run `bench/rigs/aws-transport/` on 2× c6in.8xlarge, measure iperf3 ceiling first, grade ≥85% of it. That is the A1 verdict of record.
 
-## Review-ladder outcome (2026-07-15, 8-agent full ladder + CTO gate)
+## Review outcome (2026-07-15)
 
 Verdict: FIX-FIRST → all applied. GB/s measurement verified HONEST (no path inflates it; client==server bytes on happy path).
 

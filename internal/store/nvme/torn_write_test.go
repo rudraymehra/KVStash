@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// The torn-write matrix (SPEC-3 §2): every corruption shape recovery must
+// The torn-write matrix: every corruption shape recovery must
 // survive without ever surfacing a corrupt block. Each case builds a real
 // volume, crashes it, damages bytes with raw buffered writes, reopens, and
 // asserts exactly what survived.

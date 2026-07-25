@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Rig N tier session (Week-6 gates, i7i.8xlarge): the DAEMON-level NVMe
-# numbers, quoted against fio-ceiling.sh's device ceiling (run that FIRST —
-# it is the honest denominator).
+# Rig N tier session (i7i.8xlarge): the DAEMON-level NVMe numbers, quoted
+# against fio-ceiling.sh's device ceiling (run that FIRST — it is the honest
+# denominator).
 #
 #   T1  NVMe-resident BATCH_GET storm through the full daemon:
 #       per-device (one volume) and both-device aggregate GB/s.
-#       Quote %-of-fio-ceiling; ≥95% = software-not-the-bottleneck (the A1
-#       discipline). A3-as-written (≥6.0 GB/s/device) is expected to read
-#       FAIL on any AWS instance-store device — record honestly, A3 OPEN.
+#       Quote %-of-fio-ceiling; ≥95% = software-not-the-bottleneck (the same
+#       discipline as the transport rig). The pre-registered absolute NVMe
+#       line (≥6.0 GB/s/device) is expected to read FAIL on any AWS
+#       instance-store device — record honestly and keep that question open.
 #   T2  50-loop kill -9 torture on real NVMe (zero corrupt, zero phantom).
 #   T3  warm restart: ~20 GB resident fill → SIGKILL → restart → recovery
 #       seconds + seconds-per-GB + hits-survive storm.
@@ -116,6 +117,6 @@ S '/tmp/torture -loops 50 -dir /mnt/nvme0/tort -bin /tmp/kvblockd' | tee -a "$OU
 note ""
 note "== verdict inputs =="
 note "fio ceiling: see fio-ceiling.sh output (run separately, same box)."
-note "A3-as-written (>=6.0 GB/s/device): compare T1a GB/s; expected FAIL on AWS hardware — record %-of-ceiling and keep A3 OPEN."
+note "Absolute NVMe line as-written (>=6.0 GB/s/device): compare T1a GB/s; expected FAIL on AWS hardware — record %-of-ceiling and keep the question open."
 note "Zero-corruption gate: T2 must print '0 corrupt reads, 0 phantom keys' over 50 cycles."
 echo "[tier] done — results in $OUT. RECORD THE DEMO (asciinema bench/e2e/kill9_demo.sh on this box) ONLY after all three read green, then teardown.sh."

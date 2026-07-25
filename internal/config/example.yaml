@@ -21,7 +21,7 @@ stream_timeout_ms: 30000      # PUT_STREAM inactivity reaper; floor 5000 (§5)
 lease_default_ms: 5000        # read lease auto-granted by BATCH_GET
 lease_max_ms: 60000           # LEASE grants clamp here
 
-namespaces_path: ""           # namespaces/tokens YAML (required once auth lands)
+namespaces_path: ""           # namespaces/tokens YAML; "" = EMPTY registry — every HELLO is refused until namespaces are added (file or admin API)
 
 # Per-connection socket buffer requests. 16 MiB saturated 50 GbE on the
 # benchmark rig; untuned hosts silently clamp (the daemon logs effective sizes).
@@ -36,7 +36,7 @@ dram_hugepages: false         # Linux MAP_HUGETLB (needs vm.nr_hugepages); off =
 pinned_bytes_cap: 134217728   # 128 MiB pinned per namespace (§3.6 ERR_PIN_QUOTA); 0 = unlimited
 
 # Eviction (memory pressure; PROTOCOL.md §6 ladder is always honored).
-eviction_policy: "s3fifo"     # s3fifo | sampled-lru | none (none = Week-3 hard wall)
+eviction_policy: "s3fifo"     # s3fifo | sampled-lru | none (none = hard wall: a full arena refuses writes with ERR_QUOTA_BYTES)
 eviction_watermark_pct: 95    # trigger an eviction batch at 95% arena occupancy
 eviction_batch_pct: 5         # each batch frees down to 90% (95 - 5)
 eviction_ghost_entries: 0     # per-tenant S3-FIFO ghost cap; 0 = auto (arena-derived)

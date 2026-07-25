@@ -5,7 +5,7 @@
 // server's Store surface plus the GetRef (zero-copy release) and lifecycle
 // extensions.
 //
-// Load-bearing rules (A2 verdict; go-learning-track gotchas #3/#8):
+// Load-bearing rules:
 //
 //   - Arena bytes cross API boundaries ONLY as (offset, len) + refcount.
 //     They are never stored in heap structures and never round-tripped

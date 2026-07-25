@@ -1,7 +1,7 @@
 """Guarded SGLang imports.
 
 The backend must IMPORT (and instantiate) with no sglang installed — the
-A6-style CI tripwire and the pip-install-from-clean-venv check both rely on
+CI import check and the pip-install-from-clean-venv check both rely on
 it. Only the ABC is taken from sglang when present; everything else is
 duck-typed. When sglang is absent we substitute a minimal base class with
 the same non-abstract helpers the real ABC provides.
@@ -14,7 +14,7 @@ import logging
 logger = logging.getLogger("sglang_kvblockd")
 
 try:  # broad on purpose: a broken sglang install must not break OUR import;
-    # the CI tripwire's --require-sglang leg is what distinguishes the cases.
+    # the CI import check's --require-sglang leg is what distinguishes the cases.
     from sglang.srt.mem_cache.hicache_storage import (  # type: ignore
         STORAGE_BATCH_SIZE,
         HiCacheStorage,

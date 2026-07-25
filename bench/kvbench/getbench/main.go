@@ -2,7 +2,7 @@
 // once, then drives GETs for -secs across -streams pooled connections and
 // prints GB/s. Running the daemon and the load in separate processes removes
 // the shared-scheduler artifact of the in-package benchmark and matches the
-// production shape (docs/DESIGN.md "Week 2 wire-path results").
+// production shape (see the wire-path results in docs/DESIGN.md).
 package main
 
 import (

@@ -331,8 +331,8 @@ func TestStoreModel(t *testing.T) {
 		}
 		// ghostOrFatal resolves a store observation of a key the model thinks
 		// absent: legal ONLY as post-crash resurrection of a deleted key
-		// (NVMe DELETE is not crash-durable — recovery may replay it; the
-		// ladder's confirmed model/store divergence). Returns the
+		// (NVMe DELETE is not crash-durable — recovery may replay it; a
+		// confirmed model/store divergence). Returns the
 		// materialized block, or fails the run.
 		ghostOrFatal := func(k eviction.Key, what string) *mBlock {
 			if !m.resurrectable(k) {
@@ -478,7 +478,7 @@ func TestStoreModel(t *testing.T) {
 				}
 				// Presence proven at this instant: an un-marked block that
 				// later vanishes without pressure is a store bug (the
-				// sticky-maybeGone hole the review closed). A resurrected
+				// sticky-maybeGone hole, since closed). A resurrected
 				// ghost keeps anyOf until bytes pin it down.
 				e.maybeGone = false
 			},

@@ -14,7 +14,7 @@ import (
 
 // cmdReport aggregates JSONL results and runs the executable acceptance
 // gates: --check-repeat enforces "open-loop p99 repeatable within 2% across
-// two identical runs" (SPEC-4 §11), and the default mode prints a compact
+// two identical runs" (bench/METHODOLOGY.md rule 7), and the default mode prints a compact
 // CSV the eye (and plot.py) can scan.
 func cmdReport(_ context.Context, args []string) error {
 	fs := flag.NewFlagSet("report", flag.ExitOnError)

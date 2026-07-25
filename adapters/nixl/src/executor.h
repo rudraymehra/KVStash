@@ -3,7 +3,7 @@
 // Modeled on the obj plugin's async-executor shape: a submission queue fed by
 // postXfer and drained by worker threads; completion is tracked by the request
 // state itself (atomic counters), not by the executor — so submit() NEVER
-// blocks (SPEC 5 §3.1 hard contract: postXfer must never block) and checkXfer
+// blocks (hard contract: postXfer must never block) and checkXfer
 // is a lock-free poll.
 
 #ifndef KVBLOCKD_EXECUTOR_H

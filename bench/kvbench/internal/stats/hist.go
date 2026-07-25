@@ -36,7 +36,7 @@ var opNames = [opCount]string{"get", "put", "exists", "lag"}
 
 func (o Op) String() string { return opNames[o] }
 
-// Histogram bounds: 1µs .. 60s at 3 significant figures (SPEC-4's
+// Histogram bounds: 1µs .. 60s at 3 significant figures (the harness's
 // hdrhistogram.New(1_000, 60_000_000_000, 3), values in nanoseconds).
 const (
 	histMinNs = 1_000

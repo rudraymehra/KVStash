@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# vLLM NATIVE adapter CPU e2e — the Week-10 gate recipe, pattern-matched to
-# the Week-5 LMCache leg (bench/e2e/cpu/* + .github/workflows/e2e-cpu.yml):
+# vLLM NATIVE adapter CPU e2e — pattern-matched to the LMCache leg
+# (bench/e2e/cpu/* + .github/workflows/e2e-cpu.yml):
 #
 #   build kvblockd -> start daemon (DRAM-only) -> vllm serve opt-125m on the
 #   CPU backend with KvblockdConnector -> verify.py (same 640-token prompt

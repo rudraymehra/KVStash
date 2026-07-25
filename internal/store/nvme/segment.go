@@ -58,7 +58,7 @@ func recordSpan(payloadLen uint32) uint64 {
 // MinSegmentBytes is the smallest legal segment size for a given payload
 // cap: one max-size record plus the seal footer (entry-table chunk +
 // trailer chunk). Config validation and OpenVolume both use THIS — the
-// review ladder caught the two computing slightly different minima.
+// two used to compute slightly different minima, a fixed bug.
 func MinSegmentBytes(maxBlobLen uint32) int64 {
 	return int64(recordSpan(maxBlobLen)) + 2*recordAlign + trailerSize //nolint:gosec // G115: span < 4 GiB
 }

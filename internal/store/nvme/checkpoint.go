@@ -49,8 +49,8 @@ func ckptPath(dir string, seq uint64) string {
 // present segment ≤ it, believing this file holds ALL their entries. So a
 // dying segment (mid-retire — excluded from the snapshot, but the retire
 // may still ABORT and leave it live) must CAP maxSealed below itself, or a
-// crash after an aborted retire silently loses the whole segment (ladder
-// blocker B1b, reproduced). If that cap would cover nothing, skip this
+// crash after an aborted retire silently loses the whole segment (a
+// reproduced data-loss bug). If that cap would cover nothing, skip this
 // checkpoint round entirely — footer scans stay authoritative.
 func (v *Volume) writeCheckpoint() error {
 	v.mu.RLock()
@@ -170,7 +170,7 @@ func loadNewestCkpt(dir string, warn func(msg string, args ...any)) (entries []c
 
 // ckptMaxBytes bounds the checkpoint read — the ONE parse of disk bytes
 // that would otherwise allocate before any validation (a hostile multi-GB
-// .kvbi would OOM the daemon at startup; ladder finding). 512 MiB covers
+// .kvbi would OOM the daemon at startup). 512 MiB covers
 // ~9.6M entries — far beyond any real volume's block count.
 const ckptMaxBytes = 512 << 20
 

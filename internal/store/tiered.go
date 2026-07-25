@@ -22,7 +22,7 @@ type Params struct {
 	AdmitMinHits       uint32 // blocks with fewer than this many lifetime GETs are DELETED at the demote watermark, not written to NVMe. 0 = admit everything; the operator-facing default (1) is applied by the config layer, never here
 	// PromoteWindow: a 2nd NVMe hit within this window promotes the block
 	// back to DRAM. ≤0 = promotion DISABLED — zero genuinely means never
-	// (the ladder caught withDefaults silently turning 0 into a minute;
+	// (withDefaults used to silently turn 0 into a minute, a fixed bug;
 	// callers wanting the default pass it explicitly, as config does).
 	PromoteWindow  time.Duration
 	Interval       time.Duration // demote/reclaim poll cadence (default 100ms)
@@ -174,7 +174,7 @@ type restoreReq struct {
 
 // promoteMinGap: a frame-boundary re-fetch (the transport re-GETs a block
 // that didn't fit the frame) arrives within microseconds and must not count
-// as a second touch (ladder finding) — 2nd-hit triggers on BOTH tiers
+// as a second touch — 2nd-hit triggers on BOTH tiers
 // require a minimum gap between qualifying hits.
 const promoteMinGap = int64(10 * time.Millisecond)
 
@@ -439,8 +439,8 @@ func (t *Tiered) GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, 
 
 	now := t.now()
 	// The §3.3 auto-lease + the promotion probe run under the shard lock so
-	// they ORDER against the reclaim gate's shard-locked lease read (the
-	// ladder's lease-vs-reclaim HIGH): the lease either lands before the
+	// they ORDER against the reclaim gate's shard-locked lease read (a
+	// lease racing reclaim was a real bug): the lease either lands before the
 	// gate (segment skipped) or the entry is already removed (nil — no
 	// promise minted). The bytes in flight are safe either way via the
 	// segment read-hold.
@@ -471,7 +471,7 @@ func (t *Tiered) GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, 
 // ERR_IMMUTABLE_CONFLICT exactly like a DRAM-resident one.
 //
 // The pre-check and d.Put span two lock domains, so a demotion's publish
-// can slip between them (the ladder's write-once TOCTOU HIGH): the NVMe
+// can slip between them (a write-once TOCTOU): the NVMe
 // index was empty at the check, the dram entry moved to NVMe during d.Put,
 // and a conflicting insert would be acked OK with the OLD bytes surviving
 // on flash. The post-insert re-check closes it: on divergence the fresh
@@ -583,7 +583,7 @@ func (t *Tiered) TouchLease(ns uint32, key [32]byte, sub uint8, ttlMS uint32) pr
 	// All NVMe lifecycle mutations run under the shard lock: they must
 	// ORDER against the reclaim gate, and an entry the gate just removed
 	// answers NOT_FOUND instead of minting a protection promise on a
-	// dangling ref (the ladder's lease-vs-reclaim HIGH).
+	// dangling ref (the lease-vs-reclaim race).
 	now := t.now()
 	st := protocol.StatusNotFound
 	t.idx.withShardLock(dram.Key{NS: ns, Hash: key}, func(e *nvmeRef) {
@@ -703,8 +703,8 @@ func (t *Tiered) Stats() []byte {
 		"admit_refusals_total": t.admitRefusals.Load(),
 		"promotions_total":     t.promotions.Load(),
 		// reclaims_total comes from the volume merge below — the tiered
-		// counter counted the SAME events and silently shadowed it (ladder
-		// finding); t.reclaims stays for internal assertions only.
+		// counter counted the SAME events and silently shadowed it (a
+		// fixed bug); t.reclaims stays for internal assertions only.
 		"reclaim_skips_total":   t.reclaimSkips.Load(),
 		"read_busy_total":       t.readBusy.Load(),
 		"checksum_errors_total": t.checksumErrs.Load(),

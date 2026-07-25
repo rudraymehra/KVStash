@@ -1,8 +1,8 @@
-# LMCache HEAD verification — Week-5 Day-1 gate
+# LMCache HEAD verification — adapter precondition gate
 
 Verified against `github.com/LMCache/LMCache@dev` and PyPI on 2026-07-17.
 This is the precondition for the adapter: if the plugin surface or the
-chunk-hash derivation moved, the day re-plans. Both held.
+chunk-hash derivation moved, the adapter plan changes. Both held.
 
 ## Versions (pinned)
 

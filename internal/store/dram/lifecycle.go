@@ -18,8 +18,8 @@ import (
 // flags mutate only under the index shard lock (Index.WithShardLock).
 
 // lifecycle owns the lease/pin/TTL rules plus the per-namespace pinned-bytes
-// accounting (the Week-3 slice of tenancy: the cap check and ERR_PIN_QUOTA
-// exist now; the full quota machinery is a later week).
+// accounting (the cap check and ERR_PIN_QUOTA; the per-tier byte quotas live
+// in the tenant accountant the store tiers charge, not here).
 type lifecycle struct {
 	leaseDefaultMS uint32
 	leaseMaxMS     uint32

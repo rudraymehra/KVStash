@@ -243,8 +243,8 @@ func (c *Client) Put(ctx context.Context, key [32]byte, data []byte) (err error)
 		return &StatusError{Op: protocol.OpPutStream, Status: bp.Status}
 	}
 
-	// One CHUNK for the whole block for now (striping is a later refinement);
-	// keep each chunk within the negotiated frame cap.
+	// One CHUNK carries the whole block (striping across chunks is a possible
+	// refinement); keep each chunk within the negotiated frame cap.
 	chunk := c.limits.MaxFrameLen
 	for off := 0; off < len(data); off += int(chunk) {
 		end := off + int(chunk)
@@ -274,8 +274,8 @@ func (c *Client) Put(ctx context.Context, key [32]byte, data []byte) (err error)
 	return nil
 }
 
-// Delete removes keys (§3.7). force sets F_FORCE (evict even leased/pinned —
-// lease/pin gating arrives with the tiers). Returns the per-key statuses.
+// Delete removes keys (§3.7). force sets F_FORCE (delete even leased/pinned
+// blocks; without it the lifecycle gate refuses). Returns the per-key statuses.
 func (c *Client) Delete(ctx context.Context, keys [][32]byte, force bool) (perKey []protocol.Status, err error) {
 	if uint32(len(keys)) > c.limits.MaxBatchKeys { //nolint:gosec // G115: len vs u32 cap
 		return nil, fmt.Errorf("client: %d keys exceeds negotiated max_batch_keys %d", len(keys), c.limits.MaxBatchKeys)

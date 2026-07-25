@@ -6,12 +6,12 @@ import "testing"
 
 // Release builds: a STALE Free (slot recycled by a later Alloc) and a
 // failed-Alloc sentinel Free are silent no-ops — the generation check rejects
-// them without touching live memory (the ABA a ladder review confirmed as a
-// HIGH before the generation counter existed).
+// them without touching live memory (a real ABA hazard before the
+// generation counter existed).
 // TestStaleFreeRejected pins the generation check: Alloc(A) → Free(A) →
 // Alloc(B) recycles A's slot, so a STALE Free(A) must be rejected instead of
 // silently freeing the live B (the ABA the C++ original does not defend
-// against; a confirmed HIGH here before the generation counter).
+// against; a confirmed hazard here before the generation counter).
 func TestStaleFreeRejected(t *testing.T) {
 	a := NewAllocator(binExactCapacity(1 << 20))
 	alA, ok := a.Alloc(4 << 10)

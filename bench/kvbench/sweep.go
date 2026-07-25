@@ -319,8 +319,8 @@ func cpuSnap(p stats.DaemonProbe) (self, daemon float64, source string, rss int6
 	return self, daemon, source, rss
 }
 
-// emitArgs bundles one run's measured outputs (kills the old 18-positional
-// emit signature the ladder flagged).
+// emitArgs bundles one run's measured outputs (kills an old 18-positional
+// emit signature flagged in review).
 type emitArgs struct {
 	kind, store, mode  string
 	cell               gen.Cell
@@ -365,8 +365,8 @@ func emit(w *stats.Writer, a emitArgs) error {
 		rec.RatioVsCeiling = rec.GoodputGBytesS / a.cfg.ceiling
 	}
 	// CPU deltas span the WHOLE run (warmup + measured window), so divide by
-	// the whole run's wall time, not just the measured window — the ladder
-	// caught cores being overstated ~warmup/duration. Warmup runs the same
+	// the whole run's wall time, not just the measured window — an earlier
+	// bug overstated cores by ~warmup/duration. Warmup runs the same
 	// load, so total-cpu / total-time is the honest per-second rate.
 	totalS := a.cfg.warmup.Seconds() + a.measuredS
 	rec.CPU = stats.CPUSample{

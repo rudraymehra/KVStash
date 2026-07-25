@@ -8,7 +8,7 @@ import "golang.org/x/sys/unix"
 // rounded up to the 2 MiB hugepage size and MAP_HUGETLB is attempted first;
 // ANY failure (no hugepage pool, ENOMEM, EINVAL) falls back to a normal
 // mapping at the unrounded size — mirroring cmd/xferspike/arena_linux.go, the
-// A2-proven shape.
+// shape the off-heap soak proved out (docs/notes/a2-log.md).
 func mmapRegion(bytes int64, huge bool) (region []byte, gotHuge bool, err error) {
 	const prot = unix.PROT_READ | unix.PROT_WRITE
 	if huge {

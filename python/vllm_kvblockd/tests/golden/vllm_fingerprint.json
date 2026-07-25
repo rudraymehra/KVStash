@@ -1,6 +1,6 @@
 {
   "scheme": "kvblockd-vllm-v2",
-  "note": "Pins the vLLM-native adapter key derivation (C-14 + LoRA identity): fingerprint = blake3('kvblockd-vllm-fp-v1\\x00' + sorted u32-LE-length-prefixed k,v); seed = blake3('kvblockd-vllm-chain-v2\\x00' + fp + lp(cache_salt) + lp(lora_name) + one lp per mm id — ids are prefixed INDIVIDUALLY, a joined encoding is not injective); key_i = blake3(domain + key_{i-1} + block tokens as u32-LE), key_-1 = seed. tier wire key = blake3('kvblockd-vllm-tier-v1\\x00' + fp + lp(offload_key)) with kv_cache_groups folded into the tier fingerprint. chain-v2 replaced chain-v1 (seed layout changed); v1 blocks are pure misses under v2, never cross-hits. Regenerating these bytes orphans every stored block - do not edit casually.",
+  "note": "Pins the vLLM-native adapter key derivation (cache_salt isolation + LoRA identity): fingerprint = blake3('kvblockd-vllm-fp-v1\\x00' + sorted u32-LE-length-prefixed k,v); seed = blake3('kvblockd-vllm-chain-v2\\x00' + fp + lp(cache_salt) + lp(lora_name) + one lp per mm id — ids are prefixed INDIVIDUALLY, a joined encoding is not injective); key_i = blake3(domain + key_{i-1} + block tokens as u32-LE), key_-1 = seed. tier wire key = blake3('kvblockd-vllm-tier-v1\\x00' + fp + lp(offload_key)) with kv_cache_groups folded into the tier fingerprint. chain-v2 replaced chain-v1 (seed layout changed); v1 blocks are pure misses under v2, never cross-hits. Regenerating these bytes orphans every stored block - do not edit casually.",
   "vectors": [
     {
       "fingerprint_fields": {

@@ -1,8 +1,8 @@
 package transport
 
-// BufferSource lends payload buffers to the read loop; the store implements
-// it (the RAM stub this week, the arena tiers later) so PUT bytes land
-// directly in store-owned memory instead of transient heap.
+// BufferSource lends payload buffers to the read loop; the frame handler's
+// owner implements it (the server lends a recycled per-connection extent) so
+// steady-state PUT traffic reuses one buffer instead of allocating per frame.
 //
 // Ownership protocol (load-bearing): the read loop Lends a buffer and hands
 // it to the FrameHandler with the frame → the handler owns it → whoever
@@ -21,8 +21,9 @@ type BufferSource interface {
 }
 
 // HeapSource is the trivial BufferSource: plain heap allocations. It exists
-// for tests and for the pre-store bring-up; real deployments lend from the
-// store's pools/arenas.
+// for tests and standalone transport use; the server's session lends a
+// recycled buffer instead (see internal/server), so per-frame allocation
+// never sits on the hot PUT path.
 type HeapSource struct{}
 
 // Lend allocates a fresh buffer.

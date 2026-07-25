@@ -26,15 +26,15 @@ Every method here runs in the SCHEDULER process and must be non-blocking:
 
 Key identity: vLLM's OffloadKey = raw chain-hash bytes + 4-byte big-endian
 KV-cache-group index. vLLM's chain hash already folds the request's
-cache_salt (first-block extra keys) — C-14 at this altitude is satisfied
-upstream; we bind the OffloadKey to OUR config identity with
+cache_salt (first-block extra keys) — salt isolation at this altitude is
+satisfied upstream; we bind the OffloadKey to OUR config identity with
 BLAKE3(fingerprint || offload_key) (config.tier_wire_key), where the
 fingerprint mirrors FileMapper's config.json fields (parallel-agnostic).
 Cross-instance sharing therefore requires PYTHONHASHSEED pinned identically
 everywhere — enforced loudly at construction.
 
-GPU end-to-end validation is DEFERRED (no GPU budget this week) — see
-python/vllm_kvblockd/DEFER.md for the exact revisit trigger. The unit suite
+GPU end-to-end validation is DEFERRED — see python/vllm_kvblockd/DEFER.md
+for the exact revisit trigger. The unit suite
 (tests/test_tier_manager.py) drives this class against a synthetic
 memoryview + hand-built JobMetadata, byte-for-byte.
 """

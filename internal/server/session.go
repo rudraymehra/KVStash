@@ -80,8 +80,9 @@ const maxLendReuse = 2 << 20
 // Lend / Return implement transport.BufferSource. Every HandleFrame path
 // consumes (Returns) its body synchronously on the connection's one read
 // goroutine before the transport reads the next frame, so at most one lent
-// buffer is live at a time. The DRAM tier will replace this with arena extents
-// so PUT bytes land off-heap.
+// buffer is live at a time — which is what makes one recycled extent per
+// connection safe. Staged PUT bytes move into store-owned (arena) memory at
+// COMMIT via store.Put; the lend buffer itself never outlives a frame.
 func (s *session) Lend(n int) []byte {
 	if n > maxLendReuse {
 		return make([]byte, n) // oversize: transient, GC-reclaimed after Return

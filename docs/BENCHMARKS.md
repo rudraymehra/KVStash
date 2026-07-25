@@ -65,7 +65,7 @@ below, 12.67 GB/s), the same client-bound redis-py bar implies ~14× — the
 multiple is a property of the link. A full-matrix 100 GbE re-run is the
 certification path for the ≥10× headline.
 
-Prior measured transport ceilings (Weeks 1–6, this rig family):
+Prior measured transport ceilings (this rig family):
 
 - 100 GbE (c7gn pair): kvblockd GET **12.67 GB/s ≈ 102% of the iperf3
   ceiling, verify ON** — the 10+ GB/s target, measured.

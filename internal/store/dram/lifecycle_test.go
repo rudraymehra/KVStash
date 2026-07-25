@@ -246,7 +246,7 @@ func TestPinQuotaPerNamespaceOverride(t *testing.T) {
 // TestCanEvictLadder pins the evictor pre-filter in its REAL context: a
 // block resident in the index (Refcount==1, exactly the index's own ref).
 // The idle case is the load-bearing row — an idle, unleased, unpinned
-// resident block MUST be evictable, else the Week-4 evictor finds nothing.
+// resident block MUST be evictable, else the evictor finds nothing.
 func TestCanEvictLadder(t *testing.T) {
 	nowFn, clk := testClock(msToNanos(1_000_000))
 	l := newLifecycle(5000, 60000, 0, nil, nowFn)

@@ -98,7 +98,7 @@ func Run(ctx context.Context, t target.Target, rd *kvops.Reader, clk loadgen.Clo
 			// SCHEDULED-time accounting (Tene rule): in Timed mode the
 			// reference instant is the record's SCHEDULED time, not actual
 			// dispatch. A record's replayed latency = completion − scheduled,
-			// so a stalled store shows its queue wait — the ladder caught the
+			// so a stalled store shows its queue wait — review caught the
 			// old code starting the clock AFTER SleepUntil, hiding exactly
 			// that (the coordinated-omission error loadgen.RunOpen prevents).
 			// A replay record is one request (EXISTS→GET→PUT chain); its

@@ -113,7 +113,7 @@ streams=16 batch=32x1024KiB pool=20480 (20480MiB): 10.58 GB/s (635.0 GB in 60s)
 
 == verdict inputs ==
 fio ceiling: see fio-ceiling.sh output (run separately, same box).
-A3-as-written (>=6.0 GB/s/device): compare T1a GB/s; expected FAIL on AWS hardware — record %-of-ceiling and keep A3 OPEN.
+Absolute NVMe line as-written (>=6.0 GB/s/device): compare T1a GB/s; expected FAIL on AWS hardware — record %-of-ceiling and keep the question open.
 Zero-corruption gate: T2 must print '0 corrupt reads, 0 phantom keys' over 50 cycles.
 
 fio read ceiling (file-level, bs=1m qd32): 4480 MB/s per device

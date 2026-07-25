@@ -1,16 +1,16 @@
 """KvblockdHiCacheStorage — SGLang HiCacheStorage (v1 interface) backed by
 kvblockd. Interface pinned against sglang v0.5.15.post1 (tag code-read
-2026-07-20); CPU-validated only — the GPU e2e verdict is DEFER, see
+2026-07-20); CPU-validated only — GPU end-to-end validation is deferred, see
 docs/design/sglang-hicache-v1.1.md.
 
-Three contracts dominate the design (they are the W5 LMCache connector's,
+Three contracts dominate the design (they are the LMCache connector's,
 transplanted to a synchronous surface):
 
   NEVER RAISE on the data path. SGLang's HiCacheController threads treat a
   raised exception as fatal; a False/0/None is just a cache miss. Every
   public v1/generic method is wrapped so any failure degrades to a miss,
   logged at most once per interval. (The v2 stubs are the deliberate
-  exception — they raise NotImplementedError by ruling, see below.)
+  exception — they raise NotImplementedError by design, see below.)
 
   ZERO-COPY GET into the pinned L2 host pool. register_mem_pool_host maps
   the whole pool tensor once (ctypes over data_ptr, Mooncake-style whole-
@@ -26,8 +26,8 @@ transplanted to a synchronous surface):
   namespace miss instead of silently corrupting each other (see keymap.py).
 
 v2 (PoolTransfer / CacheControllerV2) is stubbed: the upstream surface is
-still churning (sgl-project/sglang#18239) and the week-12 ruling is to not
-build against it until it stabilizes in a tagged release.
+still churning (sgl-project/sglang#18239), so the v2 methods are deliberately
+unimplemented until that interface stabilizes in a tagged release.
 """
 
 from __future__ import annotations
@@ -51,8 +51,8 @@ logger = logging.getLogger("sglang_kvblockd")
 _V2_MSG = (
     "kvblockd does not implement the HiCache v2 controller interface "
     "(PoolTransfer/CacheControllerV2): upstream is still churning it — see "
-    "https://github.com/sgl-project/sglang/issues/18239. Pre-registered "
-    "week-12 ruling: do not build against v2 until it stabilizes in a "
+    "https://github.com/sgl-project/sglang/issues/18239. v2 support is "
+    "deliberately deferred until the interface stabilizes in a "
     "tagged SGLang release; run this backend with extra-config "
     '{"interface_v1": 1}.'
 )
@@ -66,7 +66,7 @@ def _torch():  # lazy so the package imports (and instantiates) without torch
 
 class _RateLimitedLog:
     """One full traceback per key on first sight, then one terse line per
-    interval. Per-instance state (mirrors the W5 connector)."""
+    interval. Per-instance state (mirrors the LMCache connector)."""
 
     def __init__(self, interval: float = 10.0):
         self._interval = interval
@@ -593,7 +593,7 @@ class KvblockdHiCacheStorage(HiCacheStorage):
     # -------------------------------------------------------------- v2 stubs
     # register_mem_host_pool_v2 (a registration hook, not a data path) keeps
     # the inherited store-only behavior so speculative-decode init doesn't
-    # explode; the three v2 DATA methods raise by ruling.
+    # explode; the three v2 DATA methods raise by design (see _V2_MSG).
     def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
         raise NotImplementedError(_V2_MSG)
 

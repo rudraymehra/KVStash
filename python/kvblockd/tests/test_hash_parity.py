@@ -1,7 +1,7 @@
 """Hash parity: the committed golden vectors must round-trip through
-kvblockd.hashing.wire_key (this file), and — when real lmcache is present —
-the chunk-hash chain feeding CacheEngineKey.chunk_hash regenerates the same
-vectors. CI runs the golden leg lmcache-free; the live leg is importorskip.
+kvblockd.hashing.wire_key. The same golden file is the oracle for the Go
+client (pkg/client/hashchain_test.go), so a mismatch here means the two
+implementations have drifted apart.
 """
 
 from __future__ import annotations
@@ -48,15 +48,3 @@ def test_determinism_check_passes_when_pinned():
     startup_determinism_check()  # must not raise
 
 
-@pytest.mark.skipif(
-    __import__("importlib.util", fromlist=["find_spec"]).find_spec("lmcache") is None,
-    reason="lmcache not installed (golden leg covers CI)",
-)
-def test_chunk_hash_parity_live():
-    # With real lmcache: derive chunk hashes via LMCache's own
-    # ChunkedTokenDatabase, build a CacheEngineKey, and assert our wire_key
-    # over its fields matches what we'd compute — proving we consume
-    # LMCache's chunk_hash faithfully. (Regenerates goldens when run with
-    # KVB_REGEN=1.) The exact LMCache API is pinned Day-1; this test is the
-    # drift tripwire.
-    pytest.skip("live chunk-hash parity wired at connector integration time")

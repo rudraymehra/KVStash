@@ -44,7 +44,7 @@ func FillPayload(dst []byte, seed uint64, key [32]byte) {
 
 // VerifyPayloadLen is VerifyPayload with an EXPECTED length: a short read
 // (a torn block returning fewer bytes than the cell's blob size) is
-// corruption, even if every returned byte matches. The ladder caught the
+// corruption, even if every returned byte matches. Review caught the
 // bare VerifyPayload passing a 4 KiB prefix of a 462 KiB blob.
 func VerifyPayloadLen(got []byte, want int, seed uint64, key [32]byte) bool {
 	if len(got) != want {

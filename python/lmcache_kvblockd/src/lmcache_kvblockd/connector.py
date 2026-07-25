@@ -338,7 +338,6 @@ class KvblockdRemoteConnector:
         except Exception as e:
             self._log.maybe("get", "kvblockd get failed (treated as miss)", e)
             return []
-        return await self._run(_do, list)
 
     async def batched_get(self, keys):
         return await self.batched_get_non_blocking("", keys)

@@ -59,7 +59,7 @@ def read_kvops(path):
 
 def fill_bytes(n):
     # Deterministic incompressible-ish payload of EXACTLY n bytes — the same
-    # byte count every other bar moves (the ladder caught an oversized tile
+    # byte count every other bar moves (review caught an oversized tile
     # that made redis move +4096 B/key and mis-measured goodput).
     tile = bytes((i * 2654435761) & 0xFF for i in range(4096))
     reps = n // 4096 + 1

@@ -288,7 +288,7 @@ def test_manager_shutdown_never_strands_jobs():
 
 
 def test_rfc_shaped_config_kwargs_accepted(daemon):
-    """SPEC-5-§2.4-shaped tier dicts carry module_path/class_name; the merged
+    """RFC-era tier dicts carry module_path/class_name; the merged
     factory forwards them as kwargs — they must not crash the constructor."""
     view, _ = fake_view()
     mgr = make_manager(

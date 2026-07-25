@@ -2,7 +2,7 @@
 # kvblockd installer: detect OS/arch, fetch the latest release tarball,
 # install kvblockd + kvbctl into /usr/local/bin (or $KVB_INSTALL_DIR).
 #
-#   curl -fsSL https://raw.githubusercontent.com/kvstash/kvblockd/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/rudraymehra/KVStash/main/scripts/install.sh | sh
 #
 # Options via env:
 #   KVB_VERSION      pin a version (default: latest release; prereleases need
@@ -12,7 +12,7 @@
 #   KVB_TARBALL      install from a local tarball instead of downloading
 set -eu
 
-REPO="kvstash/kvblockd"
+REPO="rudraymehra/KVStash"
 INSTALL_DIR="${KVB_INSTALL_DIR:-/usr/local/bin}"
 CONF_DIR="${KVB_CONFIG_DIR:-/usr/local/etc/kvblockd}"
 

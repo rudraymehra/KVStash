@@ -420,9 +420,9 @@ func TestWireLayoutGolden(t *testing.T) {
 }
 
 // TestLimitsFlagsFeatureBitsMatchSpec pins every remaining wire-visible
-// constant to PROTOCOL.md §2/§3.4-3.6/§4/§10 — the mutation run showed these
-// were the only unpinned constants left (a typo'd limit would silently change
-// negotiation behavior against conforming peers).
+// constant to PROTOCOL.md §2/§3.4-3.6/§4/§10 — these were the last unpinned
+// constants (a typo'd limit would silently change negotiation behavior against
+// conforming peers).
 func TestLimitsFlagsFeatureBitsMatchSpec(t *testing.T) {
 	pins := []struct {
 		name string

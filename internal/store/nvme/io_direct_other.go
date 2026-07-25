@@ -26,7 +26,7 @@ func (directBackend) Open(path string, forWrite bool) (File, error) {
 	if forWrite {
 		flags = unix.O_RDWR | unix.O_CREAT
 	}
-	fd, err := unix.Open(path, flags, 0o600) // tenant KV-cache payloads: never world-readable (ladder finding)
+	fd, err := unix.Open(path, flags, 0o600) // tenant KV-cache payloads: never world-readable
 	if err != nil {
 		return nil, fmt.Errorf("nvme: open %s: %w", path, err)
 	}

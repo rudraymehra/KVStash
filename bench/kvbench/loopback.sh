@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# loopback.sh — the SPEC-4 §11 acceptance gate, one command, no cloud.
+# loopback.sh — the harness acceptance gate, one command, no cloud.
 #
 # Builds the daemon + kvbench, then exercises every correctness property the
 # harness must have BEFORE it's ever pointed at a rig:

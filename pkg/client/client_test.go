@@ -89,8 +89,8 @@ func (fs *fakeServer) addr() string { return fs.ln.Addr().String() }
 func (fs *fakeServer) close()       { _ = fs.ln.Close() }
 
 // TestGetNonOKReturnsPromptly: a preamble-only error reply to BATCH_GET must
-// surface as a *StatusError without reading ahead — the read-ahead deadlock
-// the review found (the client used to block waiting for descriptors that an
+// surface as a *StatusError without reading ahead — pins a fixed read-ahead
+// deadlock (the client used to block waiting for descriptors that an
 // error response never carries).
 func TestGetNonOKReturnsPromptly(t *testing.T) {
 	fs := newFakeServer(t, func(c net.Conn, h protocol.Header, _ []byte) bool {
@@ -158,8 +158,8 @@ func TestVerifyCatchesCorruption(t *testing.T) {
 }
 
 // TestPoolHealsAfterDesync: a framing error must evict the poisoned connection
-// and redial, so the NEXT call on the same pool works — the pool-desync bug
-// the review found (three reviewers, convergent).
+// and redial, so the NEXT call on the same pool works — pins the fixed
+// pool-desync bug (see Client.release).
 func TestPoolHealsAfterDesync(t *testing.T) {
 	poisoned := false
 	fs := newFakeServer(t, func(c net.Conn, h protocol.Header, _ []byte) bool {

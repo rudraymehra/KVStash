@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# STATUS: NOT RUN — teardown twin of runpod_up.sh (budget rule: every rig has
+# STATUS: NOT RUN — teardown twin of runpod_up.sh (rig rule: every rig has
 # a written teardown step; verify $0 residue after every session).
 # =============================================================================
 set -euo pipefail
@@ -18,6 +18,5 @@ cat <<'EOF'
   runpodctl remove pod <POD_ID>           # STOPPED pods still bill storage
   runpodctl get pod                       # MUST print no pods
 [down] then check the RunPod billing page: balance delta this session only,
-[down] zero running/stopped pods, zero network volumes = $0 residue. Log the
-[down] session cost in the week file's budget table.
+[down] zero running/stopped pods, zero network volumes = $0 residue.
 EOF

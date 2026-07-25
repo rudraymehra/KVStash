@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# STATUS: NOT RUN — wk-12 SGLang spike DEFERRED before any GPU session
-# (no GPU budget this sprint; docs/design/sglang-hicache-v1.1.md). The exact
-# launch flags below were code-read against sglang v0.5.15.post1, not
-# executed. Log every failure VERBATIM into NOTES.md.
+# STATUS: NOT RUN — SGLang HiCache spike deferred until a GPU session is
+# available (docs/design/sglang-hicache-v1.1.md). The exact launch flags
+# below were code-read against sglang v0.5.15.post1, not executed. Log every
+# failure VERBATIM into NOTES.md.
 # =============================================================================
 # Drive the multi-turn benchmark against an SGLang server whose HiCache L3 is
 # kvblockd (dynamic storage backend, zero-copy v1 interface).
 #
-# Success criteria (week-12 Day-3):
+# Success criteria (pre-registered before the first session):
 #   1. kvblockd /metrics shows PUTs during round 1, GETs (hits) on round 2+
 #   2. get_stats() prefetch/backup rates nonzero (scheduler logs)
 #   3. multi-turn outputs token-identical vs the no-L3 baseline run

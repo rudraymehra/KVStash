@@ -63,7 +63,7 @@ func TestExistsLatencyUnderGetLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := dram.New(arena, dram.Params{LeaseDefaultMS: 5000, LeaseMaxMS: 60000})
-	// Week-4 form of the gate: the p99 must hold UNDER LIVE EVICTION — the
+	// Strict form of the gate: the p99 must hold UNDER LIVE EVICTION — the
 	// policy is attached, the watermark goroutine runs, and a churn lane
 	// (below) keeps the arena above the watermark for the whole window.
 	pol, err := eviction.New("s3fifo", 8192)

@@ -1,6 +1,6 @@
 // Command kvblockd is the single-binary KV-cache block store daemon: config →
-// arena-backed DRAM tier (→ log-structured NVMe tier when nvme_paths is set)
-// → server. The S3 tier stacks underneath later.
+// arena-backed DRAM tier (→ log-structured NVMe tier when nvme_paths is set,
+// → async S3 cold tier when s3_bucket is set) → server.
 package main
 
 import (

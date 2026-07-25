@@ -1,14 +1,14 @@
 """KvblockdConnector — vLLM-native KVConnectorBase_V1 backed by kvblockd.
 
 CHURN-WATCH: KVConnectorBase_V1 is explicitly unstable (vLLM RFC #38260
-tracking); pinned per-minor, CI matrix vs last 4 releases (gate A6).
+tracking); pinned per-minor, CI matrix vs the last 4 releases.
 Re-verify the base.py diff before every vLLM bump.
 
 Version assumptions (verified against vendored sources, see UPSTREAM.lock):
   - Written against vLLM v0.25.0 (tag 702f4814fe54fabff350d43cb753ae3e47c0c276),
     modeled on its ExampleConnector (ex-SharedStorageConnector).
   - Constructor is the 3-arg form (vllm_config, role, kv_cache_config) —
-    identical across the A6 window v0.22.1..v0.25.x, and MANDATORY at v0.25
+    identical across the tested window v0.22.1..v0.25.x, and MANDATORY at v0.25
     (the factory rejects 2-arg external connectors).
   - v0.25's factory refuses connectors without SupportsHMA unless
     --disable-hybrid-kv-cache-manager is set. v0.1 does not implement
@@ -23,7 +23,7 @@ all layers) = ONE kvblockd blob. Keys are a BLAKE3 chain over raw token ids,
 seeded by (config fingerprint, cache_salt, LoRA adapter name, mm identifiers)
 — see config.py. The chain gives the prefix property BATCH_EXISTS's
 consecutive-prefix count was built for, and folding cache_salt into the seed
-is correction C-14.
+makes per-request isolation structural.
 
 NEVER RAISE on the serving path: every failure degrades to a cache miss
 (LMCache #2204 posture). The only boot-time exception is DeterminismError —
@@ -45,7 +45,7 @@ from .config import AdapterConfig, block_chain_keys, chain_seed, require_pinned_
 
 logger = logging.getLogger("vllm_kvblockd")
 
-try:  # vLLM absent (unit tests, A6 lmcache cells) -> importable fallback.
+try:  # vLLM absent (unit tests, CI cells without vllm) -> importable fallback.
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # type: ignore
         KVConnectorBase_V1 as _Base,
     )
@@ -81,7 +81,7 @@ except Exception:  # pragma: no cover - exercised by the no-vllm test env
             return None, None
 
 
-def _torch():  # lazy so the A6 import check can load us without torch
+def _torch():  # lazy so the CI import check can load us without torch
     import torch
 
     return torch
@@ -139,7 +139,7 @@ def decode_blob_prefix(prefix: bytes) -> tuple[str, int, int, int, int]:
 
 class _RateLimitedLog:
     """One full traceback per key on first sight, then one terse line per
-    interval (per-instance — mirrors the W5 connector's discipline)."""
+    interval (per-instance — mirrors the LMCache connector's discipline)."""
 
     def __init__(self, interval=10.0):
         self._interval = interval
@@ -173,7 +173,7 @@ class KvbReqMeta:
 
     req_id: str
     token_ids: list[int]        # aligned prefix only (multiples of block_size)
-    cache_salt: str | None      # C-14: folded into the chain seed
+    cache_salt: str | None      # folded into the chain seed (salt isolation)
     mm_ids: list[str]
     lora_name: str              # "" = base model; folded into the chain seed
     block_ids: list[int]        # physical block ids, KV-cache group 0

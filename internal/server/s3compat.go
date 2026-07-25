@@ -2,7 +2,7 @@
 // (PutObject, GetObject with Range, HeadObject) on its OWN HTTP listener
 // (config s3compat_addr; "" = off, the default), so NIXL's `obj` storage
 // plugin and vLLM's `obj` tier reach kvblockd with ZERO plugin code via
-// endpoint_override (the week-11 / SPEC 5 zero-code path). It is a
+// endpoint_override. It is a
 // compatibility surface, not the performance path — the KVB1 data plane is;
 // every GET here copies block bytes to the heap before they touch net/http,
 // so no arena view ever escapes into an HTTP writer.
@@ -17,7 +17,7 @@
 // isolation is NOT_FOUND semantics (disjoint keyspaces), never a FORBIDDEN
 // that would leak that the key exists elsewhere.
 //
-// Why bearer tokens, not SigV4 (the C-11 verdict, a documented divergence):
+// Why bearer tokens, not SigV4 (a deliberate, documented divergence):
 //
 //   - kvblockd tenant auth is a static per-namespace secret compared in
 //     constant time; on the data plane it rides cleartext inside HELLO. An
@@ -27,7 +27,7 @@
 //     shared secret server-side PLUS canonical-request reconstruction and
 //     the HMAC derivation chain — strictly more code for zero added secrecy
 //     at this trust boundary.
-//   - What NIXL's obj backend needs (C-11): it is built on aws-sdk-cpp,
+//   - What NIXL's obj backend needs: it is built on aws-sdk-cpp,
 //     which ALWAYS SigV4-signs — no client mode emits a Bearer header. So
 //     this endpoint ALSO accepts a SigV4-shaped Authorization header and
 //     treats the access-key-id (the first segment of `Credential=`) as the
@@ -381,7 +381,7 @@ func (h *S3Compat) getCopy(ns uint32, key [32]byte) (data []byte, sum uint64, st
 }
 
 // tokenFromAuthorization extracts the tenant token from an Authorization
-// header, accepting BOTH shapes the header comment documents (C-11):
+// header, accepting BOTH shapes the header comment documents:
 //
 //	Bearer <token>                          — the native scheme
 //	AWS4-HMAC-SHA256 Credential=<token>/... — aws-sdk clients (NIXL obj)

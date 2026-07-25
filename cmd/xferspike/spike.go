@@ -20,7 +20,7 @@ import (
 
 // result is the single JSON line xferspike prints on exit. Units are explicit
 // in the field names: GBytesPerS is decimal gigaBYTES/s (bytes/1e9/s), so the
-// A1 "12 GB/s" target = 96 Gbit/s when compared against iperf3's Gbit/s.
+// "12 GB/s" target = 96 Gbit/s when compared against iperf3's Gbit/s.
 // CPUCoresSender counts ONLY this process (the client) — the server's CPU is
 // not included, so this is not a whole-system efficiency figure.
 type result struct {
@@ -235,7 +235,7 @@ func blast(ctx context.Context, cfg config, bytesTotal, frames *atomic.Int64) er
 
 	// A per-write deadline is the safety net: without it, a stalled or
 	// non-reading peer would block WriteTo forever, hanging the run past
-	// --duration and emitting no result (an invisible A1 failure). We set the
+	// --duration and emitting no result (an invisible failure). We set the
 	// deadline to the run's end so a blocked write unblocks exactly when the
 	// blast should stop.
 	deadline, hasDeadline := ctx.Deadline()

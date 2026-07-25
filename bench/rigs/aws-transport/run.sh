@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rig T: run xferspike server on B, client sweep on A over the private network.
-# The A1 verdict: xferspike GB/s vs the iperf3 ceiling (gate: >=85%).
+# The transport verdict: xferspike GB/s vs the iperf3 ceiling (gate: >=85%).
 set -euo pipefail
 STATE="$(dirname "$0")/.rig-state"; source "$STATE"
 SSH="ssh -i $HOME/.ssh/kvbench.pem -o StrictHostKeyChecking=accept-new ec2-user"

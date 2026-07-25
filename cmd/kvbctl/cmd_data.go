@@ -159,8 +159,8 @@ func cmdPut(args []string) int {
 	return 0
 }
 
-// cmdDelete removes blocks; -force sets F_FORCE (evict even leased/pinned
-// once the tiers enforce lifecycle). Prints one status line per key.
+// cmdDelete removes blocks; -force sets F_FORCE (delete even leased/pinned
+// blocks; without it the lifecycle gate refuses). Prints one status line per key.
 func cmdDelete(args []string) int {
 	var c common
 	var force bool

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A6-tripwire check: the adapter must IMPORT and INSTANTIATE against a stub
+"""Interface-drift tripwire: the adapter must IMPORT and INSTANTIATE against a stub
 context across every pinned vLLM/LMCache release — proving interface drift
 trips CI, not production. No daemon needed (the connector dials lazily).
 Exit 1 on any failure."""

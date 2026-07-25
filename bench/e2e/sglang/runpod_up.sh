@@ -1,31 +1,30 @@
 #!/usr/bin/env bash
 # =============================================================================
-# STATUS: NOT RUN — written for the wk-12 SGLang spike, DEFERRED before any
-# GPU session (no GPU budget this sprint; docs/design/sglang-hicache-v1.1.md).
+# STATUS: NOT RUN — written for the SGLang HiCache spike, deferred until a
+# GPU session is available (docs/design/sglang-hicache-v1.1.md).
 # Re-verify every pin in versions.env before the first real run.
 # =============================================================================
 # Provision the SGLang e2e box: RunPod RTX 4090 secure (~$0.69/hr), Linux
 # x86_64, CUDA 12.x image (runpod/pytorch:*). Run THIS SCRIPT ON THE POD
-# after the repo tree lands in ~/kvstash — the repo is PRIVATE, so that
-# means a deploy-key/token `git clone`, or rsync of the working tree from
-# the laptop. Everything (daemon included) is built from that tree; nothing
-# is fetched from GitHub releases.
+# after the repo tree lands in ~/kvstash (git clone, or rsync of the working
+# tree). Everything (daemon included) is built from that tree; nothing is
+# fetched from GitHub releases.
 #
 # Teardown is MANDATORY after every session: bench/e2e/sglang/runpod_down.sh
-# (budget rule: every rig has a written teardown step; verify $0 residue).
+# (rig rule: every rig has a written teardown step; verify $0 residue).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 source "$HERE/versions.env"
 
-ARENA_BYTES=$((4 * 1024 * 1024 * 1024)) # 4 GiB DRAM arena (week-12 Day-3 spec)
+ARENA_BYTES=$((4 * 1024 * 1024 * 1024)) # 4 GiB DRAM arena — fits the pod's RAM with headroom
 KVB_DIR="${KVB_DIR:-/opt/kvblockd}"
 KVB_PORT="${KVB_PORT:-9400}"
 KVB_METRICS_PORT="${KVB_METRICS_PORT:-9401}"
 KVB_TOKEN="${KVB_TOKEN:-sglang-e2e-token}"
 
-echo "[up] 1/5 build kvblockd from this tree (private repo — no release pull)"
+echo "[up] 1/5 build kvblockd from this tree (no release pull)"
 mkdir -p "$KVB_DIR"
 if ! command -v go >/dev/null 2>&1; then
   echo "[up]   installing go${GO_VERSION} (runpod/pytorch images ship none)"

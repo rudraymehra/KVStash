@@ -1,5 +1,5 @@
-# rig: 2x c6in.8xlarge (50 GbE)  measured: 2026-07-18T19:0xZ  (best value = the A1 denominator)
-# NOTE: the 100 GbE headline in bench/BENCHMARKS.md came from a DIFFERENT session (2x c7gn.8xlarge, ceiling 99.8 Gbit/s — see docs/notes/a1-log.md); this file always holds the CURRENT rig session.
+# rig: 2x c6in.8xlarge (50 GbE)  measured: 2026-07-18T19:0xZ  (best value = the transport-gate denominator)
+# NOTE: the 100 GbE headline in bench/BENCHMARKS.md came from a DIFFERENT session (2x c7gn.8xlarge, ceiling 99.8 Gbit/s); this file always holds the CURRENT rig session.
 == -P 8 ==
 49.5 Gbit/s
 == -P 16 ==

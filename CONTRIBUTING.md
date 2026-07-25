@@ -6,9 +6,9 @@ Pre-v0.1: external contributions are welcome as issues/discussions; PRs will mak
 
 All commits must be signed off (`git commit -s`), certifying you wrote the code or have the right to submit it under Apache-2.0 (https://developercertificate.org/).
 
-## The Merge Rule (project-internal)
+## Review policy
 
-No line merges — AI-written or otherwise — until the maintainer can explain it back cold. Every substantive PR carries a 5–10 line description written *before* reading any generated explanation. Review runs a staged pipeline (style → correctness → systems → spec/security → adversarial breakers → evidence gate); disagreements are settled by a failing test, never by seniority.
+Every substantive PR carries a 5–10 line description of what it changes and why. Review is staged (style → correctness → systems → spec/security → adversarial review → evidence gate); disagreements are settled by a failing test, never by seniority.
 
 ## The 10 Go gotchas this codebase will punish
 

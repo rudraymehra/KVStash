@@ -113,7 +113,7 @@ func TestCoordinatedOmissionSafety(t *testing.T) {
 	}
 }
 
-// TestOpenLoopThroughputCappedAtSaturation pins the ladder's confirmed
+// TestOpenLoopThroughputCappedAtSaturation pins a confirmed
 // throughput-inflation fix: an OVERLOADED cell must record FEWER events than
 // its offered rate implies (the workers hit the wall-clock cutoff and stop),
 // so achieved throughput stays below the offered rate — never above the
