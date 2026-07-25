@@ -137,9 +137,15 @@ class KvblockdRemoteConnector:
     # --- key mapping ---
     @staticmethod
     def _wire(key) -> bytes:
-        # CacheEngineKey field order: fmt, model_name, world_size, worker_id, chunk_hash.
-        return wire_key([str(key.fmt), str(key.model_name), str(key.world_size),
-                         str(key.worker_id), str(key.chunk_hash)])
+        # LMCache 0.5.x CacheEngineKey identity is (model_name, world_size,
+        # worker_id, chunk_hash, dtype, tags) — there is NO fmt field (older
+        # docs assumed one; reading key.fmt raised AttributeError on every
+        # real key, which the never-raise wrappers silently turned into a
+        # permanent miss). Serialize with LMCache's OWN canonical to_string()
+        # so our wire identity can never drift from theirs: it covers dtype
+        # and tags too, which a hand-rolled field list would have dropped
+        # (same-token different-dtype keys must not collide).
+        return wire_key([key.to_string()])
 
     # --- MemoryObj (de)serialization ---
     def _dtype_name(self, dtype) -> str:
@@ -350,12 +356,16 @@ class KvblockdRemoteConnector:
         return oks
 
 
-def make_connector(context) -> KvblockdRemoteConnector:
+def make_connector(context, url: str | None = None) -> KvblockdRemoteConnector:
     """Build a connector from a ConnectorContext (url kvblockd://host:port?
-    namespace=X&streams=N; token from extra_config or KVBLOCKD_TOKEN)."""
+    namespace=X&streams=N; token from extra_config or KVBLOCKD_TOKEN).
+
+    `url` overrides context.url — the plugin path hands us a virtual
+    plugin://kvblockd context.url and the adapter resolves the real endpoint
+    from config (adapter._resolve_url)."""
     from urllib.parse import parse_qs, urlparse
 
-    u = urlparse(context.url)
+    u = urlparse(url if url is not None else context.url)
     host, port = u.hostname or "127.0.0.1", u.port or 9440
     q = parse_qs(u.query)
     namespace = q.get("namespace", ["default"])[0]

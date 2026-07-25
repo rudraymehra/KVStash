@@ -4,6 +4,51 @@ Verified against `github.com/LMCache/LMCache@dev` and PyPI on 2026-07-17.
 This is the precondition for the adapter: if the plugin surface or the
 chunk-hash derivation moved, the adapter plan changes. Both held.
 
+## CORRECTION 2026-07-26 — §2's "registration confirmed" was WRONG for 0.5.1
+
+Section 2 below concluded "Registration confirmed … adapter.py is safe to
+write." That conclusion missed how the plugin backend actually dials. In
+lmcache **0.5.1 as installed** (`lmcache/v1/storage_backend/remote_backend.py`,
+`init_connection`), a backend created from `remote_storage_plugins` uses the
+**virtual URL `plugin://{name}`** — it never passes `remote_url` to
+`CreateConnector`. Our `KvblockdConnectorAdapter` only matched `kvblockd://`,
+so `ConnectorManager.create_connector()` raised
+`ValueError: No adapter found for URL: plugin://kvblockd`, `init_connection`
+caught it, logged one warning, left `connection = None`, and **every put/get
+silently degraded to a miss** — the GPU-run zero-bytes failure. Reproduced
+locally against real `lmcache==0.5.1` with no GPU/vLLM.
+
+Also wrong by omission in §2: the `DynamicConnectorAdapter` wrapping applies
+only when `class_name` points at a `RemoteConnector` subclass; a
+`ConnectorAdapter` subclass (ours) is instantiated as-is, so **its own
+`can_parse` must accept `plugin://kvblockd`** — exactly what lmcache's builtin
+adapters (e.g. `fs_adapter.py`) do. Fixed in `lmcache_kvblockd/adapter.py`:
+`can_parse` accepts both shapes, and for `plugin://` the real endpoint is read
+from `extra_config["remote_storage_plugin.kvblockd.url"]` (fallback:
+`config.remote_url` if it is a `kvblockd://` URL; otherwise a loud ValueError,
+never a silent default). Configs drop `remote_url` (it would create a second,
+deprecated RemoteBackend and double every put). Pinned by
+`python/lmcache_kvblockd/tests/test_lmcache_registration.py` against real
+lmcache in CI (`ci.yml` python-lmcache-registration + the e2e-cpu step that
+runs before any vLLM boot).
+
+**Second correction, same audit:** 0.5.1's `CacheEngineKey` has **no `fmt`
+field** — its identity is `(model_name, world_size, worker_id, chunk_hash,
+dtype, tags)` (`lmcache/utils.py:399`). Our `_wire` read `key.fmt`, so even
+with registration fixed, every op raised AttributeError on a real key and the
+never-raise wrappers silently turned that into a permanent miss (the unit
+suite's FakeKey HAD a fmt attribute, masking it). `_wire` now serializes
+LMCache's own canonical `key.to_string()`
+(`model@world@worker@chunk_hash_hex@dtype[@tags]`), which also folds dtype and
+tags into the wire identity — the old hand-rolled field list would have
+collided same-token different-dtype keys. Verified end-to-end against real
+lmcache 0.5.1 + a real daemon: RemoteBackend(plugin_name="kvblockd") →
+contains miss → put → `kvb_bytes_total{dir="in"} 8224`, `kvb_blocks 1` →
+contains hit. NOTE (stale comments, not yet edited): `pkg/client/hashchain.go`
+line 22-23 and `python/kvblockd/tests/golden/hash_chain.json`'s "note" still
+describe the old `(fmt, ...)` field order; the golden vectors themselves stay
+valid (they pin the hash function over opaque field lists, not the mapping).
+
 ## Versions (pinned)
 
 - lmcache latest on PyPI: **0.5.1** (releases: 0.5.0, 0.5.1). Pin `>=0.5.1,<0.6`.

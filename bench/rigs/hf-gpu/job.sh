@@ -201,12 +201,16 @@ cat > "$WORK/lmcache_kvblockd.yaml" <<EOF
 chunk_size: 256
 local_cpu: true
 max_local_cpu_size: $LMC_MAX_LOCAL_CPU_GB
-remote_url: "kvblockd://$KVBD_ADDR?namespace=lmcache&streams=$KVBD_STREAMS"
 remote_storage_plugins: ["kvblockd"]
 extra_config:
   kvblockd_token: "$KVBD_TOKEN"
   remote_storage_plugin.kvblockd.module_path: "lmcache_kvblockd.adapter"
   remote_storage_plugin.kvblockd.class_name: "KvblockdConnectorAdapter"
+  # The plugin backend dials the virtual url "plugin://kvblockd"; the REAL
+  # endpoint must be THIS extra_config key (remote_url would create a second,
+  # deprecated backend and double every put — and was the silent zero-bytes
+  # failure when it was the only endpoint the adapter understood).
+  remote_storage_plugin.kvblockd.url: "kvblockd://$KVBD_ADDR?namespace=lmcache&streams=$KVBD_STREAMS"
 EOF
 cat > "$WORK/kv_transfer.json" <<EOF
 {"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both",

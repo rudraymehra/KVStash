@@ -25,12 +25,21 @@ _REPO = Path(__file__).resolve().parents[3]
 
 # --- fakes modeled on LMCache's test doubles ---
 class FakeKey:
+    """Mirrors lmcache 0.5.x CacheEngineKey: identity fields + to_string()
+    (NO fmt field — the old fake had one and masked an AttributeError that
+    turned every real op into a silent miss). to_string format matches
+    lmcache/utils.py: model@world_size@worker_id@chunk_hash_hex@dtype."""
+
     def __init__(self, i):
-        self.fmt = "vllm"
         self.model_name = "facebook/opt-125m"
         self.world_size = 1
         self.worker_id = 0
         self.chunk_hash = 1000 + i
+
+    def to_string(self):
+        # chunk_hash_hex is f"{chunk_hash:x}" in lmcache/utils.py.
+        return (f"{self.model_name}@{self.world_size}@{self.worker_id}"
+                f"@{self.chunk_hash:x}@bfloat16")
 
 
 class FakeMeta:

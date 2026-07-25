@@ -44,6 +44,16 @@ jobs:
           key: e2e-cpu-${{ hashFiles('bench/e2e/cpu/versions.env') }}
       - name: install stack
         run: bash bench/e2e/cpu/install.sh
+      # Runs BEFORE the vLLM boot: LMCache's own CreateConnector must select
+      # KvblockdRemoteConnector from bench/e2e/cpu/lmcache_kvblockd.yaml via
+      # the plugin://kvblockd path. This is the assertion the heavy leg never
+      # reached when vLLM failed to boot — it must not depend on vLLM booting.
+      - name: registration tripwire (LMCache selects our connector; no vLLM)
+        env:
+          PYTHONHASHSEED: "0"
+        run: |
+          pip install pytest==9.1.1
+          pytest python/lmcache_kvblockd/tests -q
       - name: serve vLLM (CPU) + verify
         env:
           PYTHONHASHSEED: "0"

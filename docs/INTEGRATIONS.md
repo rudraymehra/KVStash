@@ -21,13 +21,24 @@ Point LMCache at a running kvblockd daemon. `lmcache.yaml`:
 ```yaml
 chunk_size: 256
 local_cpu: true
-remote_url: "kvblockd://HOST:9440?namespace=lmcache&streams=4"
 remote_storage_plugins: ["kvblockd"]
 extra_config:
   kvblockd_token: "YOUR_TOKEN"                              # or env KVBLOCKD_TOKEN
   remote_storage_plugin.kvblockd.module_path: "lmcache_kvblockd.adapter"
   remote_storage_plugin.kvblockd.class_name: "KvblockdConnectorAdapter"
+  remote_storage_plugin.kvblockd.url: "kvblockd://HOST:9440?namespace=lmcache&streams=4"
 ```
+
+> **The endpoint must be `extra_config["remote_storage_plugin.kvblockd.url"]`,
+> not `remote_url`.** In lmcache 0.5.x a backend created via
+> `remote_storage_plugins` dials the virtual URL `plugin://kvblockd` and never
+> reads `remote_url`; adapter versions before this fix only matched
+> `kvblockd://`, so the backend failed connector creation, LMCache swallowed
+> the error, and every put/get silently became a local-tier miss (zero bytes
+> reached kvblockd). Also do NOT set `remote_url` alongside the plugin: LMCache
+> would create a second, deprecated RemoteBackend and double every put.
+> `python/lmcache_kvblockd/tests/test_lmcache_registration.py` pins this
+> behavior against the real lmcache package in CI.
 
 vLLM `--kv-transfer-config`:
 

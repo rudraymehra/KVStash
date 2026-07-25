@@ -217,6 +217,35 @@ jobs:
           PYTHONHASHSEED: "0"
         run: pytest python/lmcache_kvblockd/tests -q
 
+  # Registration tripwire with REAL lmcache (still no GPU, no vLLM, no model):
+  # LMCache's own CreateConnector must select KvblockdRemoteConnector from
+  # bench/e2e/cpu/lmcache_kvblockd.yaml via the plugin://kvblockd path. This
+  # exists because the failure mode is SILENT in production (RemoteBackend
+  # swallows "No adapter found" and serves every op as a local-tier miss), and
+  # the heavy e2e leg cannot be relied on to reach its assertion.
+  python-lmcache-registration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install torch (CPU) + pinned lmcache + packages
+        run: |
+          source bench/e2e/cpu/versions.env
+          # Pinned: an unpinned test runner lets someone else's release break CI.
+          pip install pytest==9.1.1
+          # CPU torch FIRST so the lmcache resolve does not pull CUDA torch.
+          pip install torch --index-url "$TORCH_INDEX"
+          NO_GPU_EXT=1 pip install "lmcache==$LMCACHE_VERSION"
+          pip install -e ./python/kvblockd -e ./python/lmcache_kvblockd
+      - name: pytest registration (LMCache selects our connector)
+        env:
+          PYTHONHASHSEED: "0"
+        run: pytest python/lmcache_kvblockd/tests/test_lmcache_registration.py -q
+
   python-vllm-adapter:
     runs-on: ubuntu-24.04
     steps:
