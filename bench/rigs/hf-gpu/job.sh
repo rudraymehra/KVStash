@@ -30,16 +30,16 @@ mkdir -p "$WORK/bin" "$WORK/results"
 
 # ---- knobs (all overridable via job -e/--env) ------------------------------
 MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
-LENGTHS="${LENGTHS:-1024,4096,8192,16384,32000}"
+LENGTHS="${LENGTHS:-1024,4096,8192,16384}"
 REPS="${REPS:-5}"
 WARMUP="${WARMUP:-1}"
 GEN_TOKENS="${GEN_TOKENS:-16}"
 SETTLE_S="${SETTLE_S:-3.0}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-20480}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 GO_VERSION="${GO_VERSION:-1.26.5}"
 LMCACHE_VERSION="${LMCACHE_VERSION:-0.5.1}"
-KVBD_ARENA_BYTES="${KVBD_ARENA_BYTES:-3221225472}"   # 3 GiB — holds the freshest 32k-token KV (~1.7 GiB) with headroom, inside 15 GB RAM
+KVBD_ARENA_BYTES="${KVBD_ARENA_BYTES:-2147483648}"   # 2 GiB — holds the freshest 16k-token KV with headroom; the arena is prefaulted, so it competes with vLLM for system RAM
 KVBD_STREAMS="${KVBD_STREAMS:-4}"
 LMC_MAX_LOCAL_CPU_GB="${LMC_MAX_LOCAL_CPU_GB:-3.0}"  # pinned staging pool only (local_cpu tier is OFF)
 TC_RATE_GBIT="${TC_RATE_GBIT:-}"                     # optional loopback shaping; HF Jobs likely lack NET_ADMIN — detected, not assumed
@@ -176,8 +176,17 @@ VLLM_PID=$!
 # generous: first boot downloads ~15 GB of weights. Passing the pid makes a
 # crashed server fail in seconds instead of burning the whole deadline.
 if ! bash "$ROOT/scripts/wait-http.sh" "http://127.0.0.1:$VLLM_PORT/health" 2400 "$VLLM_PID"; then
-  log "FATAL: vLLM never became healthy; last 60 lines of its log:"
-  tail -60 "$WORK/vllm.log" >&2
+  # vLLM reports the engine-core failure as "See root cause above": the worker
+  # process writes its real error well before the API-server traceback, so a
+  # short tail hides exactly the line worth reading.
+  log "FATAL: vLLM never became healthy. Memory at failure:"
+  free -g >&2 || true
+  nvidia-smi --query-gpu=memory.used,memory.total --format=csv >&2 || true
+  log "root-cause candidates from its log:"
+  grep -nE 'Error|error|Killed|OOM|out of memory|CUDA|No space|Traceback|raise ' \
+    "$WORK/vllm.log" | tail -40 >&2 || true
+  log "last 250 lines of vllm.log:"
+  tail -250 "$WORK/vllm.log" >&2
   exit 1
 fi
 
