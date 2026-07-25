@@ -37,7 +37,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, List, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 from kvblockd import protocol as kp
@@ -82,7 +82,7 @@ class _RateLimitedLog:
             logger.warning("%s", msg)
         elif key not in self._full:
             self._full.add(key)
-            logger.warning("%s: %s", msg, exc, exc_info=True)
+            logger.warning("%s: %s", msg, exc, exc_info=exc)
         else:
             logger.warning("%s: %s", msg, exc)
 
@@ -335,7 +335,7 @@ class KvblockdHiCacheStorage(HiCacheStorage):
     def exists(self, key: str) -> bool:
         return self.batch_exists([key]) >= 1
 
-    def batch_exists(self, keys: List[str], extra_info=None) -> int:
+    def batch_exists(self, keys: list[str], extra_info=None) -> int:
         """Consecutive-from-index-0 logical hit count, in ONE BATCH_EXISTS
         round trip over the interleaved physical keys. A logical page counts
         only if ALL its physical objects exist, so the flat consecutive count
@@ -353,8 +353,8 @@ class KvblockdHiCacheStorage(HiCacheStorage):
         return self._guard("batch_exists", 0, _do)
 
     # ------------------------------------------------------ zero-copy v1 path
-    def batch_get_v1(self, keys: List[str], host_indices,
-                     extra_info=None) -> List[bool]:
+    def batch_get_v1(self, keys: list[str], host_indices,
+                     extra_info=None) -> list[bool]:
         """Fetch pages straight into the pinned host pool: resolve
         host_indices → pool byte regions, then batch_get_scatter recv_into's
         each hit. Per page: True iff every physical object landed byte-exact
@@ -393,8 +393,8 @@ class KvblockdHiCacheStorage(HiCacheStorage):
 
         return self._guard("batch_get_v1", lambda: [False] * n, _do)
 
-    def batch_set_v1(self, keys: List[str], host_indices,
-                     extra_info=None) -> List[bool]:
+    def batch_set_v1(self, keys: list[str], host_indices,
+                     extra_info=None) -> list[bool]:
         """Back pages up from the pinned pool. One BATCH_EXISTS pre-pass
         skips already-stored objects (kvblockd blocks are write-once and
         content-addressed — a re-PUT would be answered OK_EXISTS anyway, the
@@ -475,8 +475,8 @@ class KvblockdHiCacheStorage(HiCacheStorage):
             return mv, target_location, len(mv)
         raise ValueError(f"unsupported target_location {type(target_location)!r}")
 
-    def get(self, key: str, target_location: Optional[Any] = None,
-            target_sizes: Optional[Any] = None):
+    def get(self, key: str, target_location: Any | None = None,
+            target_sizes: Any | None = None):
         """Fetch one whole flat page. With a target, bytes land in it
         zero-copy and the target is returned; without one, a fresh flat
         uint8 tensor is returned (raw bytes if torch is absent). None ⇒ miss."""
@@ -503,8 +503,8 @@ class KvblockdHiCacheStorage(HiCacheStorage):
 
         return self._guard("get", None, _do)
 
-    def batch_get(self, keys: List[str], target_locations: Optional[Any] = None,
-                  target_sizes: Optional[Any] = None):
+    def batch_get(self, keys: list[str], target_locations: Any | None = None,
+                  target_sizes: Any | None = None):
         # Probe the containers with `is None`, never truthiness: a stacked
         # tensor hits Tensor.__bool__ ("Boolean value of Tensor ... is
         # ambiguous") and the raise would escape the public method.
@@ -517,9 +517,9 @@ class KvblockdHiCacheStorage(HiCacheStorage):
             for k, loc, sz in zip(keys, target_locations, target_sizes)
         ]
 
-    def set(self, key: str, value: Optional[Any] = None,
-            target_location: Optional[Any] = None,
-            target_sizes: Optional[Any] = None) -> bool:
+    def set(self, key: str, value: Any | None = None,
+            target_location: Any | None = None,
+            target_sizes: Any | None = None) -> bool:
         def _do():
             src = value if value is not None else target_location
             if isinstance(src, int):  # raw pointer + sizes form
@@ -536,9 +536,9 @@ class KvblockdHiCacheStorage(HiCacheStorage):
 
         return self._guard("set", False, _do)
 
-    def batch_set(self, keys: List[str], values: Optional[Any] = None,
-                  target_locations: Optional[Any] = None,
-                  target_sizes: Optional[Any] = None) -> bool:
+    def batch_set(self, keys: list[str], values: Any | None = None,
+                  target_locations: Any | None = None,
+                  target_sizes: Any | None = None) -> bool:
         # `is None` probes for the same reason as batch_get above.
         if values is None:
             values = [None] * len(keys)

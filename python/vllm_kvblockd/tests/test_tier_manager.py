@@ -215,7 +215,7 @@ def test_touch_is_fire_and_forget(daemon):
 def test_never_raise_daemon_dead():
     """Dead endpoint: lookups resolve MISS, jobs report failure, shutdown is
     clean — the scheduler process must never see an exception from us."""
-    view, backing = fake_view()
+    view, _backing = fake_view()  # keep the backing tensor alive for the test's duration
     mgr = KvblockdTierManager(
         fake_spec(), view, "kvblockd",
         endpoint="kvblockd://127.0.0.1:1", namespace="vllm", token="tok",

@@ -23,10 +23,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from kvblockd.client import Client  # noqa: E402
-from sglang_kvblockd import keymap  # noqa: E402
-from sglang_kvblockd._compat import STORAGE_BATCH_SIZE  # noqa: E402
-from sglang_kvblockd.backend import KvblockdHiCacheStorage  # noqa: E402
+from kvblockd.client import Client
+
+from sglang_kvblockd import keymap
+from sglang_kvblockd._compat import STORAGE_BATCH_SIZE
+from sglang_kvblockd.backend import KvblockdHiCacheStorage
 
 
 # --- fake host pools (mirror memory_pool_host.get_page_buffer_meta) ---------
@@ -108,9 +109,9 @@ def host_indices(slots, page_size):
 
 
 def mha_config(**over):
-    base = dict(model_name="test/model-8b", tp_rank=0, tp_size=1, pp_rank=0,
-                pp_size=1, is_mla_model=False, is_page_first_layout=True,
-                enable_storage_metrics=True, extra_config=None)
+    base = {"model_name": "test/model-8b", "tp_rank": 0, "tp_size": 1, "pp_rank": 0,
+            "pp_size": 1, "is_mla_model": False, "is_page_first_layout": True,
+            "enable_storage_metrics": True, "extra_config": None}
     base.update(over)
     return NS(**base)
 

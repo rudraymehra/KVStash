@@ -15,8 +15,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from vllm_kvblockd import connector as conn_mod  # noqa: E402
-from vllm_kvblockd.connector import (  # noqa: E402
+from vllm_kvblockd import connector as conn_mod
+from vllm_kvblockd.connector import (
     BLOB_PREFIX_LEN,
     BlobError,
     KvblockdConnector,

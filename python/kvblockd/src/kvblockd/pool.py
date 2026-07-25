@@ -19,8 +19,7 @@ from kvblockd.protocol import StatusError
 
 class Pool:
     def __init__(self, factory, streams: int):
-        if streams < 1:
-            streams = 1
+        streams = max(streams, 1)
         self._factory = factory
         self._sem = threading.Semaphore(streams)
         self._lock = threading.Lock()

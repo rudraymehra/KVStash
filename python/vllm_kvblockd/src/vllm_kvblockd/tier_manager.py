@@ -68,7 +68,7 @@ try:  # vLLM tiering present: subclass the real ABC + reuse its result types.
     from vllm.v1.kv_offload.tiering.base import SecondaryTierManager as _TierBase
 
     _HAS_VLLM_TIERING = True
-except Exception:  # pragma: no cover - exercised by the no-vllm test env
+except Exception:  # noqa: BLE001 — availability fallback: tiering ABC absent/moved  # pragma: no cover - exercised by the no-vllm test env
     _HAS_VLLM_TIERING = False
     import enum
     from dataclasses import dataclass
@@ -99,7 +99,7 @@ class _JobState:
     """Thread-safe completion tracker for one job's tiled tasks (the
     tiering/fs JobState, plus a report flag for fire-and-forget work)."""
 
-    __slots__ = ("job_id", "_n_tasks", "_completed", "_success", "_lock", "report")
+    __slots__ = ("_completed", "_lock", "_n_tasks", "_success", "job_id", "report")
 
     def __init__(self, job_id: int, n_tasks: int, report: bool = True):
         self.job_id = job_id
@@ -233,7 +233,7 @@ class _DualQueuePool:
             try:
                 task()
                 ok = True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — worker thread must survive any task failure; the job is reported failed below
                 logger.warning("kvblockd tier task failed (job %s): %s",
                                getattr(state, "job_id", "-"), exc)
                 ok = False
@@ -343,8 +343,8 @@ class KvblockdTierManager(_TierBase):
         # RFC-#38260-shaped tier configs carry these INSIDE the tier dict; the
         # merged factory forwards every non-"type" key to us, so accept and
         # ignore them rather than crash on **config.
-        module_path: str | None = None,  # noqa: ARG002 - config-shape compat
-        class_name: str | None = None,  # noqa: ARG002 - config-shape compat
+        module_path: str | None = None,
+        class_name: str | None = None,
     ):
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         require_pinned_hashseed()  # OffloadKeys inherit vLLM's NONE_HASH seeding
@@ -410,7 +410,7 @@ class KvblockdTierManager(_TierBase):
         else falls back to the consecutive-prefix count."""
         try:
             n_consec, per_key = self._ensure().batch_exists(wire_keys)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — never raises (documented): a dead daemon = all-miss
             self._warn("BATCH_EXISTS", exc)
             return [False] * len(wire_keys)
         if per_key is not None and len(per_key) == len(wire_keys):
@@ -443,7 +443,7 @@ class KvblockdTierManager(_TierBase):
         def _touch():
             try:
                 self._ensure().touch_lease(wire, kp.TOUCH_RECENCY)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — fire-and-forget background touch; never raises into the pool thread
                 self._warn("TOUCH", exc)
 
         self._pool.enqueue_fire_and_forget(_touch)
@@ -542,5 +542,5 @@ if _HAS_VLLM_TIERING:
             )
         except ValueError:
             pass  # already registered (double import) — fine
-    except Exception as exc:  # pragma: no cover - tiering moved/renamed
+    except Exception as exc:  # noqa: BLE001 — registration is best-effort: tiering moved/renamed  # pragma: no cover
         logger.warning("kvblockd tier registration unavailable: %s", exc)

@@ -12,7 +12,7 @@ from .connector import make_connector
 
 try:
     from lmcache.v1.storage_backend.connector import ConnectorAdapter as _Base
-except Exception:  # LMCache not installed — keep the module importable
+except Exception:  # noqa: BLE001 — availability fallback: LMCache not installed — keep the module importable
     _Base = object
 
 SCHEME = "kvblockd://"

@@ -45,7 +45,7 @@ def _memory_format(fmt_int: int):
         from lmcache.v1.memory_management import MemoryFormat
 
         return MemoryFormat(fmt_int)
-    except Exception:
+    except Exception:  # noqa: BLE001 — availability fallback: any import/enum failure means "use the backend default format"
         return None
 
 
@@ -71,7 +71,7 @@ class _RateLimitedLog:
         self._last[key] = now
         if exc is not None and key not in self._full:
             self._full.add(key)
-            logger.warning("%s: %s", msg, exc, exc_info=True)
+            logger.warning("%s: %s", msg, exc, exc_info=exc)
         else:
             logger.warning("%s: %s", msg, exc)
 
@@ -102,7 +102,7 @@ class KvblockdRemoteConnector:
     def post_init(self):
         try:
             startup_determinism_check()
-        except Exception as e:  # loud, but non-fatal per never-raise
+        except Exception as e:  # noqa: BLE001 — loud, but non-fatal per never-raise
             logger.error("kvblockd determinism check failed: %s", e)
 
     def _ensure(self) -> Client:
@@ -129,7 +129,7 @@ class KvblockdRemoteConnector:
         loop = asyncio.get_running_loop()
         try:
             return await loop.run_in_executor(self._exec, fn)
-        except Exception as e:  # NEVER RAISE — degrade to a miss (BaseException/
+        except Exception as e:  # noqa: BLE001 — NEVER RAISE — degrade to a miss (BaseException/
             # CancelledError intentionally propagates: the caller cancelled).
             self._log.maybe(op, f"kvblockd {op} failed (treated as miss)", e)
             return default() if callable(default) else default
@@ -192,7 +192,7 @@ class KvblockdRemoteConnector:
                 flat = base.numpy().reshape(-1)
                 results[idx] = obj
                 return memoryview(flat)
-            except Exception:
+            except Exception:  # noqa: BLE001 — never-raise boundary: a failed alloc is a miss, not an engine exception
                 return None
 
         return alloc
@@ -230,7 +230,7 @@ class KvblockdRemoteConnector:
             finally:
                 try:
                     memory_obj.ref_count_down()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 — best-effort ref release; cleanup must not mask the put path
                     pass
         loop = asyncio.get_running_loop()
         fut = loop.run_in_executor(self._exec, _do)
@@ -238,7 +238,7 @@ class KvblockdRemoteConnector:
             return await asyncio.shield(fut)
         except asyncio.CancelledError:
             raise  # _do still completes under shield → ref consumed, no race
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: any exception must not reach the engine
             self._log.maybe("put", "kvblockd put failed (treated as miss)", e)
             return False
 
@@ -249,7 +249,7 @@ class KvblockdRemoteConnector:
         try:
             sts = self._ensure().delete([self._wire(key)], force=True)
             return bool(sts) and kp.status_ok(sts[0])
-        except BaseException as e:  # sync path: nothing above catches — never raise
+        except BaseException as e:  # noqa: BLE001 — sync path: nothing above catches — never raise
             self._log.maybe("remove", "remove_sync failed", e)
             return False
 
@@ -279,7 +279,7 @@ class KvblockdRemoteConnector:
         try:
             n, _ = self._ensure().batch_exists([self._wire(k) for k in keys])
             return n
-        except BaseException as e:  # sync path: never raise
+        except BaseException as e:  # noqa: BLE001 — sync path: never raise
             self._log.maybe("contains", "batched_contains failed", e)
             return 0
 
@@ -318,7 +318,7 @@ class KvblockdRemoteConnector:
                 if i >= len(prefix):
                     try:
                         obj.ref_count_down()
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110 — best-effort ref release on the drop path (LMCache leak rule)
                         pass
             return prefix
 
@@ -331,11 +331,11 @@ class KvblockdRemoteConnector:
                 try:
                     for obj in (f.result() or []):
                         obj.ref_count_down()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 — best-effort drain on cancel; must not raise from a done-callback
                     pass
             fut.add_done_callback(_drain)
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: any exception must not reach the engine
             self._log.maybe("get", "kvblockd get failed (treated as miss)", e)
             return []
 
@@ -350,7 +350,7 @@ class KvblockdRemoteConnector:
         return oks
 
 
-def make_connector(context) -> "KvblockdRemoteConnector":
+def make_connector(context) -> KvblockdRemoteConnector:
     """Build a connector from a ConnectorContext (url kvblockd://host:port?
     namespace=X&streams=N; token from extra_config or KVBLOCKD_TOKEN)."""
     from urllib.parse import parse_qs, urlparse

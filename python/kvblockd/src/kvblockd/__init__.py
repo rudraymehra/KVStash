@@ -2,5 +2,5 @@
 
 from kvblockd.protocol import FrameError, Op, Status, StatusError
 
-__all__ = ["Op", "Status", "StatusError", "FrameError"]
+__all__ = ["FrameError", "Op", "Status", "StatusError"]
 __version__ = "0.1.0"

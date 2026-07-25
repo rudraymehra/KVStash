@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import struct
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from blake3 import blake3
@@ -182,7 +183,7 @@ def test_parse_endpoint():
 
 def test_adapter_config_from_stub():
     class KTC:
-        kv_connector_extra_config = {
+        kv_connector_extra_config: ClassVar[dict] = {
             "kvblockd_endpoint": "kvblockd://127.0.0.1:19440",
             "kvblockd_namespace": "ns1",
             "kvblockd_token": "t",

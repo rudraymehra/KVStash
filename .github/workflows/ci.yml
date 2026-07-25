@@ -177,7 +177,10 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: install ruff + kvblockd
         run: |
-          pip install ruff pytest
+          # Pinned: an unpinned linter turns someone else's release into our
+          # red build (ruff 0.16.0 broke main with rules our code predates).
+          # Bump deliberately, with a green `ruff check python/` in the same PR.
+          pip install ruff==0.16.0 pytest==9.1.1
           pip install -e ./python/kvblockd
       - name: ruff
         run: ruff check python/
@@ -202,7 +205,8 @@ jobs:
       - name: install torch (CPU) + deps
         run: |
           # pytest is NOT on the pytorch index — install it from PyPI first.
-          pip install pytest numpy blake3 xxhash
+          # Pinned: an unpinned test runner lets someone else's release break CI.
+          pip install pytest==9.1.1 numpy blake3 xxhash
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           # The connector unit suite FAKES MemoryObj and does not need lmcache
           # (adapter.py falls back to object); --no-deps keeps CI off the heavy
@@ -229,7 +233,8 @@ jobs:
       - name: install torch (CPU) + deps
         run: |
           # pytest is NOT on the pytorch index — install it from PyPI first.
-          pip install pytest numpy blake3 xxhash
+          # Pinned: an unpinned test runner lets someone else's release break CI.
+          pip install pytest==9.1.1 numpy blake3 xxhash
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           # The suite stubs the vLLM surface (shapes pinned by
           # python/vllm_kvblockd/upstream_refs/); vllm itself is exercised by

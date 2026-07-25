@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import socket
 import struct
+
 import xxhash
 
 from kvblockd import protocol as p
@@ -22,7 +23,7 @@ _MAX_SCRATCH = 1 << 20  # reused metadata-read buffer cap (mirrors Go maxReadReu
 
 
 class Limits:
-    __slots__ = ("max_batch_keys", "max_frame_len", "max_blob_len", "initial_credit", "features")
+    __slots__ = ("features", "initial_credit", "max_batch_keys", "max_blob_len", "max_frame_len")
 
     def __init__(self, r: p.HelloResp):
         self.max_batch_keys = r.max_batch_keys
@@ -183,7 +184,7 @@ class _Conn:
         return p.parse_get_region(bytes(pre) + bytes(rest))
 
     def _scatter_one(self, gidx, local, dlen, dxxh, prefix_len, alloc, statuses):
-        pfx = prefix_len if dlen >= prefix_len else dlen
+        pfx = min(prefix_len, dlen)
         prefix = bytearray(pfx)
         if pfx:
             self._recv_into(memoryview(prefix))
@@ -375,7 +376,7 @@ class Client:
         total_consec, per = 0, []
         broken = False
         for tile in self._split(keys):
-            nc, pk = self._run(lambda c: c.batch_exists(tile))
+            nc, pk = self._run(lambda c: c.batch_exists(tile))  # noqa: B023 — lambda is invoked synchronously inside this iteration (Pool.run calls fn(conn) immediately); it never outlives the loop
             if pk is not None:
                 per.extend(pk)
             if not broken:
@@ -403,7 +404,7 @@ class Client:
             return [], []
         vals, sts = [], []
         for tile in self._split(keys):
-            v, s = self._run(lambda c: c.batch_get_bytes(tile))
+            v, s = self._run(lambda c: c.batch_get_bytes(tile))  # noqa: B023 — lambda is invoked synchronously inside this iteration (Pool.run calls fn(conn) immediately); it never outlives the loop
             vals.extend(v)
             sts.extend(s)
         return vals, sts
@@ -415,19 +416,19 @@ class Client:
     def delete(self, keys, force=False):
         out = []
         for tile in self._split(keys):
-            out.extend(self._run(lambda c: c.delete(tile, force)))
+            out.extend(self._run(lambda c: c.delete(tile, force)))  # noqa: B023 — lambda is invoked synchronously inside this iteration (Pool.run calls fn(conn) immediately); it never outlives the loop
         return out
 
     def touch_lease(self, keys, sub, ttl_ms=0):
         out = []
         for tile in self._split(keys):
-            out.extend(self._run(lambda c: c.touch_lease(tile, sub, ttl_ms)))
+            out.extend(self._run(lambda c: c.touch_lease(tile, sub, ttl_ms)))  # noqa: B023 — lambda is invoked synchronously inside this iteration (Pool.run calls fn(conn) immediately); it never outlives the loop
         return out
 
     def pin(self, keys, sub):
         out = []
         for tile in self._split(keys):
-            out.extend(self._run(lambda c: c.pin(tile, sub)))
+            out.extend(self._run(lambda c: c.pin(tile, sub)))  # noqa: B023 — lambda is invoked synchronously inside this iteration (Pool.run calls fn(conn) immediately); it never outlives the loop
         return out
 
     def stats(self):

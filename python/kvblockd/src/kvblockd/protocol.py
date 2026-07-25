@@ -143,7 +143,7 @@ class Header:
     """A KVB1 frame header. `key` is the 32-byte per-frame key (zero for the
     batch verbs, whose keys live in the body)."""
 
-    __slots__ = ("opcode", "flags", "ns", "credit", "request_id", "key", "payload_len")
+    __slots__ = ("credit", "flags", "key", "ns", "opcode", "payload_len", "request_id")
 
     def __init__(self, opcode, flags=0, ns=0, credit=0, request_id=0, key=b"\x00" * 32, payload_len=0):
         self.opcode = opcode
@@ -171,7 +171,7 @@ class Header:
         return bytes(buf)
 
     @classmethod
-    def parse(cls, buf: bytes) -> "Header":
+    def parse(cls, buf: bytes) -> Header:
         if len(buf) < HEADER_SIZE:
             raise FrameError(f"short header: {len(buf)} < {HEADER_SIZE}")
         magic, ver, op, flags, ns, credit, rid, key, plen, crc = _HEADER.unpack(buf[:HEADER_SIZE])
@@ -264,13 +264,21 @@ def pack_hello_req(
 
 class HelloResp:
     __slots__ = (
-        "proto", "features", "max_batch_keys", "max_frame_len", "max_blob_len",
-        "namespace_id", "initial_credit", "lease_default_ms", "lease_max_ms",
-        "stream_timeout_ms", "server_name",
+        "features",
+        "initial_credit",
+        "lease_default_ms",
+        "lease_max_ms",
+        "max_batch_keys",
+        "max_blob_len",
+        "max_frame_len",
+        "namespace_id",
+        "proto",
+        "server_name",
+        "stream_timeout_ms",
     )
 
     @classmethod
-    def parse(cls, body: bytes) -> "HelloResp":
+    def parse(cls, body: bytes) -> HelloResp:
         status, _ = parse_preamble(body)
         if not status_ok(status):
             raise StatusError(Op.HELLO, status)

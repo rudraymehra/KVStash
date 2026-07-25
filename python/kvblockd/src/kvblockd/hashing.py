@@ -56,8 +56,19 @@ def startup_determinism_check() -> None:
         )
     probe = "import os; print(hash(('kvblockd-determinism-probe', 1, 2, 3)))"
     env = dict(os.environ)
-    out1 = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, env=env)
-    out2 = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, env=env)
+    # check=True matters: a crashing probe leaves both stdouts empty and the
+    # equality test below would pass vacuously, hiding the failure.
+    try:
+        out1 = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, env=env, check=True
+        )
+        out2 = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, env=env, check=True
+        )
+    except subprocess.CalledProcessError as e:
+        raise DeterminismError(
+            f"determinism probe subprocess failed (exit {e.returncode}): {e.stderr!r}"
+        ) from e
     if out1.stdout.strip() != out2.stdout.strip():
         raise DeterminismError(
             f"builtin hash() is nondeterministic across subprocesses under "

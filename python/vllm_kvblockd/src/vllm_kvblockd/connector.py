@@ -54,7 +54,7 @@ try:  # vLLM absent (unit tests, CI cells without vllm) -> importable fallback.
     )
 
     _HAS_VLLM = True
-except Exception:  # pragma: no cover - exercised by the no-vllm test env
+except Exception:  # noqa: BLE001 — availability fallback: a broken vllm install must not break import  # pragma: no cover - exercised by the no-vllm test env
     _HAS_VLLM = False
 
     class _MetaBase:  # type: ignore[no-redef]
@@ -153,7 +153,7 @@ class _RateLimitedLog:
         self._last[key] = now
         if exc is not None and key not in self._full:
             self._full.add(key)
-            logger.warning("%s: %s", msg, exc, exc_info=True)
+            logger.warning("%s: %s", msg, exc, exc_info=exc)
         else:
             logger.warning("%s: %s", msg, exc)
 
@@ -283,7 +283,7 @@ class KvblockdConnector(_Base):
     def _mm_ids(request) -> list[str]:
         try:
             return [f.identifier for f in (getattr(request, "mm_features", None) or [])]
-        except Exception:
+        except Exception:  # noqa: BLE001 — never-raise boundary: an unreadable request shape means "no mm features", not an engine exception
             return []
 
     @staticmethod
@@ -316,7 +316,7 @@ class KvblockdConnector(_Base):
             n_consec, _ = self._ensure().batch_exists(keys)
             hit_tokens = min(n_consec * self._block_size, aligned)
             return max(0, hit_tokens - num_computed_tokens), False
-        except Exception as e:  # never raise: a failed lookup is a miss
+        except Exception as e:  # noqa: BLE001 — never raise: a failed lookup is a miss
             self._log.maybe("lookup", "kvblockd BATCH_EXISTS failed (treated as miss)", e)
             return 0, False
 
@@ -343,7 +343,7 @@ class KvblockdConnector(_Base):
         meta = KvblockdConnectorMetadata()
         try:
             self._build_meta_into(meta, scheduler_output)
-        except Exception as e:  # never raise: an empty meta = a no-op step
+        except Exception as e:  # noqa: BLE001 — never raise: an empty meta = a no-op step
             self._log.maybe("meta", "build_connector_meta failed (no-op step)", e)
         return meta
 
@@ -506,7 +506,7 @@ class KvblockdConnector(_Base):
                 if isinstance(kv, (list, tuple)):
                     kv = kv[ve]
                 self._layer_kv[name] = kv
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: failed capture degrades to load/store no-ops, never into the engine
             self._log.maybe("layers", "capturing paged KV tensors failed", e)
 
     def _layout(self):
@@ -557,14 +557,14 @@ class KvblockdConnector(_Base):
         self._capture_layers(forward_context)
         try:
             metadata = self._get_connector_metadata()
-        except Exception:
+        except Exception:  # noqa: BLE001 — never-raise boundary: missing metadata = nothing to load this step
             return
         requests = getattr(metadata, "requests", None) or []
         for req in requests:
             if req.num_load_blocks > 0:
                 try:
                     self._load_one(req)
-                except Exception as e:  # never raise; blocks flagged as errors
+                except Exception as e:  # noqa: BLE001 — never raise; blocks flagged as errors
                     self._log.maybe("load", f"kvblockd load failed req={req.req_id}", e)
                     self._load_errors.update(self._load_range_ids(req))
 
@@ -616,7 +616,7 @@ class KvblockdConnector(_Base):
                 src = buf[li * bytes_per_layer : (li + 1) * bytes_per_layer]
                 try:
                     dst.copy_(src.view(dst.dtype).reshape(dst.shape))
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 — never-raise boundary: a failed scatter marks the block errored, not the engine
                     self._log.maybe("scatter", f"scatter into {name} failed", e)
                     self._load_errors.add(bid)
                     break
@@ -635,14 +635,14 @@ class KvblockdConnector(_Base):
     def wait_for_save(self):
         try:
             metadata = self._get_connector_metadata()
-        except Exception:
+        except Exception:  # noqa: BLE001 — never-raise boundary: missing metadata = nothing to store this step
             return
         requests = getattr(metadata, "requests", None) or []
         for req in requests:
             if req.store_end_block > req.store_start_block:
                 try:
                     self._store_one(req)
-                except Exception as e:  # never raise: a lost store is a future miss
+                except Exception as e:  # noqa: BLE001 — never raise: a lost store is a future miss
                     self._log.maybe("store", f"kvblockd store failed req={req.req_id}", e)
 
     def _store_one(self, req: KvbReqMeta) -> None:

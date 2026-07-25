@@ -53,7 +53,7 @@ def storage_metrics_cls():
         from sglang.srt.observability.metrics_collector import StorageMetrics
 
         return StorageMetrics
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110 — availability probe: fall through to the pre-0.5.15 module location
         pass
     try:
         from sglang.srt.metrics.collector import StorageMetrics  # type: ignore

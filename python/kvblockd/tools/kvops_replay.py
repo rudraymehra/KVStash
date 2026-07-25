@@ -28,7 +28,7 @@ def trace_key(*fields: str) -> bytes:
     key-derivation parity check, NOT by the replay (which reads baked keys
     from the .kvops file). Imported lazily so the replayer runs without
     blake3 installed."""
-    from blake3 import blake3  # noqa: PLC0415 — optional dependency, lazy on purpose
+    from blake3 import blake3
 
     blob = bytearray(_TRACE_DOMAIN)
     for f in fields:

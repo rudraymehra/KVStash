@@ -117,7 +117,8 @@ jobs:
           python-version: "3.12"
       - name: install CPU torch + backend (NO sglang yet)
         run: |
-          pip install pytest blake3 xxhash
+          # Pinned: an unpinned test runner lets someone else's release break CI.
+          pip install pytest==9.1.1 blake3 xxhash
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install --no-deps ./python/kvblockd ./python/sglang_kvblockd
       - name: import + instantiate WITHOUT sglang (shim leg)

@@ -18,7 +18,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from lmcache_kvblockd.connector import KvblockdRemoteConnector  # noqa: E402
+from lmcache_kvblockd.connector import KvblockdRemoteConnector
 
 _REPO = Path(__file__).resolve().parents[3]
 

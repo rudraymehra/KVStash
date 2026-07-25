@@ -141,8 +141,7 @@ def get_extra_config(kv_transfer_config, key: str, default):
 def parse_endpoint(endpoint: str) -> tuple[str, int]:
     """kvblockd://host:port (or bare host:port) -> (host, port)."""
     ep = endpoint.strip()
-    if ep.startswith("kvblockd://"):
-        ep = ep[len("kvblockd://") :]
+    ep = ep.removeprefix("kvblockd://")
     host, _, port = ep.partition(":")
     if not host or not port:
         raise ValueError(f"endpoint must be kvblockd://host:port, got {endpoint!r}")
@@ -153,13 +152,23 @@ class AdapterConfig:
     """Everything the connector needs, pulled defensively off vllm_config."""
 
     __slots__ = (
-        "host", "port", "namespace", "token", "streams", "verify",
-        "op_timeout", "connect_timeout", "block_size", "model_name",
-        "world_size", "dtype", "fingerprint",
+        "block_size",
+        "connect_timeout",
+        "dtype",
+        "fingerprint",
+        "host",
+        "model_name",
+        "namespace",
+        "op_timeout",
+        "port",
+        "streams",
+        "token",
+        "verify",
+        "world_size",
     )
 
     @classmethod
-    def from_vllm_config(cls, vllm_config) -> "AdapterConfig":
+    def from_vllm_config(cls, vllm_config) -> AdapterConfig:
         ktc = getattr(vllm_config, "kv_transfer_config", None)
         endpoint = get_extra_config(ktc, "kvblockd_endpoint", "kvblockd://127.0.0.1:9440")
         c = cls()
@@ -244,9 +253,9 @@ def require_pinned_hashseed() -> None:
 
 
 __all__ = [
+    "WIRE_KEY_LEN",
     "AdapterConfig",
     "DeterminismError",
-    "WIRE_KEY_LEN",
     "block_chain_keys",
     "chain_seed",
     "fingerprint",

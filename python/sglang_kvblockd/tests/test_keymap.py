@@ -75,7 +75,7 @@ def test_mla_single_object_no_tp_in_key_or_fingerprint():
 
 
 def test_mismatched_deployments_cannot_cross_hit():
-    base = dict(model_name="m", tp_rank=0, pp_rank=0, pp_size=1, is_mla_model=False)
+    base = {"model_name": "m", "tp_rank": 0, "pp_rank": 0, "pp_size": 1, "is_mla_model": False}
     tp2 = keymap.scheme_from_config(NS(tp_size=2, **base))
     tp4 = keymap.scheme_from_config(NS(tp_size=4, **base))
     other_model = keymap.scheme_from_config(
@@ -90,8 +90,8 @@ def test_headsplit_folds_tp_lcm_size():
     # Head-split shards are laid out by the VIRTUAL rank geometry
     # (tp_lcm_size): two head-split deployments with different lcm widths
     # must island their keyspaces, and neither may touch the plain one.
-    base = dict(model_name="m", tp_rank=0, tp_size=2, pp_rank=0, pp_size=1,
-                is_mla_model=False)
+    base = {"model_name": "m", "tp_rank": 0, "tp_size": 2, "pp_rank": 0, "pp_size": 1,
+            "is_mla_model": False}
     plain = keymap.scheme_from_config(NS(**base))
     hs8 = keymap.scheme_from_config(
         NS(should_split_heads=True, tp_lcm_size=8, **base))
@@ -102,7 +102,7 @@ def test_headsplit_folds_tp_lcm_size():
 
 def test_pp_size_always_folded():
     # Same pp_rank under different pp widths holds DIFFERENT layer ranges.
-    base = dict(model_name="m", tp_rank=0, tp_size=1, pp_rank=0, is_mla_model=False)
+    base = {"model_name": "m", "tp_rank": 0, "tp_size": 1, "pp_rank": 0, "is_mla_model": False}
     pp1 = keymap.scheme_from_config(NS(pp_size=1, **base))
     pp2 = keymap.scheme_from_config(NS(pp_size=2, **base))
     assert pp1.fingerprint != pp2.fingerprint
