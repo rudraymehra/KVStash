@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Submit the Chart-2 TTFT job to Hugging Face Jobs (a10g-small, $1.00/hr,
+# billed per minute). THIS SPENDS MONEY when run without DRY_RUN=1.
+#
+#   DRY_RUN=1 bench/rigs/hf-gpu/submit.sh     # print the exact command, run nothing
+#   bench/rigs/hf-gpu/submit.sh               # submit (asks for confirmation)
+#
+# Knobs (env): MODEL, GIT_REF, LENGTHS, REPS, TIMEOUT, RESULTS_REPO, HF_BIN.
+#
+# The job container clones the PUBLIC repo tarball at GIT_REF — local
+# uncommitted changes are NOT visible to the job; push first.
+set -euo pipefail
+
+HF_BIN="${HF_BIN:-$HOME/.kvb-hf/bin/hf}"
+IMAGE="${IMAGE:-vllm/vllm-openai:v0.25.1}"   # amd64 digest sha256:f0b9a0dc75a9fca3b6811e3279367b2d6a448055a000bfd13859587d74cef268 (recorded 2026-07-26)
+FLAVOR="${FLAVOR:-a10g-small}"
+TIMEOUT="${TIMEOUT:-2h}"
+GIT_REF="${GIT_REF:-main}"
+MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+LENGTHS="${LENGTHS:-1024,4096,8192,16384,32000}"
+REPS="${REPS:-5}"
+RESULTS_REPO="${RESULTS_REPO:-}"   # optional: HF dataset repo to receive the JSONL
+
+[[ -x "$HF_BIN" ]] || { echo "hf CLI not found at $HF_BIN (set HF_BIN)" >&2; exit 1; }
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../../.." && pwd)"
+if [[ -n "$(git -C "$ROOT" status --porcelain -- bench/rigs/hf-gpu python bench/e2e 2>/dev/null)" ]]; then
+  echo "WARNING: uncommitted changes under bench/rigs/hf-gpu, python/ or bench/e2e." >&2
+  echo "         The job runs from the GitHub tarball at '$GIT_REF' and will NOT see them." >&2
+fi
+
+# In-container bootstrap: fetch the public repo tarball at GIT_REF (no git
+# dependency in the image), then hand off to the committed entrypoint.
+BOOTSTRAP='set -euo pipefail
+mkdir -p /work && cd /work
+curl -fsSL "https://codeload.github.com/rudraymehra/KVStash/tar.gz/${GIT_REF}" | tar -xz
+mv KVStash-* kvstash
+bash /work/kvstash/bench/rigs/hf-gpu/job.sh'
+
+CMD=("$HF_BIN" jobs run
+  --name chart2-ttft
+  --flavor "$FLAVOR"
+  --timeout "$TIMEOUT"
+  --detach
+  --secrets HF_TOKEN
+  -e GIT_REF="$GIT_REF"
+  -e MODEL="$MODEL"
+  -e LENGTHS="$LENGTHS"
+  -e REPS="$REPS")
+[[ -n "$RESULTS_REPO" ]] && CMD+=(-e RESULTS_REPO="$RESULTS_REPO")
+CMD+=("$IMAGE" /bin/bash -c "$BOOTSTRAP")
+
+echo "== hf jobs command =="
+printf ' %q' "${CMD[@]}"; echo; echo
+
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  echo "DRY_RUN=1 — nothing submitted."
+  exit 0
+fi
+
+echo "flavor $FLAVOR is \$1.00/hr billed per minute; expected run <1h, timeout $TIMEOUT."
+read -r -p "Submit and start billing? [y/N] " ans
+[[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "aborted."; exit 1; }
+
+JOB_OUT="$("${CMD[@]}")"
+echo "$JOB_OUT"
+JOB_ID="$(printf '%s\n' "$JOB_OUT" | tail -n1 | awk '{print $NF}')"  # --detach prints the Job ID
+echo "submitted: $JOB_ID"
+echo
+echo "follow logs:     $HF_BIN jobs logs -f $JOB_ID"
+echo "check status:    $HF_BIN jobs inspect $JOB_ID"
+echo "cancel:          $HF_BIN jobs cancel $JOB_ID"
+echo "fetch results:   mkdir -p bench/results/rig-e && $HF_BIN jobs logs $JOB_ID | sed -n 's/^.*CHART2JSONL //p' > bench/results/rig-e/chart2-ttft.jsonl"
+echo "render chart:    python3 bench/report/plot.py chart2 --in bench/results/rig-e/chart2-ttft.jsonl --out chart2.png"

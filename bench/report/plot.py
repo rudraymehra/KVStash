@@ -5,8 +5,12 @@ README images, no rig access needed.
 
   Chart 1  throughput bars vs the field, iperf3 ceiling drawn in, %-of-
            ceiling + cores annotated, two panels (0.44 / 2.5 MiB).
-  Chart 2  TTFT vs hit rate, p50 solid / p99 dashed, the shaded
-           "recompute wins here" region below the crossover.
+  Chart 2  two record shapes, auto-detected:
+           - kind:"ttft" (hf-gpu rig): TTFT vs prefix length, cold-recompute
+             vs warm-kvblockd-reload, p50 solid / p95 dashed, per-length
+             speedup annotated, unverified warm cells flagged.
+           - replay/hit_rate records (aws rig-e plan): TTFT vs hit rate,
+             p50 solid / p99 dashed, shaded "recompute wins here" region.
 
 Usage:
   plot.py chart1 --in results/rig-t/*.jsonl --out chart1.png
@@ -151,7 +155,92 @@ def chart1(recs, out):
     print(f"wrote {out}")
 
 
+def _conditions(recs):
+    """Conditions box read FROM the JSONL (never hardcoded — review rule).
+    Rigs stamp gpu/model/vllm/lmcache/tc_link into each record."""
+    cond = {}
+    for r in recs:
+        for k in ("gpu", "model", "vllm", "lmcache", "tc_link"):
+            if r.get(k):
+                cond.setdefault(k, r[k])
+    box = ", ".join(f"{cond[k]}" for k in ("gpu", "model", "vllm", "lmcache") if k in cond)
+    return box, cond.get("tc_link", "link undisclosed")
+
+
+def chart2_ttft(recs, out):
+    # TTFT vs prefix length, cold (recompute) vs warm (kvblockd reload).
+    # One record per (length, arm); duplicates (re-runs) collapse by median.
+    cells = {}
+    for r in recs:
+        x = r.get("target_prefix_tokens") or r.get("prefix_tokens")
+        if not x or r.get("arm") not in ("cold", "warm"):
+            continue
+        cells.setdefault((r["arm"], r.get("series", r["arm"]), x), []).append(r)
+
+    series, unverified, nreps = {}, [], []
+    for (arm, label, x), rs in sorted(cells.items()):
+        p50 = _median([r.get("ttft_p50_ms", r.get("ttft_ms", 0)) for r in rs])
+        p95 = _median([r.get("ttft_p95_ms", 0) for r in rs])
+        series.setdefault((arm, label), []).append((x, p50, p95))
+        nreps.extend(r.get("reps", 0) for r in rs)
+        if arm == "warm" and any(r.get("warm_hits_verified") is False for r in rs):
+            unverified.append(x)
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    by_arm = {}
+    for (arm, label), pts in sorted(series.items()):
+        pts.sort()
+        xs = [p[0] for p in pts]
+        p50s = [p[1] for p in pts]
+        p95s = [p[2] for p in pts]
+        line, = ax.plot(xs, p50s, marker="o", label=f"{label} p50")
+        ax.plot(xs, p95s, marker="x", linestyle="--", color=line.get_color(),
+                label=f"{label} p95")
+        by_arm[arm] = dict(zip(xs, p50s))
+
+    # Per-length speedup (the chart's whole point) annotated at the warm p50;
+    # <1x means recompute won there — printed just as honestly.
+    cold, warm = by_arm.get("cold", {}), by_arm.get("warm", {})
+    for x in sorted(set(cold) & set(warm)):
+        if warm[x] > 0:
+            note = f"{cold[x] / warm[x]:.1f}x"
+            if x in unverified:
+                note += " (UNVERIFIED)"
+            ax.annotate(note, (x, warm[x]), textcoords="offset points",
+                        xytext=(0, -14), ha="center", fontsize=8,
+                        color="crimson" if x in unverified else "black")
+
+    ax.set_xscale("log", base=2)
+    xs_all = sorted({x for pts in series.values() for x, _, _ in pts})
+    ax.set_xticks(xs_all)
+    ax.set_xticklabels([f"{round(x / 1000)}k" if x >= 1000 else str(x) for x in xs_all])
+    ax.minorticks_off()
+    ax.set_yscale("log")
+    ax.set_xlabel("prefix length (tokens)")
+    ax.set_ylabel("TTFT (ms, log)")
+
+    box, link = _conditions(recs)
+    lo, hi = (min(nreps), max(nreps)) if nreps else (0, 0)
+    runs = f"n={lo}" if lo == hi else f"n={lo}–{hi}"
+    ax.set_title("TTFT: reload KV from kvblockd vs recompute — same box, same model\n"
+                 f"median/p95 of {runs} reps per point, warmup discarded\n"
+                 f"{box or 'conditions from JSONL'}; {link} — disclosed", fontsize=9)
+    if unverified:
+        ax.text(0.02, 0.02, "warm hit UNVERIFIED at: "
+                + ", ".join(str(x) for x in unverified),
+                transform=ax.transAxes, fontsize=8, color="crimson")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out, dpi=140)
+    print(f"wrote {out}")
+
+
 def chart2(recs, out):
+    # hf-gpu TTFT-sweep records render the prefix-length chart; otherwise
+    # fall through to the original TTFT-vs-hit-rate rendering.
+    ttft_recs = [r for r in recs if r.get("kind") == "ttft"]
+    if ttft_recs:
+        return chart2_ttft(ttft_recs, out)
     # TTFT vs hit rate. Series by store/config; p50 solid, p99 dashed.
     series = {}
     for r in recs:
