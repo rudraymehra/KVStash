@@ -40,12 +40,37 @@ extra_config:
 > `python/lmcache_kvblockd/tests/test_lmcache_registration.py` pins this
 > behavior against the real lmcache package in CI.
 
-vLLM `--kv-transfer-config`:
+vLLM `--kv-transfer-config` — configure LMCache through its own
+`lmcache.`-prefixed keys, which is the only extra-config channel the
+integration reads (anything else is discarded without warning):
 
 ```json
 {"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both",
- "kv_connector_extra_config": {"lmcache_config_file": "lmcache.yaml"}}
+ "kv_connector_extra_config": {
+   "lmcache.remote_storage_plugins": "kvblockd",
+   "lmcache.local_cpu": true,
+   "lmcache.chunk_size": 256,
+   "lmcache.extra_config": {
+     "kvblockd_token": "YOUR-TOKEN",
+     "remote_storage_plugin.kvblockd.module_path": "lmcache_kvblockd.adapter",
+     "remote_storage_plugin.kvblockd.class_name": "KvblockdConnectorAdapter",
+     "remote_storage_plugin.kvblockd.url": "kvblockd://HOST:9440?namespace=lmcache&streams=4"
+   }}}
 ```
+
+> **⚠ There is no `lmcache_config_file` key.** Earlier revisions of this page
+> pointed at a YAML file that way. That key is read by neither vLLM 0.25.1 nor
+> LMCache 0.5.1 — searching both source trees finds no occurrence — so the file
+> was never loaded and LMCache silently ran on defaults with a local tier only:
+> no remote backend, and not one log line to say so. To use a YAML file
+> instead, export `LMCACHE_CONFIG_FILE` in the environment of the process that
+> serves the model (including inside the container, if you use one); do not mix
+> the two sources, since `lmcache.extra_config` replaces a file-provided one.
+>
+> Whichever route you choose, confirm it worked: the engine logs
+> `Created remote backend for plugin: kvblockd`, and the daemon's
+> `kvb_bytes_total{dir="in"}` rises on the first prefill. Silence means the
+> plugin branch never ran.
 
 > **⚠ PYTHONHASHSEED must be pinned identically on every worker.** LMCache's
 > chunk-hash chain seeds from vLLM's `NONE_HASH`, which depends on

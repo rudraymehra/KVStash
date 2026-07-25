@@ -212,10 +212,34 @@ extra_config:
   # failure when it was the only endpoint the adapter understood).
   remote_storage_plugin.kvblockd.url: "kvblockd://$KVBD_ADDR?namespace=lmcache&streams=$KVBD_STREAMS"
 EOF
+# The cache library is configured through this transfer config, using its own
+# "lmcache."-prefixed keys. That prefix is the only extra-config channel the
+# integration reads (everything else is silently discarded), and this argument
+# is proven to reach the engine's separate process because the connector
+# itself is constructed from it.
+#
+# An earlier form pointed at the YAML above via an "lmcache_config_file" key.
+# That key exists in neither the engine nor the cache library at these pinned
+# versions — searching both trees finds nothing — so the file was never read
+# and the library ran on defaults: a local tier only, no remote backend, and
+# therefore not one log line about a plugin. The YAML remains as the reference
+# for operators who prefer the environment-variable route.
 cat > "$WORK/kv_transfer.json" <<EOF
 {"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both",
- "kv_connector_extra_config": {"lmcache_config_file": "$WORK/lmcache_kvblockd.yaml"}}
+ "kv_connector_extra_config": {
+   "lmcache.remote_storage_plugins": "kvblockd",
+   "lmcache.local_cpu": true,
+   "lmcache.max_local_cpu_size": $LMC_MAX_LOCAL_CPU_GB,
+   "lmcache.chunk_size": 256,
+   "lmcache.extra_config": {
+     "kvblockd_token": "$KVBD_TOKEN",
+     "remote_storage_plugin.kvblockd.module_path": "lmcache_kvblockd.adapter",
+     "remote_storage_plugin.kvblockd.class_name": "KvblockdConnectorAdapter",
+     "remote_storage_plugin.kvblockd.url": "kvblockd://$KVBD_ADDR?namespace=lmcache&streams=$KVBD_STREAMS"
+   }}}
 EOF
+python3 -c "import json,sys; json.load(open('$WORK/kv_transfer.json'))" \
+  || die "generated kv_transfer.json is not valid JSON"
 
 # ---- 5. link shaping: attempt only if asked; record the truth either way ----
 TC_LINK="unshaped-loopback (tc shaping not attempted)"
