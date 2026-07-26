@@ -174,6 +174,7 @@ class AdapterConfig:
         "op_timeout",
         "port",
         "prewarm_bytes",
+        "revision",
         "so_rcvbuf",
         "staging_bytes",
         "store_flush_timeout_s",
@@ -269,6 +270,13 @@ class AdapterConfig:
         rev = (getattr(model, "tokenizer_revision", None)
                or getattr(model, "revision", None))
         c.tokenizer_revision = str(rev) if rev else ""
+        # The MODEL WEIGHTS revision is its own identity field, not just the
+        # tokenizer_revision fallback above: same model path + same tokenizer
+        # revision but different weights produce different KV bytes for
+        # identical token ids — sharing keys across them serves
+        # stale-weights KV with zero errors.
+        wrev = getattr(model, "revision", None)
+        c.revision = str(wrev) if wrev else ""
         par = getattr(vllm_config, "parallel_config", None)
         c.world_size = int(getattr(par, "world_size", 1) or 1)
         # Refuse multi-GPU outright: the key identity has no per-rank
@@ -308,6 +316,7 @@ class AdapterConfig:
                 "kv_cache_dtype": c.kv_cache_dtype,
                 "tokenizer": c.tokenizer,
                 "tokenizer_revision": c.tokenizer_revision,
+                "revision": c.revision,
                 "blob_version": BLOB_VERSION,
             }
         )

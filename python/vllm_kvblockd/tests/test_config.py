@@ -239,7 +239,7 @@ def test_tier_fields_resolve_auto_dtype_and_fold_groups():
 
 
 def _vc(cache_dtype="auto", model_dtype="torch.bfloat16", tokenizer=None,
-        tokenizer_revision=None, model="facebook/opt-125m"):
+        tokenizer_revision=None, revision=None, model="facebook/opt-125m"):
     """Stub VllmConfig with the knobs the fingerprint-completion tests turn."""
 
     class KTC:
@@ -253,6 +253,8 @@ def _vc(cache_dtype="auto", model_dtype="torch.bfloat16", tokenizer=None,
         mattrs["tokenizer"] = tokenizer
     if tokenizer_revision is not None:
         mattrs["tokenizer_revision"] = tokenizer_revision
+    if revision is not None:
+        mattrs["revision"] = revision
 
     class VC:
         kv_transfer_config = KTC()
@@ -288,6 +290,22 @@ def test_fingerprint_folds_tokenizer_identity():
     assert base.tokenizer == "facebook/opt-125m"  # falls back to the model path
     assert other_tok.tokenizer == "org/other-tokenizer"
     assert len({base.fingerprint, other_tok.fingerprint, other_rev.fingerprint}) == 3
+
+
+def test_fingerprint_folds_model_revision_as_its_own_field():
+    """The WEIGHTS revision is its own identity field, never just the
+    tokenizer_revision fallback: two engines pinning the SAME tokenizer
+    revision but different weights revisions produce different KV bytes for
+    identical token ids — sharing keys across them serves stale-weights KV."""
+    a = AdapterConfig.from_vllm_config(_vc(tokenizer_revision="tok-rev"))
+    b = AdapterConfig.from_vllm_config(_vc(tokenizer_revision="tok-rev", revision="v2"))
+    assert a.fingerprint != b.fingerprint, "weights revision did not fork the keyspace"
+    assert a.tokenizer_revision == b.tokenizer_revision == "tok-rev"
+    assert (a.revision, b.revision) == ("", "v2")
+    # ...and the tokenizer_revision fallback to the weights revision is
+    # unchanged (absent tokenizer_revision still inherits it).
+    c = AdapterConfig.from_vllm_config(_vc(revision="v2"))
+    assert c.tokenizer_revision == "v2" and c.revision == "v2"
 
 
 def test_fingerprint_folds_blob_version(monkeypatch):
