@@ -111,12 +111,27 @@ the table is labeled single-run rather than silently treated as final.
      measured spread% here. The same marker covers the Qwen long-context
      table below (its "single-run disclosures apply as above" line). -->
 
-| prefix | recompute (no connector) | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
+**n=3 independent runs** (each its own engine boots; median across runs, per-run
+values and min/max in the aggregate JSONL; worst p50 spread 5.3%). The cold
+arm runs the connector's **write-behind** store path (0.2.x): misses stage a
+copy in-band and the TCP put happens off the critical path.
+
+| prefix | recompute (no connector)² | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
 |---|---|---|---|---|---|
-| 1k  | 269 ms  | 506 ms  | **76 ms**  | **3.5×** | 6.6× |
-| 4k  | 1070 ms | 2035 ms | **174 ms** | **6.2×** | 11.7× |
-| 8k  | 2212 ms | 4147 ms | **302 ms** | **7.3×** | 13.7× |
-| 16k | 5045 ms | 8925 ms | **552 ms** | **9.1×** | 16.2× |
+| 1k  | 269 ms  | 407 ms  | **80 ms**  | **3.4×** | 5.1× |
+| 4k  | 1070 ms | 1614 ms | **181 ms** | **5.9×** | 8.9× |
+| 8k  | 2212 ms | 3341 ms | **325 ms** | **6.8×** | 10.3× |
+| 16k | 5045 ms | 7305 ms | **599 ms** | **8.4×** | 12.2× |
+
+² baseline is n=1 (its measured rep spread is <1%; an n=3 baseline rides the
+next paid session). Movements vs the earlier single-run table, stated
+plainly: the cold arm dropped ~18% (write-behind landed — store-on-miss
+overhead is now 1.45–1.51× vs 1.77–1.90×, with the residual attributed to
+per-layer host staging copies, the next pre-registered lever), and the warm
+arm is ~5–8% slower than the pre-wave single run (588–619 vs 552 at 16k —
+the wave added per-recv deadline enforcement and a store drain thread;
+profiling this regression is on the ledger, and the overlap pipeline wave
+targets a floor well below either number).
 
 The warm column improved 3.6–4.8× between run 4 and run 5 by rebuilding the
 connector's load path (pinned staging, chunked DMA, sharded drain — commit
@@ -167,10 +182,19 @@ blocks per rep @16k, 1999–2000 per rep @32k (per-prompt calibration lands
 within a token, so reps differ by one block; the gate is exact against each
 rep's own measured count) — and every record is path-stamped `chunked-slab`.
 
-| prefix | recompute (no connector) | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
+**n=3 independent runs**, write-behind cold arm, same protocol as above:
+
+| prefix | recompute (no connector)² | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
 |---|---|---|---|---|---|
-| 16k | 4,588 ms | 7,271 ms | **321 ms** | **14.3×** | 22.6× |
-| 32k | 10,923 ms | 15,998 ms | **636 ms** | **17.2×** | 25.1× |
+| 16k | 4,588 ms | 6,187 ms | **369 ms** (336–379) | **12.4×** | 16.8× |
+| 32k | 10,923 ms | 13,878 ms | **685 ms** (667–697) | **15.9×** | 20.3× |
+
+The warm@16k cell's cross-run spread is **11.8% — above our 10% target**
+and flagged by the aggregate gate; the full range is printed rather than
+the median alone, and the conservative end of every ratio uses the slow
+end of the range (10,923/697 = 15.7× worst-case at 32k; 4,588/379 = 12.1×
+at 16k). Earlier single-run cells (321/636 ms, 17.2×/25.1×) predate the
+write-behind wave and are superseded by this table.
 
 Why the multiple grows vs the Llama table above: the speedup is
 `prefill(L) / reload(L)` — prefill grows superlinearly with context while
