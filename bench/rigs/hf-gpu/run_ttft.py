@@ -462,6 +462,57 @@ def run_measure(args, stamp: dict) -> int:
     return 0
 
 
+# ----------------------------------------------------------- phase: baseline
+
+def run_baseline(args, stamp: dict) -> int:
+    """Pure-recompute control: the engine serving this phase has NO KV
+    connector configured at all (job.sh BASELINE_ONLY=1 omits
+    --kv-transfer-config), so TTFT here is recompute with zero store-on-miss
+    overhead. This is the third chart series: the measure phase's cold arm
+    runs WITH the connector and pays the synchronous store-on-miss write —
+    the steady-state serving shape — while this one is what a skeptic means
+    by "recompute". Fresh nonce per rep (no reuse), no daemon, no state."""
+    lengths = parse_lengths(args.lengths)
+    n_pairs = args.warmup + args.reps
+    out = open(args.out, "a")
+    rc = 0
+    for L in lengths:
+        rows = []
+        for rep in range(n_pairs):
+            nonce = f"{uuid.uuid4().hex[:12]}-L{L}-b{rep}"
+            prompt, ntok = build_prompt(args.vllm, args.model, L, nonce)
+            m = measure_stream(args.vllm, args.model, prompt,
+                               args.gen_tokens, args.request_timeout)
+            usage = m.get("usage") or {}
+            rows.append({"warmup": rep < args.warmup,
+                         "ttft_ms": m["ttft_s"] * 1e3,
+                         "prompt_tokens": int(usage.get("prompt_tokens", ntok))})
+            print(f"[baseline] L={L} rep={rep} tokens={rows[-1]['prompt_tokens']} "
+                  f"ttft={rows[-1]['ttft_ms']:.0f}ms", flush=True)
+        used = [r for r in rows if not r["warmup"]]
+        ttfts = [r["ttft_ms"] for r in used]
+        rec = {
+            "schema_version": 1, "kind": "ttft",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "store": "none",
+            "arm": "baseline", "series": "recompute (no connector)",
+            "target_prefix_tokens": L,
+            "prefix_tokens": int(statistics.median(r["prompt_tokens"] for r in used)),
+            "gen_tokens": args.gen_tokens,
+            "reps": len(used), "warmup_reps_discarded": args.warmup,
+        }
+        rec.update(stamp)
+        p50 = statistics.median(ttfts)
+        rec.update({"ttft_ms": p50, "ttft_p50_ms": p50, "ttft_p95_ms": _p95(ttfts),
+                    "ttft_all_ms": [round(x, 3) for x in ttfts]})
+        line = json.dumps(rec, sort_keys=True)
+        out.write(line + "\n")
+        out.flush()
+        print(f"{args.print_prefix} {line}", flush=True)
+    out.close()
+    return rc
+
+
 # ----------------------------------------------------------------- selftest
 
 def _stub_server(ctl):
@@ -655,6 +706,25 @@ def selftest() -> int:
             print(f"[selftest] no-hit measure: rc=3, {len(bad_warm)} warm records flagged "
                   "warm_hits_verified=false, kvb_hit_delta_total=0")
 
+        # 6b) baseline phase: cold-only control, no daemon dependency — must
+        #     produce one arm="baseline" record per length with NO
+        #     verification fields (there is nothing to verify against), even
+        #     with the stub's counters frozen ("none" = no daemon reachable
+        #     would look identical).
+        ctl["on_completion"] = "none"
+        out_base = os.path.join(tmp, "base.jsonl")
+        rc = run_baseline(mkargs(out=out_base), {"model": "stub", "rig": "selftest"})
+        base = [json.loads(l) for l in open(out_base)]
+        if rc != 0 or len(base) != 2 or any(r["arm"] != "baseline" for r in base) \
+                or any(r["series"] != "recompute (no connector)" for r in base) \
+                or any("warm_hits_verified" in r or "kvb_hit_delta_total" in r for r in base) \
+                or any(r["ttft_ms"] <= 0 for r in base):
+            print(f"FAIL: baseline phase: rc={rc} records={base}", file=sys.stderr)
+            ok = False
+        else:
+            print(f"[selftest] baseline phase: rc=0, {len(base)} cold-only control records, "
+                  "no verification fields (nothing to verify against)")
+
         # 7) healthy measure: verified records, sane schema, CHART2JSONL marker.
         ctl["on_completion"] = "hit"
         out_good = os.path.join(tmp, "good.jsonl")
@@ -698,10 +768,12 @@ def selftest() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--phase", choices=("populate", "measure"),
+    ap.add_argument("--phase", choices=("populate", "measure", "baseline"),
                     help="populate: store the sweep prompts via vLLM #1 and verify "
                          "kvblockd received them; measure: on a RESTARTED vLLM, time "
-                         "warm (kvblockd reload) then cold (recompute) arms")
+                         "warm (kvblockd reload) then cold (recompute) arms; "
+                         "baseline: pure-recompute control on an engine with NO "
+                         "connector configured (no daemon, no state)")
     ap.add_argument("--vllm", default="http://127.0.0.1:8000")
     ap.add_argument("--metrics", default="http://127.0.0.1:9442",
                     help="kvblockd metrics endpoint (put receipt + hit verification)")
@@ -753,6 +825,8 @@ def main() -> int:
         if not v:
             ap.error(f"--stamp needs K=V, got {kv!r}")
         stamp[k] = v
+    if args.phase == "baseline":
+        return run_baseline(args, stamp)
     return run_measure(args, stamp)
 
 

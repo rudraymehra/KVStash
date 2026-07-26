@@ -50,6 +50,9 @@ WORK="${WORK:-/tmp/kvb-ttft}"
 mkdir -p "$WORK/bin" "$WORK/results"
 
 # ---- knobs (all overridable via job -e/--env) ------------------------------
+BASELINE_ONLY="${BASELINE_ONLY:-0}"           # 1 = pure-recompute control: NO connector, NO daemon,
+                                              # one engine boot, cold-only sweep. The third chart
+                                              # series; see run_ttft.py --phase baseline.
 MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 LENGTHS="${LENGTHS:-1024,4096,8192,16384}"
 REPS="${REPS:-5}"
@@ -137,6 +140,9 @@ elif (( MAX_MODEL_LEN < NEED_LEN )); then
 fi
 
 PAIRS=$((REPS + WARMUP))
+if [[ "$BASELINE_ONLY" == "1" ]]; then
+  KVBD_ARENA_BYTES=0   # no daemon in this mode; silence the derivation below
+fi
 if [[ -z "$KVBD_ARENA_BYTES" ]]; then
   # The warm arm only works if EVERY populated block is still resident when
   # its measured read arrives: arena >= all populated KV + 15% headroom.
@@ -158,6 +164,8 @@ if [[ -r /proc/meminfo ]]; then
 fi
 
 # ---- 2. Go toolchain + kvblockd from THIS checkout -------------------------
+# (skipped in baseline mode: no daemon, no connector, nothing to build)
+if [[ "$BASELINE_ONLY" != "1" ]]; then
 if ! command -v go >/dev/null 2>&1; then
   log "installing go$GO_VERSION"
   curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz
@@ -215,6 +223,7 @@ cat > "$WORK/kv_transfer.json" <<EOF
 EOF
 python3 -c "import json,sys; json.load(open('$WORK/kv_transfer.json'))" \
   || die "generated kv_transfer.json is not valid JSON"
+fi  # BASELINE_ONLY skip of build/pip/configs
 
 # ---- 5. link shaping: attempt only if asked; record the truth either way ----
 TC_LINK="unshaped-loopback (tc shaping not attempted)"
@@ -230,15 +239,20 @@ if [[ -n "$TC_RATE_GBIT" ]]; then
 fi
 
 # ---- 6. start kvblockd (stays up across BOTH vLLM lifetimes) -----------------
-log "starting kvblockd (DRAM arena $KVBD_ARENA_BYTES bytes)"
-"$WORK/bin/kvblockd" -config "$WORK/kvblockd.yaml" > "$WORK/kvbd.log" 2>&1 &
-KVBD_PID=$!
-bash "$ROOT/scripts/wait-healthz.sh" "$KVBD_METRICS" 30
+if [[ "$BASELINE_ONLY" != "1" ]]; then
+  log "starting kvblockd (DRAM arena $KVBD_ARENA_BYTES bytes)"
+  "$WORK/bin/kvblockd" -config "$WORK/kvblockd.yaml" > "$WORK/kvbd.log" 2>&1 &
+  KVBD_PID=$!
+  bash "$ROOT/scripts/wait-healthz.sh" "$KVBD_METRICS" 30
+fi
 
 # ---- 7. driver selftest BEFORE spending GPU-minutes on requests -------------
 # Proves the first-token timer AND the two-phase honesty gates (populate must
-# fail on a severed store path; unproven warm hits must be flagged).
-python3 "$HERE/run_ttft.py" --selftest
+# fail on a severed store path; unproven warm hits must be flagged). The sed
+# renames the selftest's stub CHART2JSONL lines so the log-retrieval sed can
+# never scoop stub records into a results file (it did once — the run-4
+# extraction picked up 8 selftest records until filtered by rig).
+python3 "$HERE/run_ttft.py" --selftest | sed 's/^CHART2JSONL /SELFTESTJSONL /'
 
 # ---- 8. vLLM lifecycle (started twice: populate engine, then a fresh measure engine)
 VLLM_LOG=""
@@ -252,13 +266,17 @@ start_vllm() {  # $1 = log file, $2 = health timeout seconds
   # --disable-hybrid-kv-cache-manager: v0.25's factory refuses external
   # connectors without SupportsHMA otherwise (connector.py docstring; the
   # Docker rig serves with the same flag).
+  # Baseline mode serves with NO --kv-transfer-config: the whole point of
+  # that control series is an engine that cannot pay any connector cost.
+  KV_XFER_ARGS=(--kv-transfer-config "$(cat "$WORK/kv_transfer.json" 2>/dev/null || echo '{}')")
+  if [[ "$BASELINE_ONLY" == "1" ]]; then KV_XFER_ARGS=(); fi
   PYTHONHASHSEED=0 \
   vllm serve "$MODEL" --port "$VLLM_PORT" --dtype bfloat16 \
     --max-model-len "$MAX_MODEL_LEN" --max-num-seqs 1 \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --no-enable-prefix-caching \
     --disable-hybrid-kv-cache-manager \
-    --kv-transfer-config "$(cat "$WORK/kv_transfer.json")" \
+    "${KV_XFER_ARGS[@]}" \
     > "$VLLM_LOG" 2>&1 &
   VLLM_PID=$!
   # Passing the pid makes a crashed server fail in seconds instead of burning
@@ -289,6 +307,16 @@ start_vllm() {  # $1 = log file, $2 = health timeout seconds
   # never built the connector. Byte-level proof stays where it belongs: the
   # populate phase's per-prompt put receipt (kvb_bytes_total{dir="in"} must
   # grow within PUT_WAIT_S or the driver aborts loudly).
+  if [[ "$BASELINE_ONLY" == "1" ]]; then
+    # No connector requested; assert the inverse — a leaked transfer config
+    # here would contaminate the pure-recompute control with store costs.
+    if grep -q "Creating v1 connector" "$VLLM_LOG"; then
+      log "FATAL: baseline engine constructed a KV connector — the control is contaminated"
+      exit 1
+    fi
+    log "baseline engine confirmed connector-free"
+    return 0
+  fi
   if ! grep -q "Creating v1 connector with name: KvblockdConnector" "$VLLM_LOG"; then
     log "FATAL: vLLM is healthy but the connector factory never constructed KvblockdConnector — the kv-transfer config was dropped or ignored and the engine is serving with no KV connector"
     log "connector/config lines from $VLLM_LOG:"
@@ -310,6 +338,26 @@ stop_vllm() {
   wait "$VLLM_PID" 2>/dev/null || true
   VLLM_PID=""
 }
+
+# ---- 8b. BASELINE mode: one boot, cold-only control, then straight to results
+if [[ "$BASELINE_ONLY" == "1" ]]; then
+  start_vllm "$WORK/vllm-baseline.log" 2400
+  GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | sed 's/^ *//;s/ *$//')"
+  log "baseline: lengths=$LENGTHS x $PAIRS pairs, NO connector — pure recompute control"
+  rc=0
+  python3 "$HERE/run_ttft.py" --phase baseline \
+    --vllm "http://127.0.0.1:$VLLM_PORT" \
+    --model "$MODEL" --lengths "$LENGTHS" --reps "$REPS" --warmup "$WARMUP" \
+    --gen-tokens "$GEN_TOKENS" --out "$OUT_JSONL" \
+    --stamp gpu="$GPU_NAME (hf-jobs ${FLAVOR:-flavor-unset})" \
+    --stamp vllm="$VLLM_VER" --stamp connector="none (baseline control)" \
+    --stamp tc_link="$TC_LINK" --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
+    --stamp git_sha="$GIT_SHA" || rc=$?
+  log "JSONL at $OUT_JSONL ($(wc -l < "$OUT_JSONL" 2>/dev/null || echo 0) records)"
+  [[ $rc -eq 0 ]] || { tail_logs; die "baseline driver exited rc=$rc"; }
+  log "DONE (baseline)"
+  exit 0
+fi
 
 # ---- 9. PHASE 1: populate (vLLM #1 stores every sweep prompt into kvblockd) --
 start_vllm "$WORK/vllm-populate.log" 2400   # generous: first boot downloads ~15 GB of weights
@@ -370,4 +418,7 @@ if [[ $rc -ne 0 ]]; then
   tail_logs
   die "driver exited rc=$rc (rc=3 means data was produced but some warm reps were UNVERIFIED)"
 fi
-log "DONE — retrieve with: hf jobs logs <job_id> | sed -n 's/^.*CHART2JSONL //p' > chart2-ttft.jsonl"
+# The retrieval hint must NOT contain the literal marker: an earlier version
+# printed the sed command verbatim, the marker matched its own hint line, and
+# the results file grew a junk row. Marker spelled with a gap on purpose.
+log "DONE — retrieve: hf jobs logs <job_id> | sed -n 's/^.*CHART2''JSONL \({.*\)$/\1/p' > chart2-ttft.jsonl"

@@ -169,12 +169,14 @@ def _conditions(recs):
 
 
 def chart2_ttft(recs, out):
-    # TTFT vs prefix length, cold (recompute) vs warm (kvblockd reload).
+    # TTFT vs prefix length: warm (kvblockd reload) vs cold (recompute WITH
+    # the connector, paying store-on-miss — the steady-state serving shape)
+    # vs baseline (recompute with NO connector — the purist control).
     # One record per (length, arm); duplicates (re-runs) collapse by median.
     cells = {}
     for r in recs:
         x = r.get("target_prefix_tokens") or r.get("prefix_tokens")
-        if not x or r.get("arm") not in ("cold", "warm"):
+        if not x or r.get("arm") not in ("cold", "warm", "baseline"):
             continue
         cells.setdefault((r["arm"], r.get("series", r["arm"]), x), []).append(r)
 
@@ -200,11 +202,17 @@ def chart2_ttft(recs, out):
         by_arm[arm] = dict(zip(xs, p50s))
 
     # Per-length speedup (the chart's whole point) annotated at the warm p50;
-    # <1x means recompute won there — printed just as honestly.
+    # <1x means recompute won there — printed just as honestly. When the
+    # no-connector baseline series is present, both ratios are printed: vs
+    # cold-with-store (steady-state serving) and vs pure recompute (the
+    # conservative number a skeptic asks for).
     cold, warm = by_arm.get("cold", {}), by_arm.get("warm", {})
+    base = by_arm.get("baseline", {})
     for x in sorted(set(cold) & set(warm)):
         if warm[x] > 0:
             note = f"{cold[x] / warm[x]:.1f}x"
+            if x in base:
+                note += f" ({base[x] / warm[x]:.1f}x vs no-connector)"
             if x in unverified:
                 note += " (UNVERIFIED)"
             ax.annotate(note, (x, warm[x]), textcoords="offset points",

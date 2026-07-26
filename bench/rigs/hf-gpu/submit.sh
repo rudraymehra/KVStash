@@ -8,7 +8,8 @@
 #
 # Knobs (env): MODEL, GIT_REF, LENGTHS, REPS, WARMUP, GEN_TOKENS,
 # MAX_MODEL_LEN, KVBD_ARENA_BYTES, CONNECTOR_STAGING_GB, KV_BYTES_PER_TOKEN,
-# TIMEOUT, RESULTS_REPO, FLAVOR, HF_BIN.
+# TIMEOUT, RESULTS_REPO, FLAVOR, HF_BIN, BASELINE_ONLY (1 = pure-recompute
+# control run: no connector, no daemon, cold-only — the third chart series).
 #
 # The job container clones the PUBLIC repo tarball at GIT_REF — local
 # uncommitted changes are NOT visible to the job; push first.
@@ -77,7 +78,7 @@ CMD=("$HF_BIN" jobs run
   -e GEN_TOKENS="$GEN_TOKENS"
   -e FLAVOR="$FLAVOR")
 # optional knobs: forward only when the caller set them (job.sh has the defaults/derivations)
-for v in MAX_MODEL_LEN WARMUP KVBD_ARENA_BYTES CONNECTOR_STAGING_GB KV_BYTES_PER_TOKEN RESULTS_REPO; do
+for v in MAX_MODEL_LEN WARMUP KVBD_ARENA_BYTES CONNECTOR_STAGING_GB KV_BYTES_PER_TOKEN RESULTS_REPO BASELINE_ONLY; do
   if [[ -n "${!v:-}" ]]; then CMD+=(-e "$v=${!v}"); fi
 done
 CMD+=("$IMAGE" /bin/bash -c "$BOOTSTRAP")
@@ -103,5 +104,8 @@ echo
 echo "follow logs:     $HF_BIN jobs logs -f $JOB_ID"
 echo "check status:    $HF_BIN jobs inspect $JOB_ID"
 echo "cancel:          $HF_BIN jobs cancel $JOB_ID"
-echo "fetch results:   mkdir -p bench/results/rig-e && $HF_BIN jobs logs $JOB_ID | sed -n 's/^.*CHART2JSONL //p' > bench/results/rig-e/chart2-ttft.jsonl"
+# The sed requires a '{' after the marker (drops the job's own hint line and
+# any prose mentioning the marker); selftest stub records are already renamed
+# SELFTESTJSONL by job.sh.
+echo "fetch results:   mkdir -p bench/results/rig-e && $HF_BIN jobs logs $JOB_ID | sed -n 's/^.*CHART2JSONL \\({.*\\)$/\\1/p' > bench/results/rig-e/chart2-ttft.jsonl"
 echo "render chart:    python3 bench/report/plot.py chart2 --in bench/results/rig-e/chart2-ttft.jsonl --out chart2.png"
