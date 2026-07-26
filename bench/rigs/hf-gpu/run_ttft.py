@@ -272,22 +272,26 @@ def judge_warm_rep(hit_delta: float, expected: int) -> tuple[bool, str | None]:
     return False, f"hit-delta-exceeds-expected ({hit_delta:.0f} > {expected} blocks)"
 
 
-def grep_dropped_puts(log_path: str) -> int | None:
-    """Last cumulative `dropped=` count from the connector's store-queue lines
-    in the engine log ("kvblockd store queue overflow: dropped=N ..." during
-    the run, "kvblockd store queue: dropped=N failed=M dropped_bytes=B" at
-    shutdown). The counter is cumulative, so the LAST match is the total.
-    None if the log is unreadable or no line ever appeared."""
-    dropped = None
+def grep_dropped_puts(log_path: str) -> tuple[int | None, int | None]:
+    """Last cumulative (`dropped=`, `failed=`) counts from the connector's
+    store-queue lines in the engine log ("kvblockd store queue overflow:
+    dropped=N failed=M ..." during the run, "kvblockd store queue: dropped=N
+    failed=M dropped_bytes=B" at shutdown). Both counters are cumulative, so
+    the LAST match is the total; they stay DISTINCT — dropped never delivered
+    a byte (budget/flush), failed errored on the wire — but either one
+    silently shrinks the warm set. (None, None) if the log is unreadable or
+    no line ever appeared."""
+    dropped = failed = None
     try:
         with open(log_path, errors="replace") as f:
             for line in f:
-                m = re.search(r"kvblockd store queue[^\n]*?dropped=(\d+)", line)
+                m = re.search(r"kvblockd store queue[^\n]*?dropped=(\d+) failed=(\d+)",
+                              line)
                 if m:
-                    dropped = int(m.group(1))
+                    dropped, failed = int(m.group(1)), int(m.group(2))
     except OSError:
-        return None
-    return dropped
+        return None, None
+    return dropped, failed
 
 
 def grep_load_path(log_path: str) -> str | None:
@@ -381,15 +385,23 @@ def run_populate(args) -> int:
     # SHRINKS the warm set — the tail of every affected prompt becomes a
     # permanent miss — so a nonzero count aborts before anything is measured.
     if getattr(args, "vllm_log", ""):
-        dropped = grep_dropped_puts(args.vllm_log)
+        dropped, failed = grep_dropped_puts(args.vllm_log)
         if dropped:
             raise PopulateError(
                 f"the connector dropped {dropped} store block(s) during populate "
                 f"(grep 'kvblockd store queue' in {args.vllm_log}). The warm set "
                 "is silently smaller than the sweep; raise "
                 "kvblockd_store_queue_bytes (or slow the populate) and rerun.")
-        print(f"[populate] store-queue drop check: dropped="
-              f"{0 if dropped is None else dropped} in {args.vllm_log}", flush=True)
+        if failed:
+            raise PopulateError(
+                f"the connector counted {failed} FAILED store put(s) during populate "
+                f"(grep 'kvblockd store queue' in {args.vllm_log}) — blocks that "
+                "errored on the wire and never reached kvblockd. The warm set is "
+                "silently smaller than the sweep exactly like a drop; fix the "
+                "store path (daemon health / network) and rerun.")
+        print(f"[populate] store-queue check: dropped="
+              f"{0 if dropped is None else dropped} failed="
+              f"{0 if failed is None else failed} in {args.vllm_log}", flush=True)
     bpt = put_total / max(total_tokens, 1)
     print(f"[populate] DONE: {put_total / 1e9:.2f}GB in {blocks_total:.0f} blocks stored to "
           f"kvblockd for {total_tokens} prompt tokens (~{bpt / 1024:.0f}KiB/token)",
@@ -837,15 +849,35 @@ def selftest() -> int:
             else:
                 print("[selftest] populate on a lossy store queue failed loudly, as "
                       f"required (last cumulative dropped= wins): {str(e)[:90]}...")
+        # 5c) `failed=` is gated exactly like `dropped=`: a put that errored on
+        #     the wire shrinks the warm set just as silently. Counters stay
+        #     distinct in the disclosure line; either one nonzero aborts.
+        with open(drop_log, "w") as f:
+            f.write("WARNING ... kvblockd store queue: dropped=0 failed=2 "
+                    "dropped_bytes=0\n")
+        try:
+            run_populate(mkargs(lengths="96", reps=1, warmup=0,
+                                state=os.path.join(tmp, "failed.json"),
+                                vllm_log=drop_log))
+            print("FAIL: populate PASSED although the connector disclosed FAILED "
+                  "store puts (lossy warm set went undetected)", file=sys.stderr)
+            ok = False
+        except PopulateError as e:
+            if "2 FAILED store put" not in str(e):
+                print(f"FAIL: failed-puts abort quoted the wrong count: {e}", file=sys.stderr)
+                ok = False
+            else:
+                print("[selftest] populate on failed store puts failed loudly, as "
+                      f"required: {str(e)[:90]}...")
         with open(drop_log, "w") as f:
             f.write("WARNING ... kvblockd store queue: dropped=0 failed=0 dropped_bytes=0\n")
         rc = run_populate(mkargs(lengths="96", reps=1, warmup=0,
                                  state=os.path.join(tmp, "nodrop.json"), vllm_log=drop_log))
         if rc != 0:
-            print("FAIL: populate rejected a clean dropped=0 disclosure", file=sys.stderr)
+            print("FAIL: populate rejected a clean dropped=0 failed=0 disclosure", file=sys.stderr)
             ok = False
         else:
-            print("[selftest] populate accepts an explicit dropped=0 disclosure")
+            print("[selftest] populate accepts an explicit dropped=0 failed=0 disclosure")
 
         # 6) measure must mark reps UNVERIFIED (rc 3) when hits do not grow.
         ctl["on_completion"] = "none"
