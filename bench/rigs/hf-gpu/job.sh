@@ -262,6 +262,7 @@ cat > "$WORK/kv_transfer.json" <<EOF
    "kvblockd_token": "$KVBD_TOKEN",
    "kvblockd_streams": $KVBD_STREAMS,
    "kvblockd_staging_bytes": $CONNECTOR_STAGING_BYTES,
+   "kvblockd_store_queue_bytes": ${KVBD_STORE_QUEUE_BYTES:-1073741824},
    "kvblockd_verify": $KVBD_VERIFY_JSON}}
 EOF
 python3 -c "import json,sys; json.load(open('$WORK/kv_transfer.json'))" \
