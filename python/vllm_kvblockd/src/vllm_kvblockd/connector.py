@@ -362,6 +362,11 @@ class KvblockdConnector(_Base):
         self._sq_bytes = 0            # bytes currently queued
         self._sq_inflight = 0         # blocks popped, put() not finished
         self._sq_inflight_bytes = 0
+        # In-flight blocks the SHUTDOWN disclosure already counted dropped
+        # (join timed out mid-put). The drain thread reconciles when the put
+        # finally returns: delivered -> un-count the pessimistic drop; failed
+        # -> already disclosed dropped, must not ALSO count failed.
+        self._sq_inflight_counted = 0
         self._store_thread: threading.Thread | None = None
         self._store_stop = False      # shutdown: drain the remainder, then exit
         self._store_abort = False     # wedged flush: exit without draining
@@ -1259,17 +1264,24 @@ class KvblockdConnector(_Base):
             if self._store_stop or self._sq_bytes + n > self._cfg.store_queue_bytes:
                 self.dropped_puts += 1
                 self.dropped_put_bytes += n
-                # Rate-limited in-run disclosure (the shutdown summary line is
-                # unconditional); the bench populate phase greps `dropped=`.
-                self._log.maybe(
-                    "store-drop",
-                    f"kvblockd store queue overflow: dropped={self.dropped_puts} "
-                    f"failed={self.failed_puts} dropped_bytes={self.dropped_put_bytes}",
-                )
-                return False
-            self._sq.append((key, buf))
-            self._sq_bytes += n
-            self._sq_cond.notify_all()
+                dropped, failed, dbytes = (self.dropped_puts, self.failed_puts,
+                                           self.dropped_put_bytes)
+            else:
+                self._sq.append((key, buf))
+                self._sq_bytes += n
+                self._sq_cond.notify_all()
+                dropped = None
+        if dropped is not None:
+            # Rate-limited in-run disclosure (the shutdown summary line is
+            # unconditional); the bench populate phase greps `dropped=`.
+            # OUTSIDE the lock: _log.maybe formats and may hit a logging
+            # handler — never hold _sq_cond across foreign code.
+            self._log.maybe(
+                "store-drop",
+                f"kvblockd store queue overflow: dropped={dropped} "
+                f"failed={failed} dropped_bytes={dbytes}",
+            )
+            return False
         self._store_thread_start()
         return True
 
@@ -1285,10 +1297,16 @@ class KvblockdConnector(_Base):
         t.start()
 
     def _store_drain(self) -> None:
-        """FIFO drain loop: pop one staged blob, put it. A failed put counts
-        (failed_puts), logs rate-limited, and drops the client with the same
-        breaker discipline as loads — the thread itself NEVER dies to an op
+        """FIFO drain loop: pop one staged blob, put it. A CONNECTION-class
+        failure (daemon gone, breaker window) re-queues the item ONCE at the
+        head and waits out the redial backoff before retrying — a blip costs
+        one backoff window, never the whole backlog burned at one doomed put
+        per item. A SECOND consecutive failure of the same item counts it
+        failed (failed_puts) and moves on (no infinite loop); non-connection
+        failures count immediately. Either way the client is dropped with the
+        same breaker discipline as loads and the thread NEVER dies to an op
         error, so delivery resumes after a redial. OK_EXISTS = dedup, fine."""
+        retry_of: bytearray | None = None  # the buf that already failed once
         while True:
             with self._sq_cond:
                 while not self._sq and not self._store_stop:
@@ -1300,18 +1318,51 @@ class KvblockdConnector(_Base):
                 self._sq_bytes -= n
                 self._sq_inflight += 1
                 self._sq_inflight_bytes += n
+            err: BaseException | None = None
             try:
                 self._ensure().put(key, [buf])
             except Exception as e:  # noqa: BLE001 — never let the drain thread die: a lost store is a future miss
-                with self._sq_cond:
+                err = e
+            requeue = (err is not None
+                       and isinstance(err, (ConnectionLost, OSError))
+                       and buf is not retry_of)
+            with self._sq_cond:
+                self._sq_inflight -= 1
+                self._sq_inflight_bytes -= n
+                # Reconcile with a shutdown that already disclosed this
+                # in-flight block as dropped (join timed out mid-put).
+                counted_dropped = self._sq_inflight_counted > 0
+                if counted_dropped:
+                    self._sq_inflight_counted -= 1
+                if err is None:
+                    retry_of = None
+                    if counted_dropped:  # delivered after all: un-count it
+                        self.dropped_puts -= 1
+                        self.dropped_put_bytes -= n
+                elif requeue and not self._store_abort:
+                    self._sq.appendleft((key, buf))
+                    self._sq_bytes += n
+                    retry_of = buf
+                elif not counted_dropped:  # dropped-at-shutdown is not ALSO failed
+                    retry_of = None
                     self.failed_puts += 1
-                self._log.maybe("store", "kvblockd async store failed", e)
-                self._drop_client(e)
-            finally:
+                self._sq_cond.notify_all()
+            if err is None:
+                continue
+            self._log.maybe("store", "kvblockd async store failed", err)
+            self._drop_client(err)
+            if requeue:
+                # Sit out the redial backoff (and the dial breaker _drop_client
+                # just armed) instead of instantly re-failing the retry. The
+                # deadline loop ignores enqueue wakeups; shutdown's stop/abort
+                # flags cut it short so a flush is never held hostage.
+                wake = max(time.monotonic() + _REDIAL_BACKOFF_S, self._next_dial)
                 with self._sq_cond:
-                    self._sq_inflight -= 1
-                    self._sq_inflight_bytes -= n
-                    self._sq_cond.notify_all()
+                    while not self._store_stop and not self._store_abort:
+                        left = wake - time.monotonic()
+                        if left <= 0:
+                            break
+                        self._sq_cond.wait(left)
 
     def _store_flush(self, timeout: float) -> int:
         """Wait (up to timeout) until the queue is empty and nothing is in
@@ -1344,6 +1395,11 @@ class KvblockdConnector(_Base):
             if remainder:
                 self.dropped_puts += remainder
                 self.dropped_put_bytes += self._sq_bytes + self._sq_inflight_bytes
+                # An in-flight put is UNDELIVERED at disclosure time, so it
+                # counts dropped — but the put may still return: remember how
+                # many were counted so the drain thread can reconcile
+                # (delivered -> un-count; failed -> not ALSO failed_puts).
+                self._sq_inflight_counted = self._sq_inflight
             self._sq.clear()
             self._sq_bytes = 0
             self._sq_cond.notify_all()

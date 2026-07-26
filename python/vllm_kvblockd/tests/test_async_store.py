@@ -262,25 +262,89 @@ def test_shutdown_flushes(daemon, caplog):
                for r in caplog.records)
 
 
-def test_failed_put_survives(daemon):
-    """A ConnectionLost out of a put counts failed_puts, drops the client
-    (breaker discipline) and leaves the drain thread ALIVE — after a redial
-    the next staged block reaches the real daemon."""
+def test_drain_survives_a_daemon_blip_without_burning_the_backlog(chaos_daemon, monkeypatch):
+    """A connection-class put failure must NOT burn the staged backlog at one
+    doomed put per item under the dial breaker: the drain re-queues the failed
+    item ONCE at the head and waits out the redial backoff before retrying —
+    a daemon blip costs one backoff window, after which EVERYTHING staged is
+    delivered in order and failed_puts stays 0."""
+    from vllm_kvblockd import connector as conn_mod
+
+    monkeypatch.setattr(conn_mod, "_REDIAL_BACKOFF_S", 0.5)
+    conn = make_conn(chaos_daemon, kvblockd_op_timeout_s=2.0,
+                     kvblockd_connect_timeout_s=2.0)
+    pause_drain(conn)
+    kv = fresh_kv()
+    fill_block(kv, 0, seed=230)
+    fill_block(kv, 1, seed=231)
+    toks = list(range(430, 439))  # 2 blocks
+    store_step(conn, StubRequest("bl1", toks, "as-blip"), [0, 1], kv)
+    assert len(conn._sq) == 2
+
+    # The blip: the daemon dies mid-run; a fresh one takes over the SAME
+    # endpoint (kubelet restart / systemd Restart= — the redial target).
+    chaos_daemon["proc"].kill()
+    chaos_daemon["proc"].wait(timeout=5)
+    chaos_daemon["respawn"](chaos_daemon["port"])
+
+    resume_drain(conn)
+    assert conn._store_flush(15.0) == 0
+    assert conn.failed_puts == 0, "a blip must cost a backoff window, not failed puts"
+    assert conn.dropped_puts == 0
+    conn.shutdown()
+
+    conn2 = make_conn(chaos_daemon)  # fresh view of the recovered daemon
+    n, _ = conn2.get_num_new_matched_tokens(StubRequest("bl2", toks, "as-blip"), 0)
+    assert n == 8, "backlog blocks never reached the recovered daemon"
+    conn2.shutdown()
+
+
+def test_drain_gives_up_on_an_item_after_its_retry_fails(daemon, monkeypatch):
+    """The requeue is ONCE per item: a second consecutive failure of the SAME
+    item counts it failed and moves on — a dead endpoint drains the backlog at
+    one retry per item, never an infinite requeue loop."""
+    from vllm_kvblockd import connector as conn_mod
+
+    monkeypatch.setattr(conn_mod, "_REDIAL_BACKOFF_S", 0.05)
+    conn = make_conn(daemon)
+    always_dead = FakeClient(fail_first=10**9)
+    conn._ensure = lambda: always_dead  # every put attempt fails, forever
+    pause_drain(conn)
+    kv = fresh_kv()
+    fill_block(kv, 2, seed=232)
+    fill_block(kv, 3, seed=233)
+    store_step(conn, StubRequest("gu1", list(range(440, 449)), "as-giveup"), [2, 3], kv)
+    assert len(conn._sq) == 2
+    resume_drain(conn)
+    assert wait_until(lambda: conn.failed_puts == 2)
+    assert wait_until(lambda: len(conn._sq) == 0 and conn._sq_inflight == 0)
+    assert conn._store_thread.is_alive()  # the thread survives to serve a recovery
+    conn.shutdown()
+
+
+def test_failed_put_survives(daemon, monkeypatch):
+    """A ConnectionLost out of a put drops the client (breaker discipline)
+    and leaves the drain thread ALIVE; the item is re-queued once and the
+    post-backoff retry redials the real daemon and delivers it — the failure
+    costs a backoff window, not the block (failed_puts stays 0)."""
+    from vllm_kvblockd import connector as conn_mod
+
+    monkeypatch.setattr(conn_mod, "_REDIAL_BACKOFF_S", 0.2)
     conn = make_conn(daemon)
     fake = FakeClient(fail_first=1)
     conn._client = fake
     pause_drain(conn)
     kv = fresh_kv()
     fill_block(kv, 4, seed=216)
-    store_step(conn, StubRequest("fp1", list(range(380, 385)), "as-fail-1"), [4], kv)
+    toks = list(range(380, 385))
+    store_step(conn, StubRequest("fp1", toks, "as-fail-1"), [4], kv)
     resume_drain(conn)
-    assert wait_until(lambda: conn.failed_puts == 1)
-    # _drop_client runs right after the counter bump; wait for it too.
-    assert wait_until(lambda: conn._client is None), "client not dropped after put failure"
+    # _drop_client runs right after the failed put; the fake dies with it.
+    assert wait_until(lambda: fake.closed), "client not dropped after put failure"
+    assert conn._store_flush(10.0) == 0
+    assert conn.failed_puts == 0, "one failure + healthy retry must not count failed"
     assert conn._store_thread.is_alive()
-    assert fake.closed
 
-    conn._next_dial = 0.0  # collapse the 5s redial backoff for the test
     fill_block(kv, 5, seed=217)
     toks2 = list(range(390, 395))
     store_step(conn, StubRequest("fp2", toks2, "as-fail-2"), [5], kv)
@@ -288,7 +352,9 @@ def test_failed_put_survives(daemon):
     assert conn._store_thread.is_alive()
 
     conn2 = make_conn(daemon)  # fresh view of the real daemon
-    n, _ = conn2.get_num_new_matched_tokens(StubRequest("fp3", toks2, "as-fail-2"), 0)
+    n, _ = conn2.get_num_new_matched_tokens(StubRequest("fp3", toks, "as-fail-1"), 0)
+    assert n == 4, "the re-queued put never reached the daemon"
+    n, _ = conn2.get_num_new_matched_tokens(StubRequest("fp4", toks2, "as-fail-2"), 0)
     assert n == 4, "the post-redial put never reached the daemon"
     conn.shutdown()
     conn2.shutdown()
