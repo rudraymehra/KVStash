@@ -28,6 +28,15 @@ makes per-request isolation structural.
 NEVER RAISE on the serving path: every failure degrades to a cache miss
 (LMCache #2204 posture). The only boot-time exception is DeterminismError —
 refusing to start beats a fleet that silently never shares cache.
+
+FAIL-OPEN GUARANTEE: a dead, hung, or slow daemon costs the engine at most
+one bounded delay per breaker window — connect_timeout on a dial, op_timeout
+per recv, kvblockd_load_deadline_s across a whole load (a trickling daemon
+passes every per-recv check forever; the deadline abandons the remaining
+shards, flags the unfilled block ids, and degrades to recompute) — and then
+the dial breaker answers everything instantly for _REDIAL_BACKOFF_S. The
+engine never fails and never waits unboundedly; chaos-tested in
+tests/test_chaos.py (kill -9 / SIGSTOP mid-run, daemon down at boot).
 """
 
 from __future__ import annotations
@@ -839,6 +848,13 @@ class KvblockdConnector(_Base):
 
         body_len = total - BLOB_PREFIX_LEN
         dev = self._layer_kv[names[0]].device
+        # Overall per-load deadline (kvblockd_load_deadline_s): op_timeout
+        # bounds each recv, this bounds the WHOLE load — a daemon trickling
+        # bytes passes every per-recv check forever, and the engine counted
+        # these blocks computed, so the only safe degrade is: abandon the
+        # remaining shards, flag the unfilled bids, recompute.
+        deadline = (time.monotonic() + self._cfg.load_deadline_s
+                    if self._cfg.load_deadline_s > 0 else None)
         used_ring = False
         took_slab = False
         if keys and self._slab_path_ok(dev):
@@ -849,9 +865,10 @@ class KvblockdConnector(_Base):
             if pass_blocks > 0 and self._slab_reserve(pass_blocks * body_len):
                 took_slab = True
                 used_ring = self._load_slab(req, names, dtype_name, bytes_per_layer,
-                                            total, keys, pass_blocks)
+                                            total, keys, pass_blocks, deadline)
         if keys and not took_slab:
-            self._load_perblock(req, names, dtype_name, bytes_per_layer, total, keys)
+            self._load_perblock(req, names, dtype_name, bytes_per_layer, total, keys,
+                                deadline)
         if keys:
             self._note_path("chunked-slab" if used_ring else "per-block")
 
@@ -874,7 +891,7 @@ class KvblockdConnector(_Base):
                            path, self._reported_path)
 
     def _load_perblock(self, req: KvbReqMeta, names, dtype_name, bytes_per_layer,
-                       total, keys) -> None:
+                       total, keys, deadline: float | None = None) -> None:
         """The original per-block load: pageable torch.empty staging + one
         synchronous dst.copy_ per (block, layer). This is THE path for CPU
         paged tensors (the CI backend / bench/e2e/cpu rig depend on it staying
@@ -896,7 +913,8 @@ class KvblockdConnector(_Base):
             staged[idx] = buf
             return memoryview(buf.numpy())
 
-        statuses = self._ensure().batch_get_scatter(keys, BLOB_PREFIX_LEN, alloc)
+        statuses = self._ensure().batch_get_scatter(keys, BLOB_PREFIX_LEN, alloc,
+                                                    deadline=deadline)
         for j, st in enumerate(statuses):
             blk = start + j
             bid = req.block_ids[blk] if blk < len(req.block_ids) else None
@@ -960,7 +978,7 @@ class KvblockdConnector(_Base):
         return True
 
     def _load_slab(self, req: KvbReqMeta, names, dtype_name, bytes_per_layer,
-                   total, keys, pass_blocks: int) -> bool:
+                   total, keys, pass_blocks: int, deadline: float | None = None) -> bool:
         """Slab-staged load: the client drains block bodies straight into
         disjoint pinned-slab slots (the layout gate runs in alloc BEFORE any
         body byte is accepted, exactly like the per-block path), then
@@ -974,6 +992,18 @@ class KvblockdConnector(_Base):
         slab_np = self._slab_np
         used_ring = False
         for p0 in range(0, len(keys), pass_blocks):
+            if deadline is not None and time.monotonic() > deadline:
+                # Load deadline blown between passes: flag every remaining
+                # promised bid and stop — the scheduler counted them computed,
+                # so an unflagged unfilled block is silent garbage.
+                for blk in range(req.load_start_block + p0,
+                                 req.load_start_block + len(keys)):
+                    if blk < len(req.block_ids):
+                        self._load_errors.add(req.block_ids[blk])
+                self._log.maybe("load-deadline",
+                                f"load deadline exceeded — abandoning {len(keys) - p0} "
+                                f"remaining blocks (recompute) req={req.req_id}")
+                break
             sub = keys[p0:p0 + pass_blocks]
 
             def alloc(idx, prefix, blen):
@@ -991,7 +1021,8 @@ class KvblockdConnector(_Base):
                 off = idx * body_len
                 return memoryview(slab_np[off:off + blen])
 
-            statuses = self._ensure().batch_get_scatter(sub, BLOB_PREFIX_LEN, alloc)
+            statuses = self._ensure().batch_get_scatter(sub, BLOB_PREFIX_LEN, alloc,
+                                                        deadline=deadline)
             used_ring |= self._scatter_slab(req, names, bytes_per_layer, statuses,
                                             key_offset=p0)
         return used_ring

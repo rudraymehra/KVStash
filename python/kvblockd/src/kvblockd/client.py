@@ -14,6 +14,7 @@ import concurrent.futures
 import logging
 import socket
 import struct
+import time
 
 import xxhash
 
@@ -131,7 +132,8 @@ class _Conn:
             per_key = [p.status_ok(body[off + i]) for i in range(count)]
         return n_consec, per_key
 
-    def batch_get_scatter(self, keys: list[bytes], prefix_len: int, alloc, idx_base: int = 0):
+    def batch_get_scatter(self, keys: list[bytes], prefix_len: int, alloc, idx_base: int = 0,
+                          deadline: float | None = None):
         """For each OK block (key order, F_MORE frames reassembled): read the
         first prefix_len bytes, call alloc(GLOBAL index, prefix, body_len) →
         memoryview or None. A returned view receives the remaining bytes via
@@ -140,7 +142,13 @@ class _Conn:
         …) is descriptor-only and maps to a local NOT_FOUND, mirroring Go's
         readGetInto. idx_base offsets the alloc index into the caller's global
         keyspace (so tiled batches never collide). Returns tile-local statuses.
-        """
+
+        deadline (optional, time.monotonic()-based): a hard wall-clock ceiling
+        for the WHOLE drain. The socket op timeout bounds each recv, but a
+        trickling server passes every per-recv check forever; past the
+        deadline this raises ConnectionLost — abandoning mid-stream leaves the
+        conn's read state unknown, so evicting it is the only safe degrade
+        (the caller's shard turns its remaining keys into misses)."""
         n = len(keys)
         statuses = [p.Status.NOT_FOUND] * n
         if n == 0:
@@ -149,6 +157,8 @@ class _Conn:
                          [p.pack_keylist(keys)])
         seen = 0
         while True:
+            if deadline is not None and time.monotonic() > deadline:
+                raise ConnectionLost("GET deadline exceeded between frames (conn evicted)")
             h = self._next_header()
             status, first, total, descs, lead = self._read_region(h, n, prefix_len)
             if not p.status_ok(status):
@@ -164,6 +174,8 @@ class _Conn:
                 if not p.status_ok(dstatus):  # NOT_FOUND / EVICTED / any non-OK: no payload
                     statuses[local] = p.Status.NOT_FOUND
                     continue
+                if deadline is not None and time.monotonic() > deadline:
+                    raise ConnectionLost("GET deadline exceeded mid-frame (conn evicted)")
                 lead = self._scatter_one(idx_base + local, local, dlen, dxxh,
                                          prefix_len, alloc, statuses, lead)
             if lead:  # every pre-read byte belongs to some OK payload above
@@ -482,10 +494,16 @@ class Client:
             s = e
         return bounds
 
-    def batch_get_scatter(self, keys, prefix_len, alloc):
+    def batch_get_scatter(self, keys, prefix_len, alloc, deadline=None):
         """Zero-copy batched GET, fanned out across up to 4 CONTIGUOUS key
         shards (bounded by the pool size), one pooled connection per shard,
         each shard internally tiled by the negotiated max_batch_keys.
+
+        deadline (optional, time.monotonic()-based): overall wall-clock
+        ceiling for the whole call. Each shard stops starting new tiles past
+        it, and a tile caught mid-drain evicts its connection; either way the
+        affected keys come back as misses — a slow store must degrade to
+        recompute, never to an unbounded trickle.
 
         THREADING CONTRACT: `alloc` MUST be safe to call concurrently from
         multiple threads with DISTINCT idx values — the global idx is unique
@@ -504,13 +522,14 @@ class Client:
             return []
         nshards = min(_MAX_GET_FANOUT, self._streams, n)
         if nshards <= 1:
-            return self._scatter_shard(keys, prefix_len, alloc, 0)
+            return self._scatter_shard(keys, prefix_len, alloc, 0, deadline)
         bounds = self._shard_bounds(n, nshards)
         statuses = [p.Status.NOT_FOUND] * n
         errs = []
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=nshards, thread_name_prefix="kvb-get") as ex:
-            futs = [(s, ex.submit(self._scatter_shard, keys[s:e], prefix_len, alloc, s))
+            futs = [(s, ex.submit(self._scatter_shard, keys[s:e], prefix_len, alloc, s,
+                                  deadline))
                     for s, e in bounds]
             for s, fut in futs:
                 try:
@@ -522,19 +541,25 @@ class Client:
             raise errs[0]
         return statuses
 
-    def _scatter_shard(self, keys, prefix_len, alloc, idx_base):
+    def _scatter_shard(self, keys, prefix_len, alloc, idx_base, deadline=None):
         """One shard: current tiled drain. idx_base keeps alloc's index GLOBAL
         — without it, tiled batches collide in the caller's results keyed by
         index (the reproduced cross-key corruption). A dead connection turns
         the shard's REMAINING keys into misses (this shard only); tiles that
-        already completed keep their verified statuses."""
+        already completed keep their verified statuses. An expired deadline
+        stops STARTING tiles here; one caught mid-tile surfaces from _Conn as
+        ConnectionLost and lands in the same remaining-keys-are-misses path."""
         out = []
         base = idx_base
         for tile in self._split(keys):
+            if deadline is not None and time.monotonic() > deadline:
+                out.extend([p.Status.NOT_FOUND] * (len(keys) - len(out)))
+                return out
             b = base
             try:
                 out.extend(self._run(
-                    lambda c, t=tile, bb=b: c.batch_get_scatter(t, prefix_len, alloc, bb)))
+                    lambda c, t=tile, bb=b: c.batch_get_scatter(t, prefix_len, alloc, bb,
+                                                                deadline)))
             except (ConnectionLost, FatalProtocol, OSError):
                 out.extend([p.Status.NOT_FOUND] * (len(keys) - len(out)))
                 return out

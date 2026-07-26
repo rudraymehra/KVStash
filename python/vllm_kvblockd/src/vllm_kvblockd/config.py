@@ -167,6 +167,7 @@ class AdapterConfig:
         "fingerprint",
         "host",
         "kv_cache_dtype",
+        "load_deadline_s",
         "lookup_timeout_s",
         "model_name",
         "namespace",
@@ -239,6 +240,11 @@ class AdapterConfig:
         # pruned — a wedged resolver must never park a request forever.
         lt = get_extra_config(ktc, "kvblockd_lookup_timeout_s", None)
         c.lookup_timeout_s = float(lt) if lt not in (None, "") else c.op_timeout
+        # Overall per-LOAD wall-clock ceiling. op_timeout bounds each recv,
+        # but a slow daemon that keeps trickling passes every per-recv check
+        # forever; past this deadline the load abandons its remaining shards,
+        # flags the unfilled block ids, and degrades to a miss. <=0 disables.
+        c.load_deadline_s = float(get_extra_config(ktc, "kvblockd_load_deadline_s", 30.0))
 
         cache = getattr(vllm_config, "cache_config", None)
         c.block_size = int(getattr(cache, "block_size", 16) or 16)

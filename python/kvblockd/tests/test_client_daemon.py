@@ -196,10 +196,10 @@ def test_shard_connection_failure_yields_misses_for_that_shard_only(daemon, monk
         dead_base = bounds[1][0]  # second shard
         orig = _Conn.batch_get_scatter
 
-        def flaky(self, keys, prefix_len, alloc, idx_base=0):
+        def flaky(self, keys, prefix_len, alloc, idx_base=0, deadline=None):
             if idx_base == dead_base:
                 raise ConnectionLost("injected shard death")
-            return orig(self, keys, prefix_len, alloc, idx_base)
+            return orig(self, keys, prefix_len, alloc, idx_base, deadline)
 
         monkeypatch.setattr(client_mod._Conn, "batch_get_scatter", flaky)
         bodies = {}
