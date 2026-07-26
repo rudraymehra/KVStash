@@ -193,7 +193,12 @@ break-even to a few percent. The hit-rate-swept chart with the crossover
 region drawn is pre-registered for the shaped-link rig; until it exists, no
 single-hit-rate number here should be read as a deployment recommendation.
 The `bench/e2e/economics.py` model dollarizes the crossover ($/GB moved vs
-$/GPU-sec saved per hit, same-AZ vs cross-AZ) at the measured hit rates.
+$/GPU-sec saved per hit, same-AZ vs cross-AZ) and now derives its measured
+sections from these tables' committed medians (`bench/results/rig-e/`):
+4.49/4.27/10.29 GPU-s saved per hit (Llama@16k, Qwen@16k, Qwen@32k; quote
+the floored figures), the measured ~46% sync-store break-even, and the
+PROJECTED few-percent write-behind break-even as an explicitly separate
+mode.
 
 ---
 
