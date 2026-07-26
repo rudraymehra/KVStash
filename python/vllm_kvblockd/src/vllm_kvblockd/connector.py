@@ -28,22 +28,48 @@ makes per-request isolation structural.
 NEVER RAISE on the serving path: every failure degrades to a cache miss
 (LMCache #2204 posture). The only boot-time exception is DeterminismError —
 refusing to start beats a fleet that silently never shares cache.
+
+FAIL-OPEN GUARANTEE: a dead, hung, or slow daemon costs the engine at most
+one bounded delay per breaker window — connect_timeout on a dial, op_timeout
+per recv, kvblockd_load_deadline_s across a whole load (a trickling daemon
+passes every per-recv check forever; the deadline abandons the remaining
+shards, flags the unfilled block ids, and degrades to recompute) — and then
+the dial breaker answers everything instantly for _REDIAL_BACKOFF_S. The
+engine never fails and never waits unboundedly; chaos-tested in
+tests/test_chaos.py (kill -9 / SIGSTOP mid-run, daemon down at boot).
+
+KNOWN COST, by design: a slow-but-ACCEPTING daemon never errors, so it never
+arms the dial breaker — EVERY load against it pays up to the full
+kvblockd_load_deadline_s before degrading to recompute, load after load,
+until an operator intervenes. The guarantee is bounded-per-load, not
+bounded-per-outage: distinguishing "slow store, still worth asking" from
+"slow store, stop asking" needs a latency-based breaker policy this wave
+deliberately does not have.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import queue
 import struct
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
+import numpy as np
 from kvblockd import protocol as kp
 from kvblockd.client import Client
 from kvblockd.errors import ConnectionLost
 
-from .config import AdapterConfig, block_chain_keys, chain_seed, require_pinned_hashseed
+from .config import (
+    BLOB_VERSION,
+    AdapterConfig,
+    block_chain_keys,
+    chain_seed,
+    require_pinned_hashseed,
+)
 
 logger = logging.getLogger("vllm_kvblockd")
 
@@ -95,7 +121,8 @@ def _torch():  # lazy so the CI import check can load us without torch
 # buffer. Config changes already diverge the fingerprint (hence the key); this
 # catches the residue (e.g. an attention-backend layout flip within a config).
 BLOB_MAGIC = b"KVN1"
-BLOB_VERSION = 1
+# BLOB_VERSION lives in config.py (folded into the fingerprint there) and is
+# re-exported here for the codec's callers/tests.
 BLOB_PREFIX_LEN = 32
 _BLOB = struct.Struct("<4sBBHHII14x")  # magic ver dtype n_layers tokens bytes/layer total
 assert _BLOB.size == BLOB_PREFIX_LEN
@@ -126,6 +153,11 @@ _SCRATCH_RING = 1
 # before the chunked path latches OFF for the connector's lifetime — the
 # per-block-from-slab copies keep serving loads either way.
 _SCRATCH_MAX_FAILS = 3
+
+# Async-lookup pending-map ceiling: at the cap a NEW lookup answers (0, False)
+# — a miss — instead of None, because a None with no queued work would park
+# the request on a result that never comes (never-None-under-pressure rule).
+_LOOKUP_PENDING_CAP = 1024
 
 
 class BlobError(ValueError):
@@ -204,6 +236,80 @@ class KvblockdConnectorMetadata(_MetaBase):
     requests: list[KvbReqMeta] = field(default_factory=list)
 
 
+class _LookupResolver:
+    """Off-thread BATCH_EXISTS for the flag-gated async lookup. The scheduler
+    thread posts PLAIN DATA ONLY — (rid, aligned token ids, cache_salt, mm
+    ids, lora name) — NEVER the Request object: a queued Request outlives its
+    abort and keeps blocks/tensors pinned (the vLLM #42372 leak class). One
+    daemon thread derives the chain keys and asks the daemon; results are
+    plain hit-token ints. An op failure posts 0 (a failed lookup is a miss)
+    and drops the client with the usual breaker discipline — the thread
+    itself never dies to an op error."""
+
+    def __init__(self, connector: KvblockdConnector):
+        self._conn = connector
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self._results: dict[str, int] = {}
+        # rids discarded while their work was still queued/on the wire: the
+        # late result is swallowed instead of orphaned in _results (nobody is
+        # left to pop it — the vLLM #42372 leak class). Consumed by _run on
+        # completion; bounded as armor against a dead thread never consuming.
+        self._tombstones: set[str] = set()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="kvb-lookup", daemon=True)
+        self._thread.start()
+
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def post(self, rid: str, token_ids: list[int], cache_salt: str | None,
+             mm_ids: list[str], lora_name: str) -> None:
+        self._q.put((rid, token_ids, cache_salt, mm_ids, lora_name))
+
+    def pop(self, rid: str) -> int | None:
+        with self._lock:
+            return self._results.pop(rid, None)
+
+    def discard(self, rid: str, inflight: bool = False) -> None:
+        """Drop rid's result. inflight=True says the caller KNOWS work for
+        rid is still queued/on the wire (a pending entry existed with no
+        result): tombstone it so the late post is swallowed. A result that
+        already landed is simply popped — nothing is in flight then."""
+        with self._lock:
+            if self._results.pop(rid, None) is not None:
+                return
+            if inflight:
+                if len(self._tombstones) >= _LOOKUP_PENDING_CAP:
+                    self._tombstones.pop()  # bounded armor: shed an arbitrary stale entry
+                self._tombstones.add(rid)
+
+    def stop(self, timeout: float = 1.0) -> None:
+        self._q.put(None)  # sentinel
+        self._thread.join(timeout)
+
+    def _run(self) -> None:
+        conn = self._conn
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            rid, token_ids, cache_salt, mm_ids, lora_name = item
+            hit = 0
+            try:
+                seed = conn._seed(cache_salt, mm_ids, lora_name)
+                keys = block_chain_keys(seed, token_ids, conn._block_size)
+                n_consec, _ = conn._ensure().batch_exists(keys)
+                hit = min(n_consec * conn._block_size, len(token_ids))
+            except Exception as e:  # noqa: BLE001 — a failed lookup is a miss; the resolver lives on
+                conn._log.maybe("lookup", "kvblockd async BATCH_EXISTS failed (miss)", e)
+                conn._drop_client(e)
+            with self._lock:
+                if rid in self._tombstones:  # discarded while we were on the wire
+                    self._tombstones.discard(rid)
+                else:
+                    self._results[rid] = hit
+
+
 class KvblockdConnector(_Base):
     """The KVConnectorBase_V1 socket. Scheduler side answers
     get_num_new_matched_tokens with kvblockd's BATCH_EXISTS (<1ms p99 verb,
@@ -233,6 +339,10 @@ class KvblockdConnector(_Base):
         self._local_hit_tokens: dict[str, int] = {}
         self._need_load_blocks: dict[str, tuple[int, int]] = {}  # req_id -> (start, n)
         self._seeds: dict[str, bytes] = {}            # req_id -> chain seed
+        # Async lookup (kvblockd_async_lookup, default OFF): resolver thread
+        # created lazily on first use; pending maps req_id -> expiry deadline.
+        self._resolver: _LookupResolver | None = None
+        self._lookup_pending: dict[str, float] = {}
         # req_id -> full group-0 block list, accumulated across steps: the
         # SchedulerOutput only carries NEW block ids for cached requests, and
         # the Request object exposes none — chunked-prefill continuation
@@ -253,6 +363,7 @@ class KvblockdConnector(_Base):
         self._slab = None                 # 1-D pinned uint8 torch tensor
         self._slab_np = None              # numpy view of the slab (memoryview source)
         self._slab_disabled = False       # first-pin failure -> permanent per-block fallback
+        self._prewarm_done = False        # one eager-pin attempt at first CUDA capture
         # GPU scratch for the chunked scatter: _SCRATCH_RING × [chunk,
         # n_layers, bytes_per_layer] uint8, cached per (device, layout).
         self._gpu_scratch = None
@@ -264,6 +375,36 @@ class KvblockdConnector(_Base):
         self._reported_path = None
         self._path_switch_logged = False
         self._debug_scatter_checked = False  # KVBLOCKD_DEBUG_SCATTER_CHECK=1, once
+
+        # Write-behind store queue (kvblockd_async_store, default on):
+        # wait_for_save stages OWNED byte copies here and returns; ONE daemon
+        # thread ("kvb-store", lazily started on first enqueue) drains FIFO.
+        # FIFO preserves per-request block order, so a partial delivery is a
+        # usable consecutive prefix under the prefix-chain keys. All queue
+        # state (deque, byte gauges, public counters) is guarded by _sq_cond.
+        self._sq: deque[tuple[bytes, bytearray]] = deque()
+        self._sq_cond = threading.Condition()
+        self._sq_bytes = 0            # bytes currently queued
+        self._sq_inflight = 0         # blocks popped, put() not finished
+        self._sq_inflight_bytes = 0
+        # In-flight blocks the SHUTDOWN disclosure already counted dropped
+        # (join timed out mid-put). The drain thread reconciles when the put
+        # finally returns: delivered -> un-count the pessimistic drop; failed
+        # -> already disclosed dropped, must not ALSO count failed.
+        self._sq_inflight_counted = 0
+        # req_id -> FIRST store block that was dropped for that request. The
+        # keys are a prefix chain, so every later block of the request is
+        # unreachable by the consecutive-prefix lookup — later _stage_one
+        # calls (chunked-prefill continuations) skip past the hole instead of
+        # queueing dead bytes. Pruned in request_finished.
+        self._store_holes: dict[str, int] = {}
+        self._store_thread: threading.Thread | None = None
+        self._store_stop = False      # shutdown: drain the remainder, then exit
+        self._store_abort = False     # wedged flush: exit without draining
+        # Public disclosure counters (the bench reads/greps these).
+        self.dropped_puts = 0
+        self.dropped_put_bytes = 0
+        self.failed_puts = 0
 
     # ------------------------------------------------------------------
     # client plumbing (lazy: import/instantiate must succeed with no daemon)
@@ -313,6 +454,11 @@ class KvblockdConnector(_Base):
         client.close()
 
     def shutdown(self):
+        if self._resolver is not None:
+            self._resolver.stop(1.0)  # sentinel + bounded join
+        # Flush the write-behind queue FIRST — the drain thread needs the
+        # client to deliver what is still staged.
+        self._store_shutdown()
         with self._client_lock:
             self._closed = True
             client, self._client = self._client, None
@@ -354,13 +500,22 @@ class KvblockdConnector(_Base):
     def get_num_new_matched_tokens(self, request, num_computed_tokens: int):
         """Consecutive-prefix hit count x block_size beyond what is computed.
         Idempotent (vLLM may call it repeatedly; the only state written is the
-        req_id-keyed local-hit stash, overwritten in place); sync (async=False).
-        """
+        req_id-keyed local-hit stash, overwritten in place). The second tuple
+        element is ALWAYS False — no async LOADS this wave (the upstream
+        async-load hang class needs its own validation rig); with
+        kvblockd_async_lookup the first element may be None ("still resolving,
+        ask again"), never under pressure (see _lookup_async)."""
         rid = getattr(request, "request_id", None)
         if rid is not None:
             # num_computed_tokens here IS the local prefix-cache hit; the
             # Request object still reads 0 at update_state_after_alloc time.
             self._local_hit_tokens[rid] = int(num_computed_tokens or 0)
+        if self._cfg.async_lookup and rid is not None:
+            return self._lookup_async(rid, request, num_computed_tokens)
+        return self._lookup_sync(request, num_computed_tokens)
+
+    def _lookup_sync(self, request, num_computed_tokens: int):
+        """The original synchronous lookup (flag off / fallback), unchanged."""
         try:
             token_ids = list(getattr(request, "prompt_token_ids", None) or [])
             aligned = align_to_block_size(len(token_ids), self._block_size)
@@ -375,6 +530,62 @@ class KvblockdConnector(_Base):
         except Exception as e:  # noqa: BLE001 — never raise: a failed lookup is a miss
             self._log.maybe("lookup", "kvblockd BATCH_EXISTS failed (treated as miss)", e)
             self._drop_client(e)
+            return 0, False
+
+    def _lookup_async(self, rid: str, request, num_computed_tokens: int):
+        """Flag-on lookup: post once, answer (None, False) while the resolver
+        works, then (hit, False). Order of checks: result → pending+deadline →
+        new. Guard rails: an expired pending entry becomes a miss and is
+        pruned (a wedged resolver must not park the request forever); at the
+        pending-map cap a NEW request is answered (0, False) — NEVER None,
+        which with no queued work would never be followed by a result; a dead
+        resolver thread falls back to the inline synchronous lookup."""
+        try:
+            token_ids = list(getattr(request, "prompt_token_ids", None) or [])
+            aligned = align_to_block_size(len(token_ids), self._block_size)
+            if aligned <= num_computed_tokens:
+                if (self._lookup_pending.pop(rid, None) is not None
+                        and self._resolver is not None):
+                    # posted work is still in flight: tombstone the late result
+                    self._resolver.discard(rid, inflight=True)
+                return 0, False
+            if self._resolver is None:
+                self._resolver = _LookupResolver(self)
+            resolver = self._resolver
+            hit = resolver.pop(rid)  # a result posted before a thread death still counts
+            if hit is not None:
+                self._lookup_pending.pop(rid, None)
+                return max(0, min(hit, aligned) - num_computed_tokens), False
+            if not resolver.alive():
+                # Dead resolver (never expected; armor): serve inline, sync.
+                self._log.maybe("lookup-thread",
+                                "async lookup resolver thread is dead — inline sync fallback")
+                self._lookup_pending.pop(rid, None)
+                return self._lookup_sync(request, num_computed_tokens)
+            deadline = self._lookup_pending.get(rid)
+            if deadline is not None:
+                if time.monotonic() > deadline:
+                    self._lookup_pending.pop(rid, None)
+                    # pop() above answered None, so the work is still queued/
+                    # on the wire — tombstone it or the late result orphans.
+                    resolver.discard(rid, inflight=True)
+                    self._log.maybe("lookup-deadline",
+                                    f"async lookup timed out — treated as miss req={rid}")
+                    return 0, False
+                return None, False
+            if len(self._lookup_pending) >= _LOOKUP_PENDING_CAP:
+                self._log.maybe("lookup-cap",
+                                "async lookup pending map at capacity — treated as miss")
+                return 0, False
+            resolver.post(rid, token_ids[:aligned], getattr(request, "cache_salt", None),
+                          self._mm_ids(request), self._lora_name(request))
+            self._lookup_pending[rid] = time.monotonic() + self._cfg.lookup_timeout_s
+            return None, False
+        except Exception as e:  # noqa: BLE001 — never raise: a failed lookup is a miss
+            self._log.maybe("lookup", "kvblockd async lookup failed (treated as miss)", e)
+            if (self._lookup_pending.pop(rid, None) is not None
+                    and self._resolver is not None):
+                self._resolver.discard(rid, inflight=True)  # same orphan armor
             return 0, False
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
@@ -544,6 +755,14 @@ class KvblockdConnector(_Base):
             self._local_hit_tokens.pop(rid, None)
             self._seeds.pop(rid, None)
             self._blocks.pop(rid, None)
+            self._store_holes.pop(rid, None)
+            # Async-lookup abort cleanup (the #42372 leak class): an aborted
+            # request must not leave a pending deadline, an unclaimed result,
+            # OR a result still on the wire — a pending entry with no result
+            # means the work is in flight, so the discard tombstones it.
+            pending = self._lookup_pending.pop(rid, None) is not None
+            if self._resolver is not None:
+                self._resolver.discard(rid, inflight=pending)
         return False, None
 
     # ------------------------------------------------------------------
@@ -565,6 +784,42 @@ class KvblockdConnector(_Base):
                 self._layer_kv[name] = kv
         except Exception as e:  # noqa: BLE001 — never-raise boundary: failed capture degrades to load/store no-ops, never into the engine
             self._log.maybe("layers", "capturing paged KV tensors failed", e)
+        self._maybe_prewarm()
+
+    def _maybe_prewarm(self) -> None:
+        """One eager pinned-slab allocation at the FIRST CUDA layout capture
+        (not the first load): cudaHostAlloc of a multi-GiB slab takes hundreds
+        of ms, and paying it lazily buries the stall inside the first measured
+        load. Sized min(staging cap, kvblockd_prewarm_bytes). Failure falls
+        back to the EXISTING lazy path untouched (_slab_disabled stays False —
+        _slab_reserve owns that latch), never fatal. The measured duration is
+        published at WARNING (INFO is dropped in engine-core) so the bench can
+        attribute the one-time cost."""
+        if self._prewarm_done or self._slab is not None or self._slab_disabled:
+            return
+        try:
+            names = sorted(self._layer_kv)
+            if not names:
+                return
+            dev = self._layer_kv[names[0]].device
+            if not self._slab_path_ok(dev):
+                # CPU backend: the slab never pays here — and the paged
+                # tensors' device never changes mid-run, so LATCH instead of
+                # re-walking the layer map on every single capture.
+                self._prewarm_done = True
+                return
+            self._prewarm_done = True  # one attempt per connector lifetime
+            want = min(self._staging_bytes, self._cfg.prewarm_bytes)
+            if want <= 0:
+                return
+            t0 = time.monotonic()
+            slab = self._alloc_pinned(want)
+            slab_np = slab.numpy()
+            self._slab, self._slab_np = slab, slab_np
+            logger.warning("kvblockd pinned prewarm: %d bytes in %.0f ms",
+                           want, (time.monotonic() - t0) * 1e3)
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: a failed prewarm keeps the lazy slab path
+            self._log.maybe("slab", "pinned prewarm failed — lazy slab path keeps serving", e)
 
     def _layout(self):
         """(sorted layer names, dtype_name, bytes_per_layer_block) of the LIVE
@@ -644,6 +899,13 @@ class KvblockdConnector(_Base):
 
         body_len = total - BLOB_PREFIX_LEN
         dev = self._layer_kv[names[0]].device
+        # Overall per-load deadline (kvblockd_load_deadline_s): op_timeout
+        # bounds each recv, this bounds the WHOLE load — a daemon trickling
+        # bytes passes every per-recv check forever, and the engine counted
+        # these blocks computed, so the only safe degrade is: abandon the
+        # remaining shards, flag the unfilled bids, recompute.
+        deadline = (time.monotonic() + self._cfg.load_deadline_s
+                    if self._cfg.load_deadline_s > 0 else None)
         used_ring = False
         took_slab = False
         if keys and self._slab_path_ok(dev):
@@ -654,9 +916,10 @@ class KvblockdConnector(_Base):
             if pass_blocks > 0 and self._slab_reserve(pass_blocks * body_len):
                 took_slab = True
                 used_ring = self._load_slab(req, names, dtype_name, bytes_per_layer,
-                                            total, keys, pass_blocks)
+                                            total, keys, pass_blocks, deadline)
         if keys and not took_slab:
-            self._load_perblock(req, names, dtype_name, bytes_per_layer, total, keys)
+            self._load_perblock(req, names, dtype_name, bytes_per_layer, total, keys,
+                                deadline)
         if keys:
             self._note_path("chunked-slab" if used_ring else "per-block")
 
@@ -679,7 +942,7 @@ class KvblockdConnector(_Base):
                            path, self._reported_path)
 
     def _load_perblock(self, req: KvbReqMeta, names, dtype_name, bytes_per_layer,
-                       total, keys) -> None:
+                       total, keys, deadline: float | None = None) -> None:
         """The original per-block load: pageable torch.empty staging + one
         synchronous dst.copy_ per (block, layer). This is THE path for CPU
         paged tensors (the CI backend / bench/e2e/cpu rig depend on it staying
@@ -701,7 +964,8 @@ class KvblockdConnector(_Base):
             staged[idx] = buf
             return memoryview(buf.numpy())
 
-        statuses = self._ensure().batch_get_scatter(keys, BLOB_PREFIX_LEN, alloc)
+        statuses = self._ensure().batch_get_scatter(keys, BLOB_PREFIX_LEN, alloc,
+                                                    deadline=deadline)
         for j, st in enumerate(statuses):
             blk = start + j
             bid = req.block_ids[blk] if blk < len(req.block_ids) else None
@@ -765,7 +1029,7 @@ class KvblockdConnector(_Base):
         return True
 
     def _load_slab(self, req: KvbReqMeta, names, dtype_name, bytes_per_layer,
-                   total, keys, pass_blocks: int) -> bool:
+                   total, keys, pass_blocks: int, deadline: float | None = None) -> bool:
         """Slab-staged load: the client drains block bodies straight into
         disjoint pinned-slab slots (the layout gate runs in alloc BEFORE any
         body byte is accepted, exactly like the per-block path), then
@@ -779,6 +1043,18 @@ class KvblockdConnector(_Base):
         slab_np = self._slab_np
         used_ring = False
         for p0 in range(0, len(keys), pass_blocks):
+            if deadline is not None and time.monotonic() > deadline:
+                # Load deadline blown between passes: flag every remaining
+                # promised bid and stop — the scheduler counted them computed,
+                # so an unflagged unfilled block is silent garbage.
+                for blk in range(req.load_start_block + p0,
+                                 req.load_start_block + len(keys)):
+                    if blk < len(req.block_ids):
+                        self._load_errors.add(req.block_ids[blk])
+                self._log.maybe("load-deadline",
+                                f"load deadline exceeded — abandoning {len(keys) - p0} "
+                                f"remaining blocks (recompute) req={req.req_id}")
+                break
             sub = keys[p0:p0 + pass_blocks]
 
             def alloc(idx, prefix, blen):
@@ -796,7 +1072,8 @@ class KvblockdConnector(_Base):
                 off = idx * body_len
                 return memoryview(slab_np[off:off + blen])
 
-            statuses = self._ensure().batch_get_scatter(sub, BLOB_PREFIX_LEN, alloc)
+            statuses = self._ensure().batch_get_scatter(sub, BLOB_PREFIX_LEN, alloc,
+                                                        deadline=deadline)
             used_ring |= self._scatter_slab(req, names, bytes_per_layer, statuses,
                                             key_offset=p0)
         return used_ring
@@ -961,6 +1238,12 @@ class KvblockdConnector(_Base):
         self._layer_kv[layer_name] = kv_layer
 
     def wait_for_save(self):
+        """Stage-sync + drain-async (kvblockd_async_store, default on): every
+        block's bytes are copied into an OWNED buffer HERE, before returning —
+        the vLLM base contract only protects the paged buffer until this call
+        returns, and on CPU _block_bytes hands back an ALIASING view of paged
+        memory — then a background thread drains the copies over TCP. With the
+        flag off this is the original synchronous put loop, byte-identical."""
         try:
             metadata = self._get_connector_metadata()
         except Exception:  # noqa: BLE001 — never-raise boundary: missing metadata = nothing to store this step
@@ -969,10 +1252,229 @@ class KvblockdConnector(_Base):
         for req in requests:
             if req.store_end_block > req.store_start_block:
                 try:
-                    self._store_one(req)
+                    if self._cfg.async_store:
+                        self._stage_one(req)
+                    else:
+                        self._store_one(req)
                 except Exception as e:  # noqa: BLE001 — never raise: a lost store is a future miss
                     self._log.maybe("store", f"kvblockd store failed req={req.req_id}", e)
                     self._drop_client(e)
+
+    # ------------------------------------------------------------------
+    # write-behind store queue (kvblockd_async_store)
+    # ------------------------------------------------------------------
+    def _stage_one(self, req: KvbReqMeta) -> None:
+        """Copy every store-range block into ONE owned bytearray per block
+        (32B layout prefix + all layers, exactly the blob _store_one streams)
+        and enqueue it. The copies MUST happen inside wait_for_save: after it
+        returns the scheduler may reuse the paged blocks, and _block_bytes is
+        zero-copy on CPU — draining the view later would stream whatever the
+        engine wrote over it (silent corruption armor, not an optimization)."""
+        names, dtype_name, bytes_per_layer = self._layout()
+        if not names:
+            return
+        total = BLOB_PREFIX_LEN + bytes_per_layer * len(names)
+        prefix = encode_blob_prefix(dtype_name, len(names), self._block_size,
+                                    bytes_per_layer, total)
+        seed = self._seed(req.cache_salt, req.mm_ids, req.lora_name)
+        keys = block_chain_keys(seed, req.token_ids, self._block_size)
+        end = min(req.store_end_block, len(keys), len(req.block_ids))
+        hole = self._store_holes.get(req.req_id)
+        if hole is not None and end > hole:
+            # TAIL-SKIP, PERSISTED: an earlier step of this request already
+            # dropped block `hole`, so every row at/past it is unreachable by
+            # the consecutive-prefix lookup no matter how much budget freed up
+            # since — count those rows dropped (no copies built) and cap the
+            # loop below the hole.
+            skipped = end - max(req.store_start_block, hole)
+            if skipped > 0:
+                with self._sq_cond:
+                    self.dropped_puts += skipped
+                    self.dropped_put_bytes += skipped * total
+            end = hole
+        for j in range(req.store_start_block, end):
+            bid = req.block_ids[j]
+            buf = bytearray(total)
+            buf[:BLOB_PREFIX_LEN] = prefix
+            dst = np.frombuffer(buf, dtype=np.uint8)  # writable view of buf
+            for li, name in enumerate(names):
+                src = self._block_bytes(self._layer_kv[name][bid])
+                dst[BLOB_PREFIX_LEN + li * bytes_per_layer:
+                    BLOB_PREFIX_LEN + (li + 1) * bytes_per_layer] = src  # copies
+            if not self._sq_enqueue(keys[j], buf):
+                # TAIL-SKIP: block keys are a prefix chain, so once block j is
+                # missing every later block of THIS request is unreachable by
+                # BATCH_EXISTS's consecutive-prefix count — copying/queueing
+                # them would spend budget on bytes no lookup can ever count.
+                # Count them dropped (without building the copies), record the
+                # hole so LATER steps of this request skip past it too, stop.
+                self._store_holes[req.req_id] = j  # j < any prior hole (end is capped)
+                skipped = end - j - 1
+                if skipped > 0:
+                    with self._sq_cond:
+                        self.dropped_puts += skipped
+                        self.dropped_put_bytes += skipped * total
+                return
+
+    def _sq_enqueue(self, key: bytes, buf: bytearray) -> bool:
+        """Enqueue one owned blob. NEVER blocks and NEVER raises: past the
+        byte budget (or during shutdown) the block is dropped and counted —
+        a lost store is a future miss, an engine stall is an incident."""
+        n = len(buf)
+        with self._sq_cond:
+            if self._store_stop or self._sq_bytes + n > self._cfg.store_queue_bytes:
+                self.dropped_puts += 1
+                self.dropped_put_bytes += n
+                dropped, failed, dbytes = (self.dropped_puts, self.failed_puts,
+                                           self.dropped_put_bytes)
+            else:
+                self._sq.append((key, buf))
+                self._sq_bytes += n
+                self._sq_cond.notify_all()
+                dropped = None
+        if dropped is not None:
+            # Rate-limited in-run disclosure (the shutdown summary line is
+            # unconditional); the bench populate phase greps `dropped=`.
+            # OUTSIDE the lock: _log.maybe formats and may hit a logging
+            # handler — never hold _sq_cond across foreign code.
+            self._log.maybe(
+                "store-drop",
+                f"kvblockd store queue overflow: dropped={dropped} "
+                f"failed={failed} dropped_bytes={dbytes}",
+            )
+            return False
+        self._store_thread_start()
+        return True
+
+    def _store_thread_start(self) -> None:
+        """Lazily start the single "kvb-store" drain thread. Only ever called
+        from the engine's serving thread (wait_for_save), so the check-then-
+        start needs no extra lock."""
+        t = self._store_thread
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=self._store_drain, name="kvb-store", daemon=True)
+        self._store_thread = t
+        t.start()
+
+    def _store_drain(self) -> None:
+        """FIFO drain loop: pop one staged blob, put it. A CONNECTION-class
+        failure (daemon gone, breaker window) re-queues the item ONCE at the
+        head and waits out the redial backoff before retrying — a blip costs
+        one backoff window, never the whole backlog burned at one doomed put
+        per item. A SECOND consecutive failure of the same item counts it
+        failed (failed_puts) and moves on (no infinite loop); non-connection
+        failures count immediately. Either way the client is dropped with the
+        same breaker discipline as loads and the thread NEVER dies to an op
+        error, so delivery resumes after a redial. OK_EXISTS = dedup, fine."""
+        retry_of: bytearray | None = None  # the buf that already failed once
+        while True:
+            with self._sq_cond:
+                while not self._sq and not self._store_stop:
+                    self._sq_cond.wait()
+                if self._store_abort or (not self._sq and self._store_stop):
+                    return
+                key, buf = self._sq.popleft()
+                n = len(buf)
+                self._sq_bytes -= n
+                self._sq_inflight += 1
+                self._sq_inflight_bytes += n
+            err: BaseException | None = None
+            try:
+                self._ensure().put(key, [buf])
+            except Exception as e:  # noqa: BLE001 — never let the drain thread die: a lost store is a future miss
+                err = e
+            requeue = (err is not None
+                       and isinstance(err, (ConnectionLost, OSError))
+                       and buf is not retry_of)
+            with self._sq_cond:
+                self._sq_inflight -= 1
+                self._sq_inflight_bytes -= n
+                # Reconcile with a shutdown that already disclosed this
+                # in-flight block as dropped (join timed out mid-put).
+                counted_dropped = self._sq_inflight_counted > 0
+                if counted_dropped:
+                    self._sq_inflight_counted -= 1
+                if err is None:
+                    retry_of = None
+                    if counted_dropped:  # delivered after all: un-count it
+                        self.dropped_puts -= 1
+                        self.dropped_put_bytes -= n
+                elif requeue and not self._store_abort:
+                    self._sq.appendleft((key, buf))
+                    self._sq_bytes += n
+                    retry_of = buf
+                elif not counted_dropped:  # dropped-at-shutdown is not ALSO failed
+                    retry_of = None
+                    self.failed_puts += 1
+                self._sq_cond.notify_all()
+            if err is None:
+                continue
+            self._log.maybe("store", "kvblockd async store failed", err)
+            self._drop_client(err)
+            if requeue:
+                # Sit out the redial backoff (and the dial breaker _drop_client
+                # just armed) instead of instantly re-failing the retry. The
+                # deadline loop ignores enqueue wakeups; shutdown's stop/abort
+                # flags cut it short so a flush is never held hostage.
+                wake = max(time.monotonic() + _REDIAL_BACKOFF_S, self._next_dial)
+                with self._sq_cond:
+                    while not self._store_stop and not self._store_abort:
+                        left = wake - time.monotonic()
+                        if left <= 0:
+                            break
+                        self._sq_cond.wait(left)
+
+    def _store_flush(self, timeout: float) -> int:
+        """Wait (up to timeout) until the queue is empty and nothing is in
+        flight. Returns the number of UNDELIVERED blocks left at timeout."""
+        deadline = time.monotonic() + timeout
+        with self._sq_cond:
+            while self._sq or self._sq_inflight:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return len(self._sq) + self._sq_inflight
+                self._sq_cond.wait(left)
+        return 0
+
+    def _store_shutdown(self) -> None:
+        """Flag + notify + bounded join; whatever the drain thread could not
+        deliver inside kvblockd_store_flush_timeout_s is counted dropped. The
+        summary line is ALWAYS emitted, zero included, at WARNING — this
+        logger is unconfigured in vLLM's engine-core process, where the root
+        default drops INFO (proven on the bench rig) — so the bench can grep
+        for the line's presence, not just its value."""
+        with self._sq_cond:
+            self._store_stop = True
+            self._sq_cond.notify_all()
+        t = self._store_thread
+        if t is not None and t.is_alive():
+            t.join(self._cfg.store_flush_timeout_s)
+        with self._sq_cond:
+            self._store_abort = True  # a wedged put must not keep delivering
+            remainder = len(self._sq) + self._sq_inflight
+            if remainder:
+                self.dropped_puts += remainder
+                self.dropped_put_bytes += self._sq_bytes + self._sq_inflight_bytes
+                # An in-flight put is UNDELIVERED at disclosure time, so it
+                # counts dropped — but the put may still return: remember how
+                # many were counted so the drain thread can reconcile
+                # (delivered -> un-count; failed -> not ALSO failed_puts).
+                self._sq_inflight_counted = self._sq_inflight
+            self._sq.clear()
+            self._sq_bytes = 0
+            self._sq_cond.notify_all()
+            dropped, failed, dbytes = (self.dropped_puts, self.failed_puts,
+                                       self.dropped_put_bytes)
+        logger.warning("kvblockd store queue: dropped=%d failed=%d dropped_bytes=%d",
+                       dropped, failed, dbytes)
+
+    def handle_preemptions(self, *args, **kwargs) -> None:
+        """Explicit NO-OP, on purpose: the write-behind queue holds OWNED
+        copies staged inside wait_for_save — nothing in it references paged
+        memory, so a preempted request's blocks can be freed and reused
+        immediately without corrupting a queued store."""
+        return
 
     def _store_one(self, req: KvbReqMeta) -> None:
         names, dtype_name, bytes_per_layer = self._layout()

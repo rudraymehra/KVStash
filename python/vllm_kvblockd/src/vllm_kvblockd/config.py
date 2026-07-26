@@ -47,6 +47,13 @@ _TIER_DOMAIN = b"kvblockd-vllm-tier-v1\x00"
 
 WIRE_KEY_LEN = 32
 
+# The connector's 32B blob-prefix layout version. Canonical HERE (not in
+# connector.py) so the config fingerprint can fold it without a circular
+# import — the connector imports it and packs it into every blob prefix.
+# Bumping it forks the keyspace (clean misses) AND fails the prefix decode
+# of old blobs; both degrade to recompute, never to a wrong byte.
+BLOB_VERSION = 1
+
 
 def _lp(b: bytes) -> bytes:
     """u32-LE length prefix — field values can never masquerade as separators
@@ -152,19 +159,30 @@ class AdapterConfig:
     """Everything the connector needs, pulled defensively off vllm_config."""
 
     __slots__ = (
+        "async_lookup",
+        "async_store",
         "block_size",
         "connect_timeout",
         "dtype",
         "fingerprint",
         "host",
+        "kv_cache_dtype",
+        "load_deadline_s",
+        "lookup_timeout_s",
         "model_name",
         "namespace",
         "op_timeout",
         "port",
+        "prewarm_bytes",
+        "revision",
         "so_rcvbuf",
         "staging_bytes",
+        "store_flush_timeout_s",
+        "store_queue_bytes",
         "streams",
         "token",
+        "tokenizer",
+        "tokenizer_revision",
         "verify",
         "world_size",
     )
@@ -192,14 +210,73 @@ class AdapterConfig:
         # cap drain through it in cap-sized passes. <=0 disables the slab
         # (per-block loads only).
         c.staging_bytes = int(get_extra_config(ktc, "kvblockd_staging_bytes", 2 * 2**30))
+        # Eager pinned-slab pre-warm size, applied at the FIRST CUDA layout
+        # capture (min'ed against the staging cap; the cap is the default).
+        # cudaHostAlloc of gigabytes takes hundreds of ms — paying it at
+        # capture time instead of inside the first measured load, and saying
+        # so in the log, keeps the first-request stall out of the warm arm.
+        c.prewarm_bytes = int(get_extra_config(ktc, "kvblockd_prewarm_bytes", c.staging_bytes))
         c.op_timeout = float(get_extra_config(ktc, "kvblockd_op_timeout_s", 10.0))
         c.connect_timeout = float(get_extra_config(ktc, "kvblockd_connect_timeout_s", 5.0))
+        # Write-behind stores: wait_for_save stages OWNED copies and returns;
+        # a single "kvb-store" daemon thread drains them to the daemon. False
+        # = the original synchronous put loop, byte-identical, kept for A/B.
+        c.async_store = bool(get_extra_config(ktc, "kvblockd_async_store", True))
+        # Staged-copy budget for the store queue. Enqueue past the budget
+        # never blocks the engine: the block (and, tail-skip, the rest of its
+        # request) is dropped and counted in the connector's dropped_puts /
+        # dropped_put_bytes counters.
+        c.store_queue_bytes = int(get_extra_config(ktc, "kvblockd_store_queue_bytes", 1 << 30))
+        # shutdown() waits at most this long for the queue to flush; whatever
+        # is still undelivered is counted dropped and disclosed.
+        c.store_flush_timeout_s = float(
+            get_extra_config(ktc, "kvblockd_store_flush_timeout_s", 10.0)
+        )
+        # Async lookup (default OFF): get_num_new_matched_tokens answers None
+        # ("ask again") while a background thread runs BATCH_EXISTS, instead
+        # of blocking the scheduler step on the wire round-trip. Flag off =
+        # the original synchronous lookup, unchanged.
+        c.async_lookup = bool(get_extra_config(ktc, "kvblockd_async_lookup", False))
+        # A pending async lookup older than this is answered as a miss and
+        # pruned — a wedged resolver must never park a request forever.
+        lt = get_extra_config(ktc, "kvblockd_lookup_timeout_s", None)
+        c.lookup_timeout_s = float(lt) if lt not in (None, "") else c.op_timeout
+        # Overall per-LOAD wall-clock ceiling. op_timeout bounds each recv,
+        # but a slow daemon that keeps trickling passes every per-recv check
+        # forever; past this deadline the load abandons its remaining shards,
+        # flags the unfilled block ids, and degrades to a miss. <=0 disables.
+        c.load_deadline_s = float(get_extra_config(ktc, "kvblockd_load_deadline_s", 30.0))
 
         cache = getattr(vllm_config, "cache_config", None)
         c.block_size = int(getattr(cache, "block_size", 16) or 16)
         model = getattr(vllm_config, "model_config", None)
         c.model_name = str(getattr(model, "model", "unknown-model"))
         c.dtype = str(getattr(model, "dtype", getattr(cache, "cache_dtype", "auto")))
+        # Resolved KV-CACHE dtype (mirrors tier_fingerprint_fields): "auto" is
+        # an instruction, not an identity — it resolves to the model dtype.
+        # Without this field a bf16-KV and an fp8-KV engine over the same
+        # model dtype mint IDENTICAL keys and cross-serve blobs whose 32B
+        # prefix only rejects them at load time (permanent silent miss storm).
+        kv_dtype = str(getattr(cache, "cache_dtype", "auto") or "auto").replace("torch.", "")
+        if kv_dtype in ("auto", ""):
+            kv_dtype = str(getattr(model, "dtype", "auto")).replace("torch.", "")
+        c.kv_cache_dtype = kv_dtype
+        # Tokenizer identity: the same model path served through two different
+        # tokenizers yields different token-id streams — same ids, different
+        # text. vLLM's ModelConfig exposes .tokenizer (defaults to the model
+        # path) and .tokenizer_revision; fall back to model path + revision.
+        tok = getattr(model, "tokenizer", None)
+        c.tokenizer = str(tok) if tok else c.model_name
+        rev = (getattr(model, "tokenizer_revision", None)
+               or getattr(model, "revision", None))
+        c.tokenizer_revision = str(rev) if rev else ""
+        # The MODEL WEIGHTS revision is its own identity field, not just the
+        # tokenizer_revision fallback above: same model path + same tokenizer
+        # revision but different weights produce different KV bytes for
+        # identical token ids — sharing keys across them serves
+        # stale-weights KV with zero errors.
+        wrev = getattr(model, "revision", None)
+        c.revision = str(wrev) if wrev else ""
         par = getattr(vllm_config, "parallel_config", None)
         c.world_size = int(getattr(par, "world_size", 1) or 1)
         # Refuse multi-GPU outright: the key identity has no per-rank
@@ -222,6 +299,13 @@ class AdapterConfig:
                 "or use the OffloadingConnector altitude (tier_manager) once "
                 "its GPU validation lands."
             )
+        # Every field here partitions the keyspace; adding one turns existing
+        # blocks into clean misses (write-once cache repopulates) — so add
+        # facts that change KV BYTES or TOKEN IDS, and nothing else. The
+        # attention backend name is deliberately NOT folded: vLLM selects it
+        # at worker init (get_attn_backend), after this constructor runs, so
+        # it is not cheaply available here — the 32B blob prefix refuses a
+        # cross-layout scatter if a backend flip ever changes the page bytes.
         c.fingerprint = fingerprint(
             {
                 "scheme": "vllm-native-connector",
@@ -229,6 +313,11 @@ class AdapterConfig:
                 "block_size": c.block_size,
                 "world_size": c.world_size,
                 "dtype": c.dtype,
+                "kv_cache_dtype": c.kv_cache_dtype,
+                "tokenizer": c.tokenizer,
+                "tokenizer_revision": c.tokenizer_revision,
+                "revision": c.revision,
+                "blob_version": BLOB_VERSION,
             }
         )
         return c
@@ -286,6 +375,7 @@ def require_pinned_hashseed() -> None:
 
 
 __all__ = [
+    "BLOB_VERSION",
     "WIRE_KEY_LEN",
     "AdapterConfig",
     "DeterminismError",

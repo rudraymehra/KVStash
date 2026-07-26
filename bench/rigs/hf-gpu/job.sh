@@ -556,10 +556,14 @@ fi
 # ---- 9. PHASE 1: populate (vLLM #1 stores every sweep prompt into kvblockd) --
 start_vllm "$WORK/vllm-populate.log" 2400   # generous: first boot downloads ~15 GB of weights
 log "phase 1/2 populate: lengths=$LENGTHS x $PAIRS pairs; driver polls kvblockd's put counters per prompt and FAILS if they never grow"
+# --vllm-log: after the put counters quiesce the driver greps the engine log
+# for the connector's write-behind disclosure and ABORTS on a nonzero
+# `dropped=` — a lossy populate silently shrinks the warm set.
 python3 "$HERE/run_ttft.py" --phase populate \
   --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
   --model "$MODEL" --lengths "$LENGTHS" --reps "$REPS" --warmup "$WARMUP" \
   --state "$STATE_JSON" --put-wait-s "$PUT_WAIT_S" --drain-s "$DRAIN_S" \
+  --vllm-log "$WORK/vllm-populate.log" \
   || {
     # The engine's own log is where the cache library reports which backends it
     # built. Without this, a populate failure says only that no bytes arrived —
@@ -575,6 +579,27 @@ python3 "$HERE/run_ttft.py" --phase populate \
 # ---- 10. RESTART: fresh engine = no local KV anywhere; kvblockd keeps blocks -
 log "restarting vLLM: a fresh engine has no local KV, so a warm hit can only be a kvblockd TCP read"
 stop_vllm
+# The connector's shutdown flush emits its final store-queue disclosure only
+# now, after the engine exits — re-check it: blocks dropped or FAILED AT
+# SHUTDOWN (flush timeout / dead wire) escaped the driver's in-run grep but
+# still shrink the warm set. The line is emitted UNCONDITIONALLY (zeros
+# included) by connector.shutdown(): its ABSENCE means the engine exited
+# without ever calling shutdown — the flush never ran, so anything still
+# queued is silently gone and nothing measured against this warm set is
+# trustworthy. Absent line = hard failure, not a shrug.
+DISCLOSURE_FINAL="$(grep -o 'kvblockd store queue: dropped=[0-9]* failed=[0-9]*' "$WORK/vllm-populate.log" 2>/dev/null | tail -1 || true)"
+if [[ -z "$DISCLOSURE_FINAL" ]]; then
+  die "the connector's shutdown store-queue disclosure line never appeared in vllm-populate.log — the engine exited without connector.shutdown(), so the write-behind flush never ran and any still-queued blocks were silently lost; the warm set cannot be trusted"
+fi
+DROPPED_FINAL="$(printf '%s' "$DISCLOSURE_FINAL" | sed -n 's/.*dropped=\([0-9]*\).*/\1/p')"
+FAILED_FINAL="$(printf '%s' "$DISCLOSURE_FINAL" | sed -n 's/.*failed=\([0-9]*\).*/\1/p')"
+if [[ "$DROPPED_FINAL" != "0" ]]; then
+  die "the connector's shutdown disclosure reports dropped=$DROPPED_FINAL store blocks — the populated warm set is silently incomplete (raise kvblockd_store_flush_timeout_s / kvblockd_store_queue_bytes and rerun)"
+fi
+if [[ "$FAILED_FINAL" != "0" ]]; then
+  die "the connector's shutdown disclosure reports failed=$FAILED_FINAL store puts — blocks that errored on the wire and never reached kvblockd shrink the warm set exactly like drops (check daemon health and rerun)"
+fi
+log "populate store-queue disclosure: dropped=$DROPPED_FINAL failed=$FAILED_FINAL"
 start_vllm "$WORK/vllm-measure.log" 1200    # weights already on disk
 
 # ---- 11. PHASE 2: measure (warm reps first, then cold — see run_ttft.py) -----

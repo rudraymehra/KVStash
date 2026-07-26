@@ -140,6 +140,8 @@ def run_step(conn, request, block_ids, kv, num_computed=0):
         conn.wait_for_layer_load(name)
         conn.save_kv_layer(name, t, None)
     conn.wait_for_save()
+    # Stores are write-behind by default: drain before asserting on hits.
+    assert conn._store_flush(10.0) == 0
     conn.clear_connector_metadata()
     return n
 
@@ -347,6 +349,7 @@ def test_store_bounded_by_scheduled_tokens(daemon):
     conn.bind_connector_metadata(meta)
     conn.start_load_kv(StubForwardContext(kv))
     conn.wait_for_save()
+    assert conn._store_flush(10.0) == 0
     conn.clear_connector_metadata()
     n, _ = conn.get_num_new_matched_tokens(StubRequest("c2", toks, "t-chunk"), 0)
     assert n == BLOCK  # one block stored, not two
@@ -399,6 +402,7 @@ def test_chunked_prefill_continuation_stores_later_chunks(daemon):
     conn.bind_connector_metadata(meta)
     conn.start_load_kv(StubForwardContext(kv))
     conn.wait_for_save()
+    assert conn._store_flush(10.0) == 0
     conn.clear_connector_metadata()
 
     # Step 2: continuation — 9 more tokens, NEW physical blocks [6, 7] only.
@@ -414,6 +418,7 @@ def test_chunked_prefill_continuation_stores_later_chunks(daemon):
     conn.bind_connector_metadata(meta)
     conn.start_load_kv(StubForwardContext(kv))
     conn.wait_for_save()
+    assert conn._store_flush(10.0) == 0
     conn.clear_connector_metadata()
 
     # All FOUR blocks must now hit; a fresh engine loads them byte-identical.
