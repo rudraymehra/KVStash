@@ -242,6 +242,11 @@ class _LookupResolver:
         self._conn = connector
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._results: dict[str, int] = {}
+        # rids discarded while their work was still queued/on the wire: the
+        # late result is swallowed instead of orphaned in _results (nobody is
+        # left to pop it — the vLLM #42372 leak class). Consumed by _run on
+        # completion; bounded as armor against a dead thread never consuming.
+        self._tombstones: set[str] = set()
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, name="kvb-lookup", daemon=True)
         self._thread.start()
@@ -257,9 +262,18 @@ class _LookupResolver:
         with self._lock:
             return self._results.pop(rid, None)
 
-    def discard(self, rid: str) -> None:
+    def discard(self, rid: str, inflight: bool = False) -> None:
+        """Drop rid's result. inflight=True says the caller KNOWS work for
+        rid is still queued/on the wire (a pending entry existed with no
+        result): tombstone it so the late post is swallowed. A result that
+        already landed is simply popped — nothing is in flight then."""
         with self._lock:
-            self._results.pop(rid, None)
+            if self._results.pop(rid, None) is not None:
+                return
+            if inflight:
+                if len(self._tombstones) >= _LOOKUP_PENDING_CAP:
+                    self._tombstones.pop()  # bounded armor: shed an arbitrary stale entry
+                self._tombstones.add(rid)
 
     def stop(self, timeout: float = 1.0) -> None:
         self._q.put(None)  # sentinel
@@ -282,7 +296,10 @@ class _LookupResolver:
                 conn._log.maybe("lookup", "kvblockd async BATCH_EXISTS failed (miss)", e)
                 conn._drop_client(e)
             with self._lock:
-                self._results[rid] = hit
+                if rid in self._tombstones:  # discarded while we were on the wire
+                    self._tombstones.discard(rid)
+                else:
+                    self._results[rid] = hit
 
 
 class KvblockdConnector(_Base):
@@ -519,7 +536,10 @@ class KvblockdConnector(_Base):
             token_ids = list(getattr(request, "prompt_token_ids", None) or [])
             aligned = align_to_block_size(len(token_ids), self._block_size)
             if aligned <= num_computed_tokens:
-                self._lookup_pending.pop(rid, None)
+                if (self._lookup_pending.pop(rid, None) is not None
+                        and self._resolver is not None):
+                    # posted work is still in flight: tombstone the late result
+                    self._resolver.discard(rid, inflight=True)
                 return 0, False
             if self._resolver is None:
                 self._resolver = _LookupResolver(self)
@@ -538,6 +558,9 @@ class KvblockdConnector(_Base):
             if deadline is not None:
                 if time.monotonic() > deadline:
                     self._lookup_pending.pop(rid, None)
+                    # pop() above answered None, so the work is still queued/
+                    # on the wire — tombstone it or the late result orphans.
+                    resolver.discard(rid, inflight=True)
                     self._log.maybe("lookup-deadline",
                                     f"async lookup timed out — treated as miss req={rid}")
                     return 0, False
@@ -552,7 +575,9 @@ class KvblockdConnector(_Base):
             return None, False
         except Exception as e:  # noqa: BLE001 — never raise: a failed lookup is a miss
             self._log.maybe("lookup", "kvblockd async lookup failed (treated as miss)", e)
-            self._lookup_pending.pop(rid, None)
+            if (self._lookup_pending.pop(rid, None) is not None
+                    and self._resolver is not None):
+                self._resolver.discard(rid, inflight=True)  # same orphan armor
             return 0, False
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
@@ -724,10 +749,12 @@ class KvblockdConnector(_Base):
             self._blocks.pop(rid, None)
             self._store_holes.pop(rid, None)
             # Async-lookup abort cleanup (the #42372 leak class): an aborted
-            # request must not leave a pending deadline or an unclaimed result.
-            self._lookup_pending.pop(rid, None)
+            # request must not leave a pending deadline, an unclaimed result,
+            # OR a result still on the wire — a pending entry with no result
+            # means the work is in flight, so the discard tombstones it.
+            pending = self._lookup_pending.pop(rid, None) is not None
             if self._resolver is not None:
-                self._resolver.discard(rid)
+                self._resolver.discard(rid, inflight=pending)
         return False, None
 
     # ------------------------------------------------------------------

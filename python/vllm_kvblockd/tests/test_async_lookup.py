@@ -48,7 +48,7 @@ class FakeResolver:
     def pop(self, rid):
         return None
 
-    def discard(self, rid):
+    def discard(self, rid, inflight=False):
         return None
 
     def post(self, *item):
@@ -138,6 +138,46 @@ def test_lookup_bounded_map_and_deadline(daemon):
     assert len(fake.posted) == posted_before  # nothing was queued at the cap
     assert "bd2" not in conn._lookup_pending
     conn._lookup_pending.clear()
+    conn.shutdown()
+
+
+def test_discard_before_post_leaves_no_orphan(daemon):
+    """The orphan flavor test_lookup_abort_cleanup can't see: the lookup
+    EXPIRES (pruned, answered miss) and the request FINISHES while the
+    resolver is still ON THE WIRE — the late result used to squat in
+    _results forever (nobody left to pop it). The discard now tombstones the
+    in-flight rid and the resolver swallows the late result, leaving BOTH
+    maps empty once it unblocks."""
+    import threading
+
+    toks = list(range(540, 549))
+    conn = make_conn(daemon, kvblockd_async_lookup=True,
+                     kvblockd_lookup_timeout_s=0.05)
+    gate = threading.Event()
+
+    class BlockedClient:
+        """batch_exists parks on the gate — a daemon that answers late."""
+
+        def batch_exists(self, keys):
+            gate.wait(10.0)
+            return len(keys), None
+
+    conn._ensure = lambda: BlockedClient()
+    req = StubRequest("orph1", toks, "al-orphan")
+    assert conn.get_num_new_matched_tokens(req, 0) == (None, False)  # posted; on the wire
+    time.sleep(0.08)
+    assert conn.get_num_new_matched_tokens(req, 0) == (0, False)  # expired -> miss, pruned
+    conn.request_finished(req, [])  # finished/aborted while still in flight
+    gate.set()
+
+    # Fence: the queue is FIFO, so once a lookup posted AFTER the orphan
+    # resolves, the orphan's work has completed and reconciled.
+    fence = StubRequest("orph-fence", toks, "al-orphan")
+    assert conn.get_num_new_matched_tokens(fence, 0) == (None, False)
+    assert poll_lookup(conn, fence) == 8
+    with conn._resolver._lock:
+        assert conn._resolver._results == {}, "late result orphaned after discard"
+        assert conn._resolver._tombstones == set()  # consumed, never accumulated
     conn.shutdown()
 
 
