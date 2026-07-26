@@ -152,6 +152,7 @@ class AdapterConfig:
     """Everything the connector needs, pulled defensively off vllm_config."""
 
     __slots__ = (
+        "async_store",
         "block_size",
         "connect_timeout",
         "dtype",
@@ -163,6 +164,8 @@ class AdapterConfig:
         "port",
         "so_rcvbuf",
         "staging_bytes",
+        "store_flush_timeout_s",
+        "store_queue_bytes",
         "streams",
         "token",
         "verify",
@@ -194,6 +197,20 @@ class AdapterConfig:
         c.staging_bytes = int(get_extra_config(ktc, "kvblockd_staging_bytes", 2 * 2**30))
         c.op_timeout = float(get_extra_config(ktc, "kvblockd_op_timeout_s", 10.0))
         c.connect_timeout = float(get_extra_config(ktc, "kvblockd_connect_timeout_s", 5.0))
+        # Write-behind stores: wait_for_save stages OWNED copies and returns;
+        # a single "kvb-store" daemon thread drains them to the daemon. False
+        # = the original synchronous put loop, byte-identical, kept for A/B.
+        c.async_store = bool(get_extra_config(ktc, "kvblockd_async_store", True))
+        # Staged-copy budget for the store queue. Enqueue past the budget
+        # never blocks the engine: the block (and, tail-skip, the rest of its
+        # request) is dropped and counted in the connector's dropped_puts /
+        # dropped_put_bytes counters.
+        c.store_queue_bytes = int(get_extra_config(ktc, "kvblockd_store_queue_bytes", 1 << 30))
+        # shutdown() waits at most this long for the queue to flush; whatever
+        # is still undelivered is counted dropped and disclosed.
+        c.store_flush_timeout_s = float(
+            get_extra_config(ktc, "kvblockd_store_flush_timeout_s", 10.0)
+        )
 
         cache = getattr(vllm_config, "cache_config", None)
         c.block_size = int(getattr(cache, "block_size", 16) or 16)

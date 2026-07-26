@@ -37,8 +37,10 @@ import os
 import struct
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
+import numpy as np
 from kvblockd import protocol as kp
 from kvblockd.client import Client
 from kvblockd.errors import ConnectionLost
@@ -265,6 +267,25 @@ class KvblockdConnector(_Base):
         self._path_switch_logged = False
         self._debug_scatter_checked = False  # KVBLOCKD_DEBUG_SCATTER_CHECK=1, once
 
+        # Write-behind store queue (kvblockd_async_store, default on):
+        # wait_for_save stages OWNED byte copies here and returns; ONE daemon
+        # thread ("kvb-store", lazily started on first enqueue) drains FIFO.
+        # FIFO preserves per-request block order, so a partial delivery is a
+        # usable consecutive prefix under the prefix-chain keys. All queue
+        # state (deque, byte gauges, public counters) is guarded by _sq_cond.
+        self._sq: deque[tuple[bytes, bytearray]] = deque()
+        self._sq_cond = threading.Condition()
+        self._sq_bytes = 0            # bytes currently queued
+        self._sq_inflight = 0         # blocks popped, put() not finished
+        self._sq_inflight_bytes = 0
+        self._store_thread: threading.Thread | None = None
+        self._store_stop = False      # shutdown: drain the remainder, then exit
+        self._store_abort = False     # wedged flush: exit without draining
+        # Public disclosure counters (the bench reads/greps these).
+        self.dropped_puts = 0
+        self.dropped_put_bytes = 0
+        self.failed_puts = 0
+
     # ------------------------------------------------------------------
     # client plumbing (lazy: import/instantiate must succeed with no daemon)
     # ------------------------------------------------------------------
@@ -313,6 +334,9 @@ class KvblockdConnector(_Base):
         client.close()
 
     def shutdown(self):
+        # Flush the write-behind queue FIRST — the drain thread needs the
+        # client to deliver what is still staged.
+        self._store_shutdown()
         with self._client_lock:
             self._closed = True
             client, self._client = self._client, None
@@ -961,6 +985,12 @@ class KvblockdConnector(_Base):
         self._layer_kv[layer_name] = kv_layer
 
     def wait_for_save(self):
+        """Stage-sync + drain-async (kvblockd_async_store, default on): every
+        block's bytes are copied into an OWNED buffer HERE, before returning —
+        the vLLM base contract only protects the paged buffer until this call
+        returns, and on CPU _block_bytes hands back an ALIASING view of paged
+        memory — then a background thread drains the copies over TCP. With the
+        flag off this is the original synchronous put loop, byte-identical."""
         try:
             metadata = self._get_connector_metadata()
         except Exception:  # noqa: BLE001 — never-raise boundary: missing metadata = nothing to store this step
@@ -969,10 +999,163 @@ class KvblockdConnector(_Base):
         for req in requests:
             if req.store_end_block > req.store_start_block:
                 try:
-                    self._store_one(req)
+                    if self._cfg.async_store:
+                        self._stage_one(req)
+                    else:
+                        self._store_one(req)
                 except Exception as e:  # noqa: BLE001 — never raise: a lost store is a future miss
                     self._log.maybe("store", f"kvblockd store failed req={req.req_id}", e)
                     self._drop_client(e)
+
+    # ------------------------------------------------------------------
+    # write-behind store queue (kvblockd_async_store)
+    # ------------------------------------------------------------------
+    def _stage_one(self, req: KvbReqMeta) -> None:
+        """Copy every store-range block into ONE owned bytearray per block
+        (32B layout prefix + all layers, exactly the blob _store_one streams)
+        and enqueue it. The copies MUST happen inside wait_for_save: after it
+        returns the scheduler may reuse the paged blocks, and _block_bytes is
+        zero-copy on CPU — draining the view later would stream whatever the
+        engine wrote over it (silent corruption armor, not an optimization)."""
+        names, dtype_name, bytes_per_layer = self._layout()
+        if not names:
+            return
+        total = BLOB_PREFIX_LEN + bytes_per_layer * len(names)
+        prefix = encode_blob_prefix(dtype_name, len(names), self._block_size,
+                                    bytes_per_layer, total)
+        seed = self._seed(req.cache_salt, req.mm_ids, req.lora_name)
+        keys = block_chain_keys(seed, req.token_ids, self._block_size)
+        end = min(req.store_end_block, len(keys), len(req.block_ids))
+        for j in range(req.store_start_block, end):
+            bid = req.block_ids[j]
+            buf = bytearray(total)
+            buf[:BLOB_PREFIX_LEN] = prefix
+            dst = np.frombuffer(buf, dtype=np.uint8)  # writable view of buf
+            for li, name in enumerate(names):
+                src = self._block_bytes(self._layer_kv[name][bid])
+                dst[BLOB_PREFIX_LEN + li * bytes_per_layer:
+                    BLOB_PREFIX_LEN + (li + 1) * bytes_per_layer] = src  # copies
+            if not self._sq_enqueue(keys[j], buf):
+                # TAIL-SKIP: block keys are a prefix chain, so once block j is
+                # missing every later block of THIS request is unreachable by
+                # BATCH_EXISTS's consecutive-prefix count — copying/queueing
+                # them would spend budget on bytes no lookup can ever count.
+                # Count them dropped (without building the copies) and stop.
+                skipped = end - j - 1
+                if skipped > 0:
+                    with self._sq_cond:
+                        self.dropped_puts += skipped
+                        self.dropped_put_bytes += skipped * total
+                return
+
+    def _sq_enqueue(self, key: bytes, buf: bytearray) -> bool:
+        """Enqueue one owned blob. NEVER blocks and NEVER raises: past the
+        byte budget (or during shutdown) the block is dropped and counted —
+        a lost store is a future miss, an engine stall is an incident."""
+        n = len(buf)
+        with self._sq_cond:
+            if self._store_stop or self._sq_bytes + n > self._cfg.store_queue_bytes:
+                self.dropped_puts += 1
+                self.dropped_put_bytes += n
+                # Rate-limited in-run disclosure (the shutdown summary line is
+                # unconditional); the bench populate phase greps `dropped=`.
+                self._log.maybe(
+                    "store-drop",
+                    f"kvblockd store queue overflow: dropped={self.dropped_puts} "
+                    f"failed={self.failed_puts} dropped_bytes={self.dropped_put_bytes}",
+                )
+                return False
+            self._sq.append((key, buf))
+            self._sq_bytes += n
+            self._sq_cond.notify_all()
+        self._store_thread_start()
+        return True
+
+    def _store_thread_start(self) -> None:
+        """Lazily start the single "kvb-store" drain thread. Only ever called
+        from the engine's serving thread (wait_for_save), so the check-then-
+        start needs no extra lock."""
+        t = self._store_thread
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=self._store_drain, name="kvb-store", daemon=True)
+        self._store_thread = t
+        t.start()
+
+    def _store_drain(self) -> None:
+        """FIFO drain loop: pop one staged blob, put it. A failed put counts
+        (failed_puts), logs rate-limited, and drops the client with the same
+        breaker discipline as loads — the thread itself NEVER dies to an op
+        error, so delivery resumes after a redial. OK_EXISTS = dedup, fine."""
+        while True:
+            with self._sq_cond:
+                while not self._sq and not self._store_stop:
+                    self._sq_cond.wait()
+                if self._store_abort or (not self._sq and self._store_stop):
+                    return
+                key, buf = self._sq.popleft()
+                n = len(buf)
+                self._sq_bytes -= n
+                self._sq_inflight += 1
+                self._sq_inflight_bytes += n
+            try:
+                self._ensure().put(key, [buf])
+            except Exception as e:  # noqa: BLE001 — never let the drain thread die: a lost store is a future miss
+                with self._sq_cond:
+                    self.failed_puts += 1
+                self._log.maybe("store", "kvblockd async store failed", e)
+                self._drop_client(e)
+            finally:
+                with self._sq_cond:
+                    self._sq_inflight -= 1
+                    self._sq_inflight_bytes -= n
+                    self._sq_cond.notify_all()
+
+    def _store_flush(self, timeout: float) -> int:
+        """Wait (up to timeout) until the queue is empty and nothing is in
+        flight. Returns the number of UNDELIVERED blocks left at timeout."""
+        deadline = time.monotonic() + timeout
+        with self._sq_cond:
+            while self._sq or self._sq_inflight:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return len(self._sq) + self._sq_inflight
+                self._sq_cond.wait(left)
+        return 0
+
+    def _store_shutdown(self) -> None:
+        """Flag + notify + bounded join; whatever the drain thread could not
+        deliver inside kvblockd_store_flush_timeout_s is counted dropped. The
+        summary line is ALWAYS emitted, zero included, at WARNING — this
+        logger is unconfigured in vLLM's engine-core process, where the root
+        default drops INFO (proven on the bench rig) — so the bench can grep
+        for the line's presence, not just its value."""
+        with self._sq_cond:
+            self._store_stop = True
+            self._sq_cond.notify_all()
+        t = self._store_thread
+        if t is not None and t.is_alive():
+            t.join(self._cfg.store_flush_timeout_s)
+        with self._sq_cond:
+            self._store_abort = True  # a wedged put must not keep delivering
+            remainder = len(self._sq) + self._sq_inflight
+            if remainder:
+                self.dropped_puts += remainder
+                self.dropped_put_bytes += self._sq_bytes + self._sq_inflight_bytes
+            self._sq.clear()
+            self._sq_bytes = 0
+            self._sq_cond.notify_all()
+            dropped, failed, dbytes = (self.dropped_puts, self.failed_puts,
+                                       self.dropped_put_bytes)
+        logger.warning("kvblockd store queue: dropped=%d failed=%d dropped_bytes=%d",
+                       dropped, failed, dbytes)
+
+    def handle_preemptions(self, *args, **kwargs) -> None:
+        """Explicit NO-OP, on purpose: the write-behind queue holds OWNED
+        copies staged inside wait_for_save — nothing in it references paged
+        memory, so a preempted request's blocks can be freed and reused
+        immediately without corrupting a queued store."""
+        return
 
     def _store_one(self, req: KvbReqMeta) -> None:
         names, dtype_name, bytes_per_layer = self._layout()

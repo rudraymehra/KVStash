@@ -391,10 +391,14 @@ fi
 # ---- 9. PHASE 1: populate (vLLM #1 stores every sweep prompt into kvblockd) --
 start_vllm "$WORK/vllm-populate.log" 2400   # generous: first boot downloads ~15 GB of weights
 log "phase 1/2 populate: lengths=$LENGTHS x $PAIRS pairs; driver polls kvblockd's put counters per prompt and FAILS if they never grow"
+# --vllm-log: after the put counters quiesce the driver greps the engine log
+# for the connector's write-behind disclosure and ABORTS on a nonzero
+# `dropped=` — a lossy populate silently shrinks the warm set.
 python3 "$HERE/run_ttft.py" --phase populate \
   --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
   --model "$MODEL" --lengths "$LENGTHS" --reps "$REPS" --warmup "$WARMUP" \
   --state "$STATE_JSON" --put-wait-s "$PUT_WAIT_S" --drain-s "$DRAIN_S" \
+  --vllm-log "$WORK/vllm-populate.log" \
   || {
     # The engine's own log is where the cache library reports which backends it
     # built. Without this, a populate failure says only that no bytes arrived —
@@ -410,6 +414,14 @@ python3 "$HERE/run_ttft.py" --phase populate \
 # ---- 10. RESTART: fresh engine = no local KV anywhere; kvblockd keeps blocks -
 log "restarting vLLM: a fresh engine has no local KV, so a warm hit can only be a kvblockd TCP read"
 stop_vllm
+# The connector's shutdown flush emits its final store-queue disclosure only
+# now, after the engine exits — re-check it: blocks dropped AT SHUTDOWN (flush
+# timeout) escaped the driver's in-run grep but still shrink the warm set.
+DROPPED_FINAL="$(grep -o 'kvblockd store queue: dropped=[0-9]*' "$WORK/vllm-populate.log" 2>/dev/null | tail -1 | grep -o '[0-9]*$' || true)"
+if [[ -n "$DROPPED_FINAL" && "$DROPPED_FINAL" != "0" ]]; then
+  die "the connector's shutdown disclosure reports dropped=$DROPPED_FINAL store blocks — the populated warm set is silently incomplete (raise kvblockd_store_flush_timeout_s / kvblockd_store_queue_bytes and rerun)"
+fi
+log "populate store-queue disclosure: dropped=${DROPPED_FINAL:-<line absent>}"
 start_vllm "$WORK/vllm-measure.log" 1200    # weights already on disk
 
 # ---- 11. PHASE 2: measure (warm reps first, then cold — see run_ttft.py) -----
