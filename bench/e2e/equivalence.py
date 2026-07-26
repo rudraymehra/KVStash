@@ -29,20 +29,25 @@ Prompt lengths are adversarial by construction: for every --boundary-multiples
 entry m, prompts at exactly m*block_size - 1 / m*block_size / m*block_size + 1
 tokens (the connector stores only the complete blocks of the first n-1 tokens,
 so these straddle the store/recompute boundary), plus any --lengths extras.
+"Exactly" is enforced: build_prompt pads/trims until the server's /tokenize
+returns the target to the token (a tolerance as wide as one calibration unit
+would collapse the boundary trio onto one length), or the record phase fails.
 --n prompts (default 20 — the free CPU rig's budget; GPU runs pass --n 100)
 round-robin across that length list, each with a unique nonce at token 0.
 
 Exit codes: 0 all matched and (with --metrics) all warm-attributed;
 1 match rate below --min-match (default 100 — for a byte-exact store ANY
-mismatch is a finding, not noise); 3 tokens all matched but some compare
-prompts could not be attributed to kvblockd (equivalence proven only against
-recompute, not against the store). 2 = phase-level failure (severed store
-path, bad state).
+mismatch is a finding, not noise); 3 tokens all matched but the proof is
+weaker than claimed — some compare prompts could not be attributed to
+kvblockd (equivalence proven only against recompute, not against the store)
+or were compared at text level only (the server elided logprobs.tokens).
+2 = phase-level failure (severed store path, bad state, prompt calibration
+could not land exactly).
 
-`--selftest` proves the equality gate, the first-divergence report, the
-store receipt, and the attribution rule against an in-process stub with
-driver-controlled counters (same style as run_ttft.py) — run it before
-trusting a green run.
+`--selftest` proves the exact-landing calibration, the equality gate, the
+first-divergence report, the store receipt, the attribution rule, and the
+text-fallback accounting against an in-process stub with driver-controlled
+counters (same style as run_ttft.py) — run it before trusting a green run.
 """
 
 from __future__ import annotations
@@ -57,12 +62,19 @@ import urllib.request
 import uuid
 
 UNIT = "The quick brown fox jumps over the lazy dog. "
+FILLER = " and"   # single-token pad for exact landing (verified against the
+                  # server's /tokenize on every adjustment, never assumed)
 PRINT_PREFIX = "EQUIVJSONL"
 
 
 class StorePathError(RuntimeError):
     """The store path engine -> connector -> kvblockd is severed; comparing
     would prove recompute==recompute, which is theater."""
+
+
+class PromptLandingError(RuntimeError):
+    """build_prompt could not make /tokenize return EXACTLY the target — the
+    record phase must fail rather than mislabel a boundary cell."""
 
 
 # ------------------------------------------------------------------ HTTP bits
@@ -134,26 +146,45 @@ def complete_greedy(vllm: str, model: str, prompt: str, gen_tokens: int,
 
 
 # ------------------------------------------------------------- prompt build
-# (same calibration algorithm as run_ttft.build_prompt: nonce FIRST so every
-# connector block key differs between prompts; count from the server's own
-# /tokenize, never assumed)
+# (nonce FIRST, same as run_ttft.build_prompt, so every connector block key
+# differs between prompts; count from the server's own /tokenize, never
+# assumed. UNLIKE run_ttft, the landing must be EXACT: the boundary targets
+# m*B-1 / m*B / m*B+1 differ by single tokens, and a tolerance as wide as one
+# UNIT (~11 tokens) collapses all three onto one physical length — the suite
+# would test the same cell thrice and call it a boundary sweep.)
 
 def build_prompt(vllm: str, model: str, target_tokens: int, nonce: str) -> tuple[str, int]:
+    """Coarse UNIT calibration, then trim whole UNITs / pad 1-token FILLERs
+    until /tokenize returns EXACTLY target_tokens; raises PromptLandingError
+    otherwise (the record phase fails rather than mislabel a cell)."""
     head = f"kvstash-equiv {nonce} :: "
     base = tokenize_count(vllm, model, head)
     probe = tokenize_count(vllm, model, head + UNIT * 128)
     unit_toks = max((probe - base) / 128.0, 0.5)
-    k = max(1, round((target_tokens - base) / unit_toks))
-    tol = max(math.ceil(unit_toks), target_tokens // 200)
-    prompt, n = head, base
-    for _ in range(10):
-        prompt = head + UNIT * k
+    k = max(0, round((target_tokens - base) / unit_toks))
+    fill = 0
+    n = base
+    for _ in range(24):
+        prompt = head + UNIT * k + FILLER * fill
         n = tokenize_count(vllm, model, prompt)
         err = target_tokens - n
-        if abs(err) <= tol:
-            break
-        k = max(1, k + (round(err / unit_toks) or (1 if err > 0 else -1)))
-    return prompt, n
+        if err == 0:
+            return prompt, n
+        if err > 0:                        # undershoot
+            if err >= unit_toks:           # whole units while they fit...
+                k += int(err // unit_toks)
+            else:                          # ...then single-token fillers
+                fill += err
+        elif fill >= -err:                 # overshoot: peel fillers first
+            fill += err
+        elif fill:
+            fill = 0
+        else:                              # no fillers left: drop whole units
+            k = max(0, k - max(1, math.ceil(-err / unit_toks)))
+    raise PromptLandingError(
+        f"could not land exactly on {target_tokens} tokens (got {n}; "
+        f"unit={unit_toks:.2f} tok, k={k}, fill={fill}) — the boundary cells "
+        "are only meaningful at their exact lengths")
 
 
 def expected_hit_blocks(prompt_tokens: int, block_size: int) -> int:
@@ -280,7 +311,7 @@ def run_compare(args, stamp: dict) -> int:
         print(f"{args.print_prefix} {line}", flush=True)
 
     matched = 0
-    mismatches, unwarmed = [], []
+    mismatches, unwarmed, text_fallback = [], [], []
     for e in entries:
         c0 = read_counters(args.metrics) if args.metrics else None
         r = complete_greedy(args.vllm, args.model, e["prompt"], gen_tokens,
@@ -296,6 +327,7 @@ def run_compare(args, stamp: dict) -> int:
         else:
             div = first_divergence(list(e["text"]), list(r["text"]))
             rec["compare_level"] = "text (logprobs unavailable)"
+            text_fallback.append(e["i"])
         rec["match"] = div is None
         rec["first_divergence_index"] = div
         if div is None:
@@ -331,7 +363,13 @@ def run_compare(args, stamp: dict) -> int:
                "mismatches": [{"i": i, "target_tokens": t, "first_divergence_index": d}
                               for i, t, d in mismatches],
                "warm_attributed_all": not unwarmed if args.metrics else None,
-               "isolation": "vllm-restart"}
+               "text_fallback_prompts": len(text_fallback),
+               # Isolation is a property of the HARNESS that ran the two
+               # phases (did an engine restart actually happen in between?);
+               # this driver cannot see it, so it claims nothing — the harness
+               # must stamp it (--stamp isolation=vllm-restart) or the summary
+               # says "unverified".
+               "isolation": "unverified"}
     summary.update(stamp)
     emit(summary)
     if args.out:
@@ -358,6 +396,12 @@ def run_compare(args, stamp: dict) -> int:
               "kvblockd — equivalence was proven against recompute, not against "
               "the store.", file=sys.stderr)
         return 3
+    if text_fallback:
+        print(f"FAIL: {len(text_fallback)} prompt(s) compared at TEXT level only "
+              "(the server elided logprobs.tokens) — matching text is necessary "
+              "but token-exact equivalence was not proven for prompts "
+              f"{text_fallback}.", file=sys.stderr)
+        return 3
     return 0
 
 
@@ -374,8 +418,10 @@ def _stub_server(ctl):
     CORRECT expected block count for the request's prompt (a well-behaved
     connector); "hit-short" grows them by one block too few; "none" freezes
     them. ctl["flip_at"]: index of a generated token to corrupt (None = exact
-    replay). Token sequences are a deterministic function of the prompt, so
-    record and compare agree unless flip_at interferes."""
+    replay). ctl["elide_logprobs"]: drop logprobs.tokens from completions (a
+    server that forces the text-level fallback). Token sequences are a
+    deterministic function of the prompt, so record and compare agree unless
+    flip_at interferes."""
     import hashlib
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -423,8 +469,10 @@ def _stub_server(ctl):
                 if ctl["flip_at"] is not None and ctl["flip_at"] < len(toks):
                     toks = list(toks)
                     toks[ctl["flip_at"]] = "CORRUPTED"
-                resp = {"choices": [{"index": 0, "text": " ".join(toks),
-                                     "logprobs": {"tokens": toks}}],
+                choice = {"index": 0, "text": " ".join(toks)}
+                if not ctl.get("elide_logprobs"):
+                    choice["logprobs"] = {"tokens": toks}
+                resp = {"choices": [choice],
                         "usage": {"prompt_tokens": ptoks,
                                   "completion_tokens": len(toks)}}
                 self._send(200, json.dumps(resp).encode())
@@ -445,16 +493,21 @@ def _stub_server(ctl):
 
 
 def selftest() -> int:
-    """Prove (1) the boundary-length expansion incl. the zero-block filter,
-    (2) record fails loudly on a severed store path, (3) a healthy record
-    persists prompts + token sequences, (4) an exact replay passes at 100%,
-    (5) a corrupted replay fails with the right first-divergence index, and
-    (6) a token-equal but hit-starved compare exits 3 (proven equal, unproven
-    warm)."""
+    """Prove (1) the boundary-length expansion incl. the zero-block filter
+    AND that build_prompt lands EXACTLY on each boundary target (95/96/97
+    must land 95/96/97 — one physical length per cell), (2) record fails
+    loudly on a severed store path, (3) a healthy record persists prompts +
+    token sequences, (4) an exact replay passes at 100% with the isolation
+    field defaulting to "unverified", (5) a corrupted replay fails with the
+    right first-divergence index, (6) a token-equal but hit-starved compare
+    exits 3 (proven equal, unproven warm), and (7) a logprobs-elided compare
+    exits 3 with the text-fallback prompts counted and a harness-stamped
+    isolation honored."""
     import tempfile
 
     ctl = {"hits": 0.0, "put_bytes": 0.0, "get_bytes": 0.0, "blocks": 0.0,
-           "on_completion": "none", "flip_at": None, "block_size": 12}
+           "on_completion": "none", "flip_at": None, "block_size": 12,
+           "elide_logprobs": False}
     srv, url = _stub_server(ctl)
     ok = True
 
@@ -483,6 +536,22 @@ def selftest() -> int:
         if expected_hit_blocks(97, 12) != 8 or expected_hit_blocks(96, 12) != 7:
             print("FAIL: expected_hit_blocks alignment", file=sys.stderr)
             ok = False
+
+        # 1b) EXACT landing: the boundary trio differs by single tokens, so
+        # each target must land precisely (the old unit-wide tolerance
+        # calibrated 95, 96 and 97 all onto the same 96-token prompt — three
+        # "boundary cells" that were one physical length).
+        landed = {}
+        for t in (95, 96, 97, 120):
+            _, n = build_prompt(url, "stub", t, f"land-{t}")
+            landed[t] = n
+            if n != t:
+                print(f"FAIL: build_prompt({t}) landed at {n}, not exactly {t}",
+                      file=sys.stderr)
+                ok = False
+        if all(landed[t] == t for t in landed):
+            print(f"[selftest] exact landing OK: targets {sorted(landed)} "
+                  "each hit to the token")
 
         tmp = tempfile.mkdtemp(prefix="equiv-selftest-")
         state_path = os.path.join(tmp, "state.json")
@@ -514,7 +583,9 @@ def selftest() -> int:
             print(f"[selftest] healthy record: rc=0, {len(st['entries'])} prompts "
                   "with token sequences, put receipts verified")
 
-        # 4) exact replay (well-behaved connector) -> rc 0, 100% match.
+        # 4) exact replay (well-behaved connector) -> rc 0, 100% match; the
+        # driver cannot see whether an engine restart happened, so with no
+        # harness stamp the summary must say isolation "unverified".
         ctl["on_completion"] = "hit"
         out_good = os.path.join(tmp, "good.jsonl")
         rc = run_compare(mkargs(state=state_path, out=out_good),
@@ -524,11 +595,14 @@ def selftest() -> int:
         summ = [r for r in recs if r["kind"] == "equivalence-summary"]
         if rc != 0 or len(summ) != 1 or summ[0]["match_rate_pct"] != 100.0 \
                 or summ[0]["matched"] != 4 or not summ[0]["warm_attributed_all"] \
+                or summ[0]["isolation"] != "unverified" \
+                or summ[0]["text_fallback_prompts"] != 0 \
                 or any(not r["match"] for r in recs if r["kind"] == "equivalence"):
             print(f"FAIL: exact replay rc={rc} summary={summ}", file=sys.stderr)
             ok = False
         else:
-            print("[selftest] exact replay: rc=0, 4/4 matched, all warm-attributed")
+            print("[selftest] exact replay: rc=0, 4/4 matched, all warm-attributed, "
+                  "isolation honestly 'unverified' without a harness stamp")
 
         # 5) corrupted replay -> rc 1 with the right divergence index.
         ctl["flip_at"] = 2
@@ -560,6 +634,29 @@ def selftest() -> int:
             else:
                 print(f"[selftest] {why} compare: rc=3 — tokens equal but not "
                       "attributed to kvblockd")
+
+        # 7) logprobs elided by the server -> text-level fallback: matching
+        # text is necessary but not the token-exact claim, so rc 3 with the
+        # fallback prompts counted; a harness-stamped isolation overrides the
+        # "unverified" default.
+        ctl["on_completion"] = "hit"
+        ctl["elide_logprobs"] = True
+        out_txt = os.path.join(tmp, "textfallback.jsonl")
+        rc = run_compare(mkargs(state=state_path, out=out_txt),
+                         {"rig": "selftest", "isolation": "vllm-restart"})
+        with open(out_txt) as f:
+            summ = [r for r in (json.loads(line) for line in f)
+                    if r["kind"] == "equivalence-summary"]
+        if rc != 3 or summ[0]["text_fallback_prompts"] != 4 \
+                or summ[0]["matched"] != 4 \
+                or summ[0]["isolation"] != "vllm-restart":
+            print(f"FAIL: text-fallback compare rc={rc} summary={summ}",
+                  file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] text-fallback compare: rc=3, 4/4 text-matched but "
+                  "counted as fallback; stamped isolation honored")
+        ctl["elide_logprobs"] = False
     finally:
         srv.shutdown()
     print("SELFTEST " + ("PASS" if ok else "FAIL"))
@@ -614,7 +711,7 @@ def main() -> int:
     if args.phase == "record":
         try:
             return run_record(args)
-        except StorePathError as e:
+        except (StorePathError, PromptLandingError) as e:
             print(f"FATAL(record): {e}", file=sys.stderr)
             return 2
 

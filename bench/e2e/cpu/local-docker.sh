@@ -250,8 +250,10 @@ if [[ "$MODE" == "equivalence" ]]; then
   # attribution, token-sequence equality gated at 100%). vLLM-on-CPU uses
   # 128-token KV blocks, so the boundary trios sit at 255/256/257 and
   # 383/384/385 tokens (the connector stores only the complete blocks of the
-  # first n-1 tokens — these straddle the store/recompute edge); 320,512 are
-  # the plain mid-block cells. Greedy decode: temperature=0, seed pinned by
+  # first n-1 tokens — these straddle the store/recompute edge); 320 is the
+  # plain mid-block cell and 512 the exactly-block-aligned one (4*128 — a
+  # fourth boundary length, not mid-block). Greedy decode: temperature=0,
+  # seed pinned by
   # the driver, --max-num-seqs 1 in serve() — determinism is the premise, so
   # any token mismatch is a store-path finding, not sampling noise.
   docker exec "$CTR" bash -c 'cd /repo && python3 bench/e2e/equivalence.py --selftest'
@@ -271,7 +273,10 @@ if [[ "$MODE" == "equivalence" ]]; then
     --model \"$MODEL\" --min-match 100 \
     --state /work/equiv-state.json --out /work/equivalence.jsonl \
     --stamp rig=local-docker --stamp connector=vllm_kvblockd-native \
-    --stamp tc_link=loopback"
+    --stamp tc_link=loopback --stamp isolation=vllm-restart"
+  # ^ isolation is stamped by THIS harness because this harness performed the
+  #   restart (stop_vllm + fresh serve above); the driver itself cannot see
+  #   that and defaults the summary to isolation=unverified.
   echo "[local-docker] PASS (equivalence): warm kvblockd reload is token-identical to recompute"
   exit 0
 fi
