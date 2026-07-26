@@ -105,12 +105,12 @@ that being disclosed next to the number.
 
 ---
 
-## 3. TTFT, Qwen2.5-7B long context: 14.3×/22.6× @16k and 17.2×/25.2× @32k
+## 3. TTFT, Qwen2.5-7B long context: 14.3×/22.6× @16k and 17.2×/25.1× @32k
 
 **Claim.** Same harness, same gates, KV-lighter model (56 KiB/token GQA-4)
 at its NATIVE 32k context (no rope scaling, no config overrides): warm
 reload **321 ms vs 4,588 ms** pure recompute @16k (**14.3×**; 22.6× vs
-serving-shape 7,271 ms) and **636 ms vs 10,923 ms** @32k (**17.2×**; 25.2×
+serving-shape 7,271 ms) and **636 ms vs 10,923 ms** @32k (**17.2×**; 25.1×
 vs 15,998 ms).
 
 **Rig + commands.** Identical to claim 2 with

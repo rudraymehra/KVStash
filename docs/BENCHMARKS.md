@@ -170,7 +170,7 @@ rep's own measured count) — and every record is path-stamped `chunked-slab`.
 | prefix | recompute (no connector) | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
 |---|---|---|---|---|---|
 | 16k | 4,588 ms | 7,271 ms | **321 ms** | **14.3×** | 22.6× |
-| 32k | 10,923 ms | 15,998 ms | **636 ms** | **17.2×** | 25.2× |
+| 32k | 10,923 ms | 15,998 ms | **636 ms** | **17.2×** | 25.1× |
 
 Why the multiple grows vs the Llama table above: the speedup is
 `prefill(L) / reload(L)` — prefill grows superlinearly with context while
