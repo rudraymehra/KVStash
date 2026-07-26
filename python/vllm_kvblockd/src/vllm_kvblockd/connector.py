@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import struct
 import threading
 import time
@@ -129,6 +130,11 @@ _SCRATCH_RING = 1
 # per-block-from-slab copies keep serving loads either way.
 _SCRATCH_MAX_FAILS = 3
 
+# Async-lookup pending-map ceiling: at the cap a NEW lookup answers (0, False)
+# — a miss — instead of None, because a None with no queued work would park
+# the request on a result that never comes (never-None-under-pressure rule).
+_LOOKUP_PENDING_CAP = 1024
+
 
 class BlobError(ValueError):
     """Unrecognized/incompatible blob prefix — the caller treats it as a miss."""
@@ -206,6 +212,63 @@ class KvblockdConnectorMetadata(_MetaBase):
     requests: list[KvbReqMeta] = field(default_factory=list)
 
 
+class _LookupResolver:
+    """Off-thread BATCH_EXISTS for the flag-gated async lookup. The scheduler
+    thread posts PLAIN DATA ONLY — (rid, aligned token ids, cache_salt, mm
+    ids, lora name) — NEVER the Request object: a queued Request outlives its
+    abort and keeps blocks/tensors pinned (the vLLM #42372 leak class). One
+    daemon thread derives the chain keys and asks the daemon; results are
+    plain hit-token ints. An op failure posts 0 (a failed lookup is a miss)
+    and drops the client with the usual breaker discipline — the thread
+    itself never dies to an op error."""
+
+    def __init__(self, connector: KvblockdConnector):
+        self._conn = connector
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self._results: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="kvb-lookup", daemon=True)
+        self._thread.start()
+
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def post(self, rid: str, token_ids: list[int], cache_salt: str | None,
+             mm_ids: list[str], lora_name: str) -> None:
+        self._q.put((rid, token_ids, cache_salt, mm_ids, lora_name))
+
+    def pop(self, rid: str) -> int | None:
+        with self._lock:
+            return self._results.pop(rid, None)
+
+    def discard(self, rid: str) -> None:
+        with self._lock:
+            self._results.pop(rid, None)
+
+    def stop(self, timeout: float = 1.0) -> None:
+        self._q.put(None)  # sentinel
+        self._thread.join(timeout)
+
+    def _run(self) -> None:
+        conn = self._conn
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            rid, token_ids, cache_salt, mm_ids, lora_name = item
+            hit = 0
+            try:
+                seed = conn._seed(cache_salt, mm_ids, lora_name)
+                keys = block_chain_keys(seed, token_ids, conn._block_size)
+                n_consec, _ = conn._ensure().batch_exists(keys)
+                hit = min(n_consec * conn._block_size, len(token_ids))
+            except Exception as e:  # noqa: BLE001 — a failed lookup is a miss; the resolver lives on
+                conn._log.maybe("lookup", "kvblockd async BATCH_EXISTS failed (miss)", e)
+                conn._drop_client(e)
+            with self._lock:
+                self._results[rid] = hit
+
+
 class KvblockdConnector(_Base):
     """The KVConnectorBase_V1 socket. Scheduler side answers
     get_num_new_matched_tokens with kvblockd's BATCH_EXISTS (<1ms p99 verb,
@@ -235,6 +298,10 @@ class KvblockdConnector(_Base):
         self._local_hit_tokens: dict[str, int] = {}
         self._need_load_blocks: dict[str, tuple[int, int]] = {}  # req_id -> (start, n)
         self._seeds: dict[str, bytes] = {}            # req_id -> chain seed
+        # Async lookup (kvblockd_async_lookup, default OFF): resolver thread
+        # created lazily on first use; pending maps req_id -> expiry deadline.
+        self._resolver: _LookupResolver | None = None
+        self._lookup_pending: dict[str, float] = {}
         # req_id -> full group-0 block list, accumulated across steps: the
         # SchedulerOutput only carries NEW block ids for cached requests, and
         # the Request object exposes none — chunked-prefill continuation
@@ -334,6 +401,8 @@ class KvblockdConnector(_Base):
         client.close()
 
     def shutdown(self):
+        if self._resolver is not None:
+            self._resolver.stop(1.0)  # sentinel + bounded join
         # Flush the write-behind queue FIRST — the drain thread needs the
         # client to deliver what is still staged.
         self._store_shutdown()
@@ -378,13 +447,22 @@ class KvblockdConnector(_Base):
     def get_num_new_matched_tokens(self, request, num_computed_tokens: int):
         """Consecutive-prefix hit count x block_size beyond what is computed.
         Idempotent (vLLM may call it repeatedly; the only state written is the
-        req_id-keyed local-hit stash, overwritten in place); sync (async=False).
-        """
+        req_id-keyed local-hit stash, overwritten in place). The second tuple
+        element is ALWAYS False — no async LOADS this wave (the upstream
+        async-load hang class needs its own validation rig); with
+        kvblockd_async_lookup the first element may be None ("still resolving,
+        ask again"), never under pressure (see _lookup_async)."""
         rid = getattr(request, "request_id", None)
         if rid is not None:
             # num_computed_tokens here IS the local prefix-cache hit; the
             # Request object still reads 0 at update_state_after_alloc time.
             self._local_hit_tokens[rid] = int(num_computed_tokens or 0)
+        if self._cfg.async_lookup and rid is not None:
+            return self._lookup_async(rid, request, num_computed_tokens)
+        return self._lookup_sync(request, num_computed_tokens)
+
+    def _lookup_sync(self, request, num_computed_tokens: int):
+        """The original synchronous lookup (flag off / fallback), unchanged."""
         try:
             token_ids = list(getattr(request, "prompt_token_ids", None) or [])
             aligned = align_to_block_size(len(token_ids), self._block_size)
@@ -399,6 +477,54 @@ class KvblockdConnector(_Base):
         except Exception as e:  # noqa: BLE001 — never raise: a failed lookup is a miss
             self._log.maybe("lookup", "kvblockd BATCH_EXISTS failed (treated as miss)", e)
             self._drop_client(e)
+            return 0, False
+
+    def _lookup_async(self, rid: str, request, num_computed_tokens: int):
+        """Flag-on lookup: post once, answer (None, False) while the resolver
+        works, then (hit, False). Order of checks: result → pending+deadline →
+        new. Guard rails: an expired pending entry becomes a miss and is
+        pruned (a wedged resolver must not park the request forever); at the
+        pending-map cap a NEW request is answered (0, False) — NEVER None,
+        which with no queued work would never be followed by a result; a dead
+        resolver thread falls back to the inline synchronous lookup."""
+        try:
+            token_ids = list(getattr(request, "prompt_token_ids", None) or [])
+            aligned = align_to_block_size(len(token_ids), self._block_size)
+            if aligned <= num_computed_tokens:
+                self._lookup_pending.pop(rid, None)
+                return 0, False
+            if self._resolver is None:
+                self._resolver = _LookupResolver(self)
+            resolver = self._resolver
+            hit = resolver.pop(rid)  # a result posted before a thread death still counts
+            if hit is not None:
+                self._lookup_pending.pop(rid, None)
+                return max(0, min(hit, aligned) - num_computed_tokens), False
+            if not resolver.alive():
+                # Dead resolver (never expected; armor): serve inline, sync.
+                self._log.maybe("lookup-thread",
+                                "async lookup resolver thread is dead — inline sync fallback")
+                self._lookup_pending.pop(rid, None)
+                return self._lookup_sync(request, num_computed_tokens)
+            deadline = self._lookup_pending.get(rid)
+            if deadline is not None:
+                if time.monotonic() > deadline:
+                    self._lookup_pending.pop(rid, None)
+                    self._log.maybe("lookup-deadline",
+                                    f"async lookup timed out — treated as miss req={rid}")
+                    return 0, False
+                return None, False
+            if len(self._lookup_pending) >= _LOOKUP_PENDING_CAP:
+                self._log.maybe("lookup-cap",
+                                "async lookup pending map at capacity — treated as miss")
+                return 0, False
+            resolver.post(rid, token_ids[:aligned], getattr(request, "cache_salt", None),
+                          self._mm_ids(request), self._lora_name(request))
+            self._lookup_pending[rid] = time.monotonic() + self._cfg.lookup_timeout_s
+            return None, False
+        except Exception as e:  # noqa: BLE001 — never raise: a failed lookup is a miss
+            self._log.maybe("lookup", "kvblockd async lookup failed (treated as miss)", e)
+            self._lookup_pending.pop(rid, None)
             return 0, False
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
@@ -568,6 +694,11 @@ class KvblockdConnector(_Base):
             self._local_hit_tokens.pop(rid, None)
             self._seeds.pop(rid, None)
             self._blocks.pop(rid, None)
+            # Async-lookup abort cleanup (the #42372 leak class): an aborted
+            # request must not leave a pending deadline or an unclaimed result.
+            self._lookup_pending.pop(rid, None)
+            if self._resolver is not None:
+                self._resolver.discard(rid)
         return False, None
 
     # ------------------------------------------------------------------

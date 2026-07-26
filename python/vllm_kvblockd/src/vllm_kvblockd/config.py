@@ -152,12 +152,14 @@ class AdapterConfig:
     """Everything the connector needs, pulled defensively off vllm_config."""
 
     __slots__ = (
+        "async_lookup",
         "async_store",
         "block_size",
         "connect_timeout",
         "dtype",
         "fingerprint",
         "host",
+        "lookup_timeout_s",
         "model_name",
         "namespace",
         "op_timeout",
@@ -211,6 +213,15 @@ class AdapterConfig:
         c.store_flush_timeout_s = float(
             get_extra_config(ktc, "kvblockd_store_flush_timeout_s", 10.0)
         )
+        # Async lookup (default OFF): get_num_new_matched_tokens answers None
+        # ("ask again") while a background thread runs BATCH_EXISTS, instead
+        # of blocking the scheduler step on the wire round-trip. Flag off =
+        # the original synchronous lookup, unchanged.
+        c.async_lookup = bool(get_extra_config(ktc, "kvblockd_async_lookup", False))
+        # A pending async lookup older than this is answered as a miss and
+        # pruned — a wedged resolver must never park a request forever.
+        lt = get_extra_config(ktc, "kvblockd_lookup_timeout_s", None)
+        c.lookup_timeout_s = float(lt) if lt not in (None, "") else c.op_timeout
 
         cache = getattr(vllm_config, "cache_config", None)
         c.block_size = int(getattr(cache, "block_size", 16) or 16)
