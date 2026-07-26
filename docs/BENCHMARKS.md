@@ -104,7 +104,9 @@ connector's load path (pinned staging, chunked DMA, sharded drain — commit
 Effective reload bandwidth at 16k: ~3.8 GB/s through a Python client with
 per-block xxh3 verification on. Run-5 hit verification uses the exact-count
 gate: every rep's `kvb_hits_total` delta equals its expected block count
-(1023/1023 at 16k), recorded per-rep in the JSONL.
+(16k: four reps at 1023/1023 and one at 1024/1024 — that rep's prompt
+calibrated one filler unit longer, and the gate tracks each rep's own
+measured token count, not a nominal target), recorded per-rep in the JSONL.
 
 ¹ the cold arm of the two-phase run serves WITH the connector, so every miss
 also pays the synchronous store-on-miss write — the steady-state serving
@@ -112,8 +114,10 @@ shape. The no-connector column is the separate control run. Quote the
 conservative "vs pure" column unless the serving context is explicit.
 
 **Attribution is arithmetic, not inferred:** `kvb_hits_total` grew by
-exactly blocks-per-prompt × reps at every length (16k: 1023 blocks × 5 =
-5115 hits, to the block). A warm rep that fails to grow the counter is
+exactly each rep's own expected block count at every length (16k: 1023+
+1023+1023+1024+1023 = 5116 hits — one rep's prompt calibrated one block
+longer, and the gate is per-rep against the measured token count, never
+a nominal target). A warm rep that fails to grow the counter is
 recorded `warm_hits_verified: false`, drawn red, and fails the job — the
 harness cannot emit an unattributed warm number (`run_ttft.py --selftest`
 proves the gates; an earlier run's 16× "speedup" with zero store hits was
