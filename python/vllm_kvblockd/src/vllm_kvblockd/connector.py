@@ -661,16 +661,22 @@ class KvblockdConnector(_Base):
             self._note_path("chunked-slab" if used_ring else "per-block")
 
     def _note_path(self, path: str) -> None:
-        """One machine-readable INFO line on the first completed load — the
-        bench rig greps it to attribute measured numbers to the path that
-        produced them — plus one more line if the path ever switches mid-run."""
+        """One machine-readable line on the first completed load — the bench
+        rig greps it to attribute measured numbers to the path that produced
+        them — plus one more line if the path ever switches mid-run.
+
+        WARNING level on purpose: this logger lives outside vLLM's logging
+        config, and in the engine-core process an unconfigured logger drops
+        INFO under the root default — the certification run recorded 'path
+        unattributed' exactly that way. WARNING passes the default filter;
+        one line per process lifetime is not noise."""
         if self._reported_path is None:
             self._reported_path = path
-            logger.info("kvblockd load path: %s", path)
+            logger.warning("kvblockd load path: %s", path)
         elif path != self._reported_path and not self._path_switch_logged:
             self._path_switch_logged = True
-            logger.info("kvblockd load path: %s (switched from %s mid-run)",
-                        path, self._reported_path)
+            logger.warning("kvblockd load path: %s (switched from %s mid-run)",
+                           path, self._reported_path)
 
     def _load_perblock(self, req: KvbReqMeta, names, dtype_name, bytes_per_layer,
                        total, keys) -> None:
