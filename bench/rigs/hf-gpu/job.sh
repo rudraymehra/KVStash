@@ -286,12 +286,24 @@ start_vllm() {  # $1 = log file, $2 = health timeout seconds
   # that control series is an engine that cannot pay any connector cost.
   KV_XFER_ARGS=(--kv-transfer-config "$(cat "$WORK/kv_transfer.json" 2>/dev/null || echo '{}')")
   if [[ "$BASELINE_ONLY" == "1" ]]; then KV_XFER_ARGS=(); fi
+  # HF_OVERRIDES: optional JSON merged into the HF model config. Needed for
+  # Qwen2.5-*-1M at this vLLM pin: their config ships
+  # dual_chunk_attention_config, whose model-code path passes layer_idx to a
+  # FlashAttention backend that does not accept it (measured: engine-core
+  # TypeError at boot). Dropping the key serves the model-card-sanctioned
+  # standard-attention mode (valid <= 262,144 tokens):
+  #   HF_OVERRIDES='{"dual_chunk_attention_config": null}'
+  # The override is stamped into every JSONL record by the measure/baseline
+  # phases (hf_overrides=), so a chart can never hide it.
+  HF_OVR_ARGS=()
+  if [[ -n "${HF_OVERRIDES:-}" ]]; then HF_OVR_ARGS=(--hf-overrides "$HF_OVERRIDES"); fi
   PYTHONHASHSEED=0 \
   vllm serve "$MODEL" --port "$VLLM_PORT" --dtype bfloat16 \
     --max-model-len "$MAX_MODEL_LEN" --max-num-seqs 1 \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --no-enable-prefix-caching \
     --disable-hybrid-kv-cache-manager \
+    "${HF_OVR_ARGS[@]}" \
     "${KV_XFER_ARGS[@]}" \
     > "$VLLM_LOG" 2>&1 &
   VLLM_PID=$!
@@ -368,6 +380,7 @@ if [[ "$BASELINE_ONLY" == "1" ]]; then
     --stamp gpu="$GPU_NAME (hf-jobs ${FLAVOR:-flavor-unset})" \
     --stamp vllm="$VLLM_VER" --stamp connector="none (baseline control)" \
     --stamp tc_link="$TC_LINK" --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
+    ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \
     --stamp git_sha="$GIT_SHA" || rc=$?
   log "JSONL at $OUT_JSONL ($(wc -l < "$OUT_JSONL" 2>/dev/null || echo 0) records)"
   [[ $rc -eq 0 ]] || { tail_logs; die "baseline driver exited rc=$rc"; }
@@ -419,6 +432,7 @@ python3 "$HERE/run_ttft.py" --phase measure \
   --stamp vllm="$VLLM_VER" \
   --stamp connector="$CONNECTOR_STAMP" \
   --stamp tc_link="$TC_LINK" --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
+  ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \
   --stamp git_sha="$GIT_SHA" || rc=$?
 
 # Path attribution receipt (the driver already stamped it into the JSONL):

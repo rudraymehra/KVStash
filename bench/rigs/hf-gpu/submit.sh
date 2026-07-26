@@ -79,7 +79,7 @@ CMD=("$HF_BIN" jobs run
   -e GEN_TOKENS="$GEN_TOKENS"
   -e FLAVOR="$FLAVOR")
 # optional knobs: forward only when the caller set them (job.sh has the defaults/derivations)
-for v in MAX_MODEL_LEN GPU_MEM_UTIL WARMUP KVBD_ARENA_BYTES CONNECTOR_STAGING_GB KV_BYTES_PER_TOKEN RESULTS_REPO BASELINE_ONLY; do
+for v in MAX_MODEL_LEN GPU_MEM_UTIL WARMUP KVBD_ARENA_BYTES CONNECTOR_STAGING_GB KV_BYTES_PER_TOKEN RESULTS_REPO BASELINE_ONLY HF_OVERRIDES; do
   if [[ -n "${!v:-}" ]]; then CMD+=(-e "$v=${!v}"); fi
 done
 CMD+=("$IMAGE" /bin/bash -c "$BOOTSTRAP")
