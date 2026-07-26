@@ -144,6 +144,27 @@ remain with the AWS rig (`bench/rigs/aws-gpu/`), gated on GPU quota.
 prefix hit; the pre-registered A4 verdict (measured Bailian hit-rate band,
 emulated link) stays OPEN until the AWS rig runs.
 
+### The long-context cells (measured 2026-07-27, same rig, Qwen2.5-7B-Instruct)
+
+Same harness, same gates, KV-lighter model (56 KiB/token GQA-4) at its
+NATIVE 32k context — no rope scaling, no config overrides. Raw JSONL:
+`bench/results/rig-e/chart2-ttft-qwen32k{,-baseline}.jsonl`; chart:
+`chart2-qwen32k.png`. Every warm rep passed the exact-count gate
+(1024/1024 and 2000/2000 blocks) and every record is path-stamped
+`chunked-slab`.
+
+| prefix | recompute (no connector) | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
+|---|---|---|---|---|---|
+| 16k | 4,588 ms | 7,271 ms | **321 ms** | **14.3×** | 22.6× |
+| 32k | 10,923 ms | 15,998 ms | **636 ms** | **17.2×** | 25.2× |
+
+Why the multiple grows vs the Llama table above: the speedup is
+`prefill(L) / reload(L)` — prefill grows superlinearly with context while
+reload grows linearly with KV bytes, and this model carries less than half
+the KV per token. Same physics every vendor's 100k-context headline runs
+on; stated here with the formula instead of hidden behind it. The same
+loopback and single-run disclosures apply as above.
+
 ---
 
 ## When NOT to use kvblockd
