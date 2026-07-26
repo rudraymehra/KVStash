@@ -80,18 +80,50 @@ Prior measured transport ceilings (this rig family):
 
 ---
 
-## Chart 2 — TTFT vs hit rate (TO FILL from Rig E)
+## Chart 2 — TTFT: reload from kvblockd vs recompute (measured 2026-07-26)
 
-A10G/g5.xlarge, Llama-3.1-8B-Instruct, vLLM 0.25.1 + LMCache 0.5.1 +
-lmcache_kvblockd, tc-emulated 25/50 Gbps link (disclosed on-chart). Series:
-vLLM recompute · LMCache+Redis 7 remote · LMCache+kvblockd@25G · @50G. Hit-
-rate points {0, 25, 50, 90}% by prefix-block seeding, plus the **Bailian
-production-trace datapoint at the measured hit rate (54–62% band) — that is
-the A4 number**, not a 90% fantasy point.
+NVIDIA A10G (HF Jobs a10g-large), Llama-3.1-8B-Instruct bf16, vLLM 0.25.1 +
+the native connector (`vllm_kvblockd` 0.1.0), **unshaped loopback link —
+disclosed on-chart**. Two-phase isolation: populate → **vLLM restart** →
+measure, `--no-enable-prefix-caching` in both phases, so a warm hit's KV has
+exactly one possible source: kvblockd over TCP into a fresh engine. TTFT =
+first SSE token; p50 of n=5 reps per point, warmup discarded. Raw JSONL:
+`bench/results/rig-e/chart2-ttft-{run4,baseline}.jsonl`; render:
+`python bench/report/plot.py chart2 --in bench/results/rig-e/chart2-ttft-*.jsonl`.
 
-**A4 verdict:** _remote TCP fetch beats recompute at the measured Bailian hit
-rate → PASS / FAIL, curve published either way with the shaded "recompute
-wins here" region._
+| prefix | recompute (no connector) | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
+|---|---|---|---|---|---|
+| 1k  | 269 ms  | 511 ms  | **145 ms**  | **1.9×** | 3.5× |
+| 4k  | 1070 ms | 2027 ms | **462 ms**  | **2.3×** | 4.4× |
+| 8k  | 2212 ms | 4147 ms | **1304 ms** | **1.7×** | 3.2× |
+| 16k | 5045 ms | 8964 ms | **2673 ms** | **1.9×** | 3.4× |
+
+¹ the cold arm of the two-phase run serves WITH the connector, so every miss
+also pays the synchronous store-on-miss write — the steady-state serving
+shape. The no-connector column is the separate control run. Quote the
+conservative "vs pure" column unless the serving context is explicit.
+
+**Attribution is arithmetic, not inferred:** `kvb_hits_total` grew by
+exactly blocks-per-prompt × reps at every length (16k: 1023 blocks × 5 =
+5115 hits, to the block). A warm rep that fails to grow the counter is
+recorded `warm_hits_verified: false`, drawn red, and fails the job — the
+harness cannot emit an unattributed warm number (`run_ttft.py --selftest`
+proves the gates; an earlier run's 16× "speedup" with zero store hits was
+rejected under exactly this rule and never published).
+
+**What this does and does not show.** Reloading KV from kvblockd beats
+recompute at every measured length on this box — the first independent,
+methodology-open measurement of TCP KV-reload vs recompute we know of (every
+prior figure in this category is vendor-claimed). The link is loopback:
+network transfer time is near zero, and a real NIC adds wire time (~0.7 s
+for the 16k prefix's ~2 GB at 25 GbE — still well inside the 5 s recompute
+budget, but that number must be measured, not asserted). The tc-shaped
+25/50 Gbps points, the hit-rate sweep, and the Bailian-trace A4 datapoint
+remain with the AWS rig (`bench/rigs/aws-gpu/`), gated on GPU quota.
+
+**A4 status:** the loopback evidence is a PASS at every length at 100%
+prefix hit; the pre-registered A4 verdict (measured Bailian hit-rate band,
+emulated link) stays OPEN until the AWS rig runs.
 
 ---
 
