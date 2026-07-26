@@ -25,6 +25,10 @@ That's a DRAM-only daemon — the recommended first run. NVMe tiering, hugepages
 
 ## Measured, not promised
 
+Every headline number below has a ledger entry stating its exact rig,
+commands, definitions, disclosures, and a falsification line — the
+observation that would take the claim down: [docs/CLAIMS.md](docs/CLAIMS.md).
+
 **Wire path:** kvblockd served batched GETs at **12.67 GB/s (101.4 Gbit/s) — ~102% of the iperf3 ceiling on a 100 GbE pair, with end-to-end xxh3 verification ON**. On 50 GbE it saturates the NIC the same way. Methodology, raw logs, and the one-command repro scripts: [bench/BENCHMARKS.md](bench/BENCHMARKS.md) · [docs/BENCHMARKS.md](docs/BENCHMARKS.md) · [bench/METHODOLOGY.md](bench/METHODOLOGY.md). Every chart we publish draws the transport ceiling on the chart — a bar that can't be compared to the wire's physical limit isn't honest.
 
 **Durability:** the kill -9 torture harness SIGKILLs a live daemon mid-write-storm and holds recovery to the crash contract — every acknowledged commit either survives byte-identical or is honestly gone; never corrupt, never a phantom. **100 loops on Linux: 0 corrupt, 0 phantom over 18,160 journaled acks** ([docs/DESIGN.md](docs/DESIGN.md), `test/crash/`). Run it yourself: `go run -tags crashtest ./test/crash -loops 10`.

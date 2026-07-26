@@ -2,6 +2,8 @@
 
 > Prior raw transport/DRAM/NVMe gate numbers live in `bench/BENCHMARKS.md`
 > (the running scoreboard); this file is the methodology-first launch view.
+> Every headline claim's exact conditions and falsification line:
+> [docs/CLAIMS.md](CLAIMS.md).
 
 **Methodology first.** Read `bench/METHODOLOGY.md` (the 12 honesty rules)
 before any number below. Every figure is absolute GB/s *and* %-of-same-rig-
