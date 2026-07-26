@@ -10,7 +10,9 @@
 # MAX_MODEL_LEN, GPU_MEM_UTIL, KVBD_ARENA_BYTES, CONNECTOR_STAGING_GB,
 # KV_BYTES_PER_TOKEN, TIMEOUT, RESULTS_REPO, FLAVOR, HF_BIN, BASELINE_ONLY
 # (1 = pure-recompute control run: no connector, no daemon, cold-only — the
-# third chart series).
+# third chart series), JOB_NAME (job name shown by `hf jobs`, default
+# chart2-ttft), ASSUME_YES (1 = skip the billing confirmation — ONLY for
+# submit-n.sh, which confirms the whole batch once before setting it).
 #
 # The job container clones the PUBLIC repo tarball at GIT_REF — local
 # uncommitted changes are NOT visible to the job; push first.
@@ -67,7 +69,7 @@ mv KVStash-* kvstash
 bash /work/kvstash/bench/rigs/hf-gpu/job.sh'
 
 CMD=("$HF_BIN" jobs run
-  --name chart2-ttft
+  --name "${JOB_NAME:-chart2-ttft}"
   --flavor "$FLAVOR"
   --timeout "$TIMEOUT"
   --detach
@@ -94,8 +96,12 @@ fi
 
 echo "flavor $FLAVOR is billed per minute (a10g-small was \$1.00/hr; a10g-large costs more — check current HF Jobs pricing)."
 echo "expected run <1h (two vLLM boots: populate, then a fresh measure engine); timeout $TIMEOUT caps the spend."
-read -r -p "Submit and start billing? [y/N] " ans
-[[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "aborted."; exit 1; }
+if [[ "${ASSUME_YES:-0}" == "1" ]]; then
+  echo "ASSUME_YES=1 — confirmation was given upstream (submit-n.sh batch)."
+else
+  read -r -p "Submit and start billing? [y/N] " ans
+  [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "aborted."; exit 1; }
+fi
 
 JOB_OUT="$("${CMD[@]}")"
 echo "$JOB_OUT"

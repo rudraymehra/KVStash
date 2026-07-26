@@ -98,6 +98,17 @@ per point (per-rep values published in `ttft_all_ms`); an independent
 same-config re-run is queued with the next paid session, and until it lands
 the table is labeled single-run rather than silently treated as final.
 
+<!-- TODO(multi-run reruns): when the n>=3 independent submissions land
+     (bench/rigs/hf-gpu/submit-n.sh -> bench/results/rig-e/<tag>-run{1..N}.jsonl),
+     replace the single-run honesty note above with the n>=3 protocol:
+     median across runs charted with min/max whiskers (plot.py), per-cell
+     spread gated at <=10% by bench/report/aggregate.py — looser than the 2%
+     quiet-rig throughput gate because each run is a fresh engine boot on a
+     shared GPU host (boot-state + neighbor variance), not a 30s steady-state
+     mean; aggregate.py's docstring carries the full justification. Quote the
+     measured spread% here. The same marker covers the Qwen long-context
+     table below (its "single-run disclosures apply as above" line). -->
+
 | prefix | recompute (no connector) | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
 |---|---|---|---|---|---|
 | 1k  | 269 ms  | 506 ms  | **76 ms**  | **3.5×** | 6.6× |
