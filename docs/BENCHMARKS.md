@@ -88,8 +88,15 @@ disclosed on-chart**. Two-phase isolation: populate → **vLLM restart** →
 measure, `--no-enable-prefix-caching` in both phases, so a warm hit's KV has
 exactly one possible source: kvblockd over TCP into a fresh engine. TTFT =
 first SSE token; p50 of n=5 reps per point, warmup discarded. Raw JSONL:
-`bench/results/rig-e/chart2-ttft-{run4,baseline}.jsonl`; render:
-`python bench/report/plot.py chart2 --in bench/results/rig-e/chart2-ttft-*.jsonl`.
+`bench/results/rig-e/chart2-ttft-{run5,baseline}.jsonl`; render exactly:
+`python bench/report/plot.py chart2 --in bench/results/rig-e/chart2-ttft-run5.jsonl bench/results/rig-e/chart2-ttft-baseline.jsonl`
+— NOT a wildcard: `rig-e/` keeps the superseded run3/run4 files for history
+(run3's warm arm is flagged UNVERIFIED; run4 predates the load-path rework),
+and a wildcard render would median them into the current cells.
+Honesty note against methodology rule 7: this table is ONE run of n=5 reps
+per point (per-rep values published in `ttft_all_ms`); an independent
+same-config re-run is queued with the next paid session, and until it lands
+the table is labeled single-run rather than silently treated as final.
 
 | prefix | recompute (no connector) | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
 |---|---|---|---|---|---|
@@ -141,9 +148,17 @@ emulated link) stays OPEN until the AWS rig runs.
 
 ## When NOT to use kvblockd
 
-Below the crossover hit rate (drawn on Chart 2), recompute is cheaper than a
-remote fetch — don't deploy a remote KV cache for that workload. The
-`bench/e2e/economics.py` model dollarizes the crossover ($/GB moved vs
+Below the crossover hit rate, recompute is cheaper than a remote fetch —
+don't deploy a remote KV cache for that workload. From this table's own
+measured numbers, today's break-even is stark: with the current synchronous
+store-on-miss path, `h·warm + (1−h)·cold_with_connector = pure_recompute`
+solves to **h ≈ 46–55% at every length** — below roughly half your requests
+hitting, installing the connector makes mean TTFT *worse*. Write-behind
+stores (next connector release) collapse the miss overhead and move that
+break-even to a few percent. The hit-rate-swept chart with the crossover
+region drawn is pre-registered for the shaped-link rig; until it exists, no
+single-hit-rate number here should be read as a deployment recommendation.
+The `bench/e2e/economics.py` model dollarizes the crossover ($/GB moved vs
 $/GPU-sec saved per hit, same-AZ vs cross-AZ) at the measured hit rates.
 
 ---
@@ -159,8 +174,12 @@ bench/rigs/aws-transport/provision.sh && bench/rigs/aws-transport/run-chart1.sh 
   bench/rigs/aws-transport/teardown.sh
 python bench/report/plot.py chart1 --in bench/results/rig-t/*.jsonl --out chart1.png
 
-# Chart 2 (AWS g5.xlarge):
-# Rig E is a RUNBOOK (bench/rigs/aws-gpu/README.md); its provision/seed/sweep/teardown
-# scripts are finalized at session start on the g5 box, then committed with the results.
-python bench/report/plot.py chart2 --in bench/results/rig-e/*.jsonl --out chart2.png
+# Chart 2 (HF Jobs, a10g-large — the rig that produced the published table):
+DRY_RUN=1 bench/rigs/hf-gpu/submit.sh       # inspect the exact job first
+MODEL=meta-llama/Llama-3.1-8B-Instruct bench/rigs/hf-gpu/submit.sh   # two-phase run
+BASELINE_ONLY=1 MODEL=meta-llama/Llama-3.1-8B-Instruct bench/rigs/hf-gpu/submit.sh
+python bench/report/plot.py chart2 \
+  --in bench/results/rig-e/chart2-ttft-run5.jsonl bench/results/rig-e/chart2-ttft-baseline.jsonl \
+  --out chart2.png
+# (bench/rigs/aws-gpu/ is the future shaped-link runbook, not this chart's source.)
 ```

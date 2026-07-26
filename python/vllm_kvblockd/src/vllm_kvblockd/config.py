@@ -202,6 +202,26 @@ class AdapterConfig:
         c.dtype = str(getattr(model, "dtype", getattr(cache, "cache_dtype", "auto")))
         par = getattr(vllm_config, "parallel_config", None)
         c.world_size = int(getattr(par, "world_size", 1) or 1)
+        # Refuse multi-GPU outright: the key identity has no per-rank
+        # component, so at TP>1 every rank derives IDENTICAL keys for
+        # DIFFERENT KV shards. The blob-prefix drift armor is blind to it
+        # (shards are shape-symmetric), the first rank's put wins the
+        # write-once dedup, and every other rank then loads the winner's
+        # heads — silent garbage attention state with zero errors. Refusing
+        # to boot beats corrupting quietly (same posture as
+        # require_pinned_hashseed). Lifting this needs rank folded into the
+        # worker-side chain plus a scheduler-side lookup story — a design
+        # change, not a patch. Adversarially verified 2026-07-27: two
+        # world_size=2 configs differing only in rank fingerprint
+        # byte-identically.
+        if c.world_size > 1:
+            raise ValueError(
+                f"kvblockd connector: world_size={c.world_size} is unsupported — "
+                "block keys carry no rank identity, and tensor-parallel ranks "
+                "would silently cross-load each other's KV shards. Run TP=1, "
+                "or use the OffloadingConnector altitude (tier_manager) once "
+                "its GPU validation lands."
+            )
         c.fingerprint = fingerprint(
             {
                 "scheme": "vllm-native-connector",

@@ -44,7 +44,7 @@ way benchmarks lie.
 | 2, 12 | `ratio_vs_ceiling` in every JSONL line; `plot.py` renders from JSONL alone |
 | 3 | `redis-py` bar (`baselines/redis_py_driver`) + `go-redis` bar (`--target redis`) |
 | 5 | `loadgen` open-loop measures from **scheduled** send time (CO-safety unit test) |
-| 6 | Chart 2 shades the sub-crossover region; single-point TTFT has no code path |
+| 6 | PARTIAL, disclosed: the hit-rate branch of `plot.py chart2` shades the sub-crossover region, but the published prefix-length TTFT chart (`chart2_ttft`) is a 100%-hit sweep with NO shading — the crossover lives as break-even arithmetic in docs/BENCHMARKS.md ("When NOT to use") until the shaped-link hit-rate rig runs. This row previously claimed enforcement the code path did not have. |
 | 7 | `report --check-repeat --tolerance 0.02` — the executable 2% gate |
 | 8 | deterministic `kvbench-payload-v1` blobs; `verify` regenerates + byte-compares (length-checked). Note: `verify` corruption-checks the **kvblockd** path; baseline bars quote throughput, and every kvblockd GET is xxh3-verified in-line unless `--noverify` isolates that cost |
 | 9 | trace converters with `--expect-requests` count-exactness |

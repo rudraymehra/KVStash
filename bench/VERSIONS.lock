@@ -26,11 +26,17 @@ mooncake = kvcache-ai/mooncake:LATEST-TAG@sha256:PENDING  # protocol="tcp"; neve
 ## Baseline clients
 redis-py = 8.0.1     # the client LMCache actually ships (RESP3 default; we report RESP2 & RESP3 if they differ >5%). 8.0.1 requires Python >=3.10 — AL2023's default python3.9 pip does NOT see it (its `pip index` shows 7.0.1 max); the rig installs python3.11 and runs the driver with it. A mid-session note here briefly claimed 8.0.1 didn't exist on PyPI — that was the 3.9 filter, corrected 2026-07-19.
 
-## GPU stack (Rig E, AWS g5.xlarge — A10G)
+## GPU stack (Rig E — published runs: HF Jobs a10g-large, A10G, NATIVE connector)
+# The published Chart-2 table came from bench/rigs/hf-gpu/job.sh in the
+# vllm/vllm-openai:v0.25.1 image (amd64 digest recorded in submit.sh), with
+# vllm_kvblockd (native connector) — NOT the LMCache stack originally planned
+# here. lmcache stays pinned below for the CPU CI legs and the future
+# shaped-link plan (bench/rigs/aws-gpu/), whose GPU leg is unvalidated.
 vllm    = 0.25.1     # matches the CPU e2e recipe pin (bench/e2e/cpu)
-lmcache = 0.5.1      # + lmcache_kvblockd (python/lmcache_kvblockd)
+vllm_kvblockd = 0.1.0  # the native connector that produced runs 4-5 (stamped in every JSONL record)
+lmcache = 0.5.1      # CPU CI legs + lmcache_kvblockd (python/lmcache_kvblockd); GPU leg unvalidated
 model   = meta-llama/Llama-3.1-8B-Instruct
-torch   = cu124      # CUDA 12.4 wheels (A10G, sm_86)
+torch   = cu124      # CUDA 12.4 wheels (A10G, sm_86; the HF image ships its own build)
 
 ## Measurement tools
 iperf3 = 3.16        # multithreaded -P; the transport ceiling

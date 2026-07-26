@@ -1,8 +1,14 @@
-# Rig E — GPU TTFT rig (g5.xlarge, A10G)
+# Rig E (AWS leg) — shaped-link TTFT rig (future)
 
-**Status: NOT YET RUN — requires GPU access.** Nothing in this directory has
-produced numbers; `bench/results/rig-e/` does not exist yet. Everything below
-is the written plan for the first session.
+**Status: SUPERSEDED for the loopback chart; PLANNED for the shaped-link
+matrix.** The published Chart-2 TTFT numbers were produced by
+`bench/rigs/hf-gpu/` (HF Jobs a10g-large, the NATIVE vLLM connector — not
+the LMCache stack this plan describes) and live in `bench/results/rig-e/`.
+This directory remains the plan for what only AWS root access can add:
+tc-shaped 25/10/5 Gbit links, the hit-rate sweep, and the Bailian-trace A4
+datapoint, on a two-node rig (GPU node + store node). Rewrite this plan
+against the native connector before the first session — the LMCache stack
+below predates the connector switch and its GPU leg is unvalidated.
 
 ## What it measures
 

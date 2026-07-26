@@ -1,8 +1,8 @@
 # kvblockd
 
-**A single static Go binary that serves LLM KV-cache blocks at 10+ GB/s over the plain TCP you already have.** Engines (vLLM via LMCache today; native vLLM, SGLang, and NIXL adapters on `main`, validation-gated) store prefix-keyed, write-once cache blocks here and load them back faster than the GPU can recompute them — tiered DRAM → NVMe → S3, multi-tenant, and honest about every number it publishes.
+**A single static Go binary that serves LLM KV-cache blocks at 10+ GB/s over the plain TCP you already have.** Engines store prefix-keyed, write-once cache blocks here and load them back faster than the GPU can recompute them — via the **native vLLM connector (GPU-validated: it produced the published TTFT chart)**, the LMCache remote-backend plugin, an SGLang HiCache backend, and NIXL paths, all on `main` — tiered DRAM → NVMe → S3, multi-tenant, and honest about every number it publishes.
 
-> **Status: all three tiers — DRAM, NVMe, S3 — ship on `main`. Latest published release: v0.2.0** (the S3 tier landed there; lazy cold-segment restore + cold-object GC completed on `main` since). The wire protocol is frozen at v1 and the transport numbers below are measured. The two headline charts (throughput matrix vs baselines; TTFT vs hit rate on a real vLLM stack) land here from the committed benchmark harness — raw JSONL first, pictures second.
+> **Status: all three tiers — DRAM, NVMe, S3 — ship on `main`. Latest published release: v0.2.0** (the S3 tier landed there; lazy cold-segment restore + cold-object GC completed on `main` since). The wire protocol is frozen at v1 and the transport numbers below are measured. Both headline charts are published from committed JSONL: the throughput matrix vs baselines, and TTFT reload-vs-recompute measured through the native vLLM connector on a real GPU — raw JSONL first, pictures second.
 
 ## Why
 
@@ -29,7 +29,7 @@ That's a DRAM-only daemon — the recommended first run. NVMe tiering, hugepages
 
 **Durability:** the kill -9 torture harness SIGKILLs a live daemon mid-write-storm and holds recovery to the crash contract — every acknowledged commit either survives byte-identical or is honestly gone; never corrupt, never a phantom. **100 loops on Linux: 0 corrupt, 0 phantom over 18,160 journaled acks** ([docs/DESIGN.md](docs/DESIGN.md), `test/crash/`). Run it yourself: `go run -tags crashtest ./test/crash -loops 10`.
 
-Chart 1 (GB/s vs Redis 7 / Valkey 8 / Mooncake-TCP / NVMe-fs floor, two client classes) and Chart 2 (TTFT vs hit rate through vLLM + LMCache + kvblockd, honest Bailian-trace hit-rate band) render from committed JSONL via `bench/report/plot.py` and are published with the rig sessions.
+Chart 1 (GB/s vs Redis 7 / Valkey 8, two client classes, %-of-wire) and Chart 2 (TTFT vs prefix length: reload from kvblockd vs recompute, three series, measured through the **native vLLM connector** on an A10G with per-rep block-exact hit verification) render from committed JSONL via `bench/report/plot.py` — `bench/results/rig-t/` and `bench/results/rig-e/`. The TTFT-vs-hit-rate sweep on a shaped link is the next pre-registered rig.
 
 ## How it compares
 
@@ -56,7 +56,7 @@ Chart 1 (GB/s vs Redis 7 / Valkey 8 / Mooncake-TCP / NVMe-fs floor, two client c
 
 ## v1 cut-line
 
-TCP only (MSG_ZEROCOPY/sendfile-class optimizations in scope; RDMA/AF_XDP/DPDK out). Reached through the connectors people already run — LMCache → vLLM today; on `main`: a native vLLM connector (code-complete, GPU e2e deferred), an SGLang HiCache backend (CPU-validated, verdict DEFER until a GPU run), a native NIXL C++ plugin (beta), and the S3-compat endpoint as the zero-code NIXL/`obj` path ([docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)). Blocks are opaque sealed bytes — the server never parses tensors. No HA/replication in v1. Tenancy quotas and the S3 tier both shipped in v0.2.0; the cold tier is completed on `main`.
+TCP only (MSG_ZEROCOPY/sendfile-class optimizations in scope; RDMA/AF_XDP/DPDK out). Reached through the connectors people already run — on `main`: the **native vLLM connector (GPU-validated on the TTFT rig; TP=1 only — it refuses multi-GPU at boot until keys carry rank identity)**, the LMCache remote-backend plugin (CPU-validated in CI; its GPU leg is unvalidated), an SGLang HiCache backend (CPU-validated, verdict DEFER until a GPU run), a native NIXL C++ plugin (beta), and the S3-compat endpoint as the zero-code NIXL/`obj` path ([docs/INTEGRATIONS.md](docs/INTEGRATIONS.md)). Blocks are opaque sealed bytes — the server never parses tensors. No HA/replication in v1. Tenancy quotas and the S3 tier both shipped in v0.2.0; the cold tier is completed on `main`.
 
 ## Security model
 

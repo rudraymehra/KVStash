@@ -246,3 +246,28 @@ def test_hashseed_check_rejects_unpinned(monkeypatch):
     # the escape hatch works (single-process experiments)
     monkeypatch.setenv("KVBLOCKD_SKIP_HASHSEED_CHECK", "1")
     require_pinned_hashseed()  # must not raise
+
+
+def test_multi_gpu_refused_at_boot():
+    """world_size>1 must refuse to construct: block keys carry no rank
+    identity, so TP ranks would silently cross-load each other's KV shards
+    (adversarially verified: rank is not in the fingerprint). Refusing beats
+    corrupting — same posture as the hashseed determinism check."""
+    import pytest
+
+    from vllm_kvblockd.config import AdapterConfig
+
+    class KTC:
+        kv_connector_extra_config: ClassVar[dict] = {"kvblockd_token": "t"}
+
+        def get_from_extra_config(self, key, default):
+            return self.kv_connector_extra_config.get(key, default)
+
+    class VC:
+        kv_transfer_config = KTC()
+        cache_config = type("C", (), {"block_size": 16, "cache_dtype": "auto"})()
+        model_config = type("M", (), {"model": "m", "dtype": "torch.bfloat16"})()
+        parallel_config = type("P", (), {"world_size": 2})()
+
+    with pytest.raises(ValueError, match="world_size=2.*rank"):
+        AdapterConfig.from_vllm_config(VC())
