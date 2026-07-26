@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """Chart-2 TTFT driver: cold (recompute) vs warm (kvblockd reload) per prefix length.
 
+Connector-agnostic by construction: every honesty gate reads kvblockd's OWN
+metrics (put receipt per prompt, hit growth per warm rep), so the driver works
+identically whether the engine reaches kvblockd through the native
+vllm_kvblockd connector (the GPU rig's path, proven to move bytes by
+bench/e2e/cpu/local-docker.sh) or through LMCache's plugin framework.
+
 Two-phase design (run-3 post-mortem). A warm hit is only believable if the
 engine serving it CANNOT have the KV anywhere local. Run 3 tried to force that
-with `local_cpu: false`; LMCache stages remote writes THROUGH the local CPU
-buffer, so that silently severed the store path — kvblockd received nothing,
-and the "warm" arm measured LMCache's own cache. The fix mirrors the CI-proven
-approach (bench/e2e/cpu/verify.py property (d): hits persist across a vLLM
-restart): keep `local_cpu: true` (the exact config CI proves works) and get
-isolation from a vLLM RESTART between storing and measuring.
+by disabling the connector's local tier (`local_cpu: false`); LMCache stages
+remote writes THROUGH that buffer, so it silently severed the store path —
+kvblockd received nothing, and the "warm" arm measured LMCache's own cache.
+The fix mirrors the CI-proven approach (bench/e2e/cpu/verify.py property (d):
+hits persist across a vLLM restart): never fight the connector's internals —
+get isolation from a vLLM RESTART between storing and measuring.
 
   --phase populate   vLLM #1: send every sweep prompt once — one prompt per
-                     (length, rep), unique nonce at token 0 — so LMCache saves
-                     the KV locally AND to kvblockd. After each prompt the
+                     (length, rep), unique nonce at token 0 — so the engine's
+                     connector saves the KV to kvblockd. After each prompt the
                      driver polls kvblockd's metrics until
                      kvb_bytes_total{dir="in"} / kvb_blocks GREW; if kvblockd
                      received nothing the whole premise is dead and we FAIL
-                     LOUDLY before any measurement. Ends by waiting for the
+                     LOUDLY before any measurement. Ends by waiting for any
                      async put queue to drain (put bytes stable for --drain-s),
                      then writes the exact prompts to --state.
 
-  (job.sh restarts vLLM here: LMCache's in-process/local tier dies with the
-   process; kvblockd keeps the blocks.)
+  (job.sh restarts vLLM here: any engine-local KV — vLLM's own or a
+   connector tier's — dies with the process; kvblockd keeps the blocks.)
 
   --phase measure    vLLM #2 (fresh engine): first ALL warm requests — the
                      exact prompts from --state; each rep's kvb_hits_total
@@ -38,8 +44,8 @@ isolation from a vLLM RESTART between storing and measuring.
 
 vLLM runs with --no-enable-prefix-caching in BOTH phases, so a warm hit can
 never come from vLLM's own prefix cache; after the restart it cannot come from
-LMCache's local tier either — kvblockd over TCP is the only source left, and
-the per-rep kvb_hits_total growth is the proof.
+any engine-side connector tier either — kvblockd over TCP is the only source
+left, and the per-rep kvb_hits_total growth is the proof.
 
 TTFT is measured on the OpenAI-compatible STREAMING endpoint: the clock starts
 immediately before the request is sent and stops on the first SSE event
@@ -71,7 +77,7 @@ PRINT_PREFIX = "CHART2JSONL"
 
 
 class PopulateError(RuntimeError):
-    """The store path vLLM -> LMCache -> kvblockd is severed; measuring would be theater."""
+    """The store path vLLM -> connector -> kvblockd is severed; measuring would be theater."""
 
 
 # ---------------------------------------------------------------- HTTP bits
@@ -135,10 +141,10 @@ def wait_counter_growth(metrics_url: str, before: dict, keys: tuple,
 def wait_put_quiesce(metrics_url: str, stable_s: float, timeout_s: float,
                      poll_s: float = 0.5):
     """Wait until kvb_bytes_total{dir="in"} / kvb_blocks stop growing for
-    stable_s. LMCache's remote put path is asynchronous and job.sh kills vLLM
-    right after populate — anything still queued would be dropped with the
-    process. Returns the final counters, or None if puts were still trickling
-    in at timeout_s."""
+    stable_s. A connector's remote put path may be asynchronous (LMCache's is;
+    the native connector's is sync) and job.sh kills vLLM right after populate
+    — anything still queued would be dropped with the process. Returns the
+    final counters, or None if puts were still trickling in at timeout_s."""
     deadline = time.monotonic() + timeout_s
     last = read_counters(metrics_url)
     stable_since = time.monotonic()
@@ -208,10 +214,11 @@ def measure_stream(vllm: str, model: str, prompt: str, gen_tokens: int,
 # ------------------------------------------------------------ prompt build
 
 def build_prompt(vllm: str, model: str, target_tokens: int, nonce: str) -> tuple[str, int]:
-    """Filler prompt of ~target_tokens, nonce FIRST so every LMCache chunk
-    hash (a prefix chain from token 0) differs between reps → cold is a
-    guaranteed miss. Calibrated against the server's own /tokenize; the
-    ACTUAL count is returned and stamped, never assumed."""
+    """Filler prompt of ~target_tokens, nonce FIRST so every connector block
+    key (a prefix chain from token 0 — both the native connector's BLAKE3
+    chain and LMCache's chunk hashes work this way) differs between reps →
+    cold is a guaranteed miss. Calibrated against the server's own /tokenize;
+    the ACTUAL count is returned and stamped, never assumed."""
     head = f"kvstash-ttft {nonce} :: "
     base = tokenize_count(vllm, model, head)
     probe = tokenize_count(vllm, model, head + UNIT * 128)
@@ -250,11 +257,11 @@ def _p95(xs):
 # ---------------------------------------------------------- phase: populate
 
 def run_populate(args) -> int:
-    """Phase 1 (vLLM #1): prefill every sweep prompt once so LMCache stores
-    the KV into kvblockd; assert per-prompt that kvblockd RECEIVED data, then
-    drain the async put queue and persist the prompts to --state. Raises
-    PopulateError (fail loudly, nothing measured yet) on a severed store path.
-    """
+    """Phase 1 (vLLM #1): prefill every sweep prompt once so the engine's
+    connector stores the KV into kvblockd; assert per-prompt that kvblockd
+    RECEIVED data, then drain any async put queue and persist the prompts to
+    --state. Raises PopulateError (fail loudly, nothing measured yet) on a
+    severed store path."""
     lengths = parse_lengths(args.lengths)
     n_pairs = args.warmup + args.reps
     state = {
@@ -283,7 +290,7 @@ def run_populate(args) -> int:
                     f"kvblockd received NOTHING for L={L} rep={rep}: "
                     f'kvb_bytes_total{{dir="in"}} and kvb_blocks stayed flat for '
                     f"{args.put_wait_s:.0f}s after the prefill. The store path "
-                    "vLLM->LMCache->kvblockd is severed (the run-3 failure mode); "
+                    "vLLM->connector->kvblockd is severed (the run-3 failure mode); "
                     "a warm arm measured now would be meaningless. Aborting "
                     "before any measurement.")
             put_mb = (after["put_bytes"] - c0["put_bytes"]) / 1e6
@@ -298,8 +305,8 @@ def run_populate(args) -> int:
     if final is None:
         raise PopulateError(
             f"kvblockd's put counters were still moving after {args.drain_timeout_s:.0f}s "
-            "— LMCache's async put queue never drained; restarting vLLM now "
-            "would drop queued blocks.")
+            "— the connector's async put queue never drained; restarting vLLM "
+            "now would drop queued blocks.")
     put_total = final["put_bytes"] - t_start["put_bytes"]
     blocks_total = final["blocks"] - t_start["blocks"]
     if put_total <= 0 or blocks_total <= 0:
@@ -711,14 +718,14 @@ def main() -> int:
                     help="populate: max wait for kvblockd's put counters to grow per prompt")
     ap.add_argument("--drain-s", type=float, default=5.0,
                     help="populate: put counters must be stable this long before exit "
-                         "(LMCache's remote puts are async; vLLM is killed next)")
+                         "(a connector's remote puts may be async; vLLM is killed next)")
     ap.add_argument("--drain-timeout-s", type=float, default=300.0)
     ap.add_argument("--poll-s", type=float, default=0.25, help="metrics poll interval")
     ap.add_argument("--request-timeout", type=float, default=600.0)
     ap.add_argument("--out", default="chart2-ttft.jsonl")
     ap.add_argument("--print-prefix", default=PRINT_PREFIX)
     ap.add_argument("--stamp", action="append", default=[], metavar="K=V",
-                    help="stamped into every record (gpu=, model=, vllm=, lmcache=, "
+                    help="stamped into every record (gpu=, model=, vllm=, connector=, "
                          "tc_link=, rig=, git_sha=) — plot.py reads conditions from these")
     ap.add_argument("--selftest", action="store_true",
                     help="verify the timing logic and the two-phase honesty gates "
@@ -731,7 +738,7 @@ def main() -> int:
         ap.error("--phase populate|measure is required (or --selftest). The old "
                  "single-process cold/warm flow was removed after run 3: without a "
                  "vLLM restart between store and read, a 'warm' hit can come from "
-                 "LMCache's local tier and never touch kvblockd.")
+                 "an engine-side cache tier and never touch kvblockd.")
 
     if args.phase == "populate":
         try:

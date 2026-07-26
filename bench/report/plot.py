@@ -157,13 +157,14 @@ def chart1(recs, out):
 
 def _conditions(recs):
     """Conditions box read FROM the JSONL (never hardcoded — review rule).
-    Rigs stamp gpu/model/vllm/lmcache/tc_link into each record."""
+    Rigs stamp gpu/model/vllm/connector (or lmcache)/tc_link into each record."""
     cond = {}
     for r in recs:
-        for k in ("gpu", "model", "vllm", "lmcache", "tc_link"):
+        for k in ("gpu", "model", "vllm", "connector", "lmcache", "tc_link"):
             if r.get(k):
                 cond.setdefault(k, r[k])
-    box = ", ".join(f"{cond[k]}" for k in ("gpu", "model", "vllm", "lmcache") if k in cond)
+    box = ", ".join(f"{cond[k]}" for k in ("gpu", "model", "vllm", "connector", "lmcache")
+                    if k in cond)
     return box, cond.get("tc_link", "link undisclosed")
 
 
@@ -293,14 +294,15 @@ def chart2(recs, out):
                     ha="center", va="top", fontsize=9, color="crimson")
 
     # Conditions box read FROM the JSONL (was once hardcoded — a review
-    # caught it; never hardcode conditions):
-    # the GPU harness stamps gpu/model/vllm/lmcache/tc_link into each record.
+    # caught it; never hardcode conditions): the GPU harness stamps
+    # gpu/model/vllm/connector (or lmcache)/tc_link into each record.
     cond = {}
     for r in recs:
-        for k in ("gpu", "model", "vllm", "lmcache", "tc_link"):
+        for k in ("gpu", "model", "vllm", "connector", "lmcache", "tc_link"):
             if r.get(k):
                 cond.setdefault(k, r[k])
-    box = ", ".join(f"{cond[k]}" for k in ("gpu", "model", "vllm", "lmcache") if k in cond)
+    box = ", ".join(f"{cond[k]}" for k in ("gpu", "model", "vllm", "connector", "lmcache")
+                    if k in cond)
     link = cond.get("tc_link", "tc-emulated link")
     ax.set_xlabel("KV-cache hit rate (%)")
     ax.set_ylabel("TTFT (ms)")

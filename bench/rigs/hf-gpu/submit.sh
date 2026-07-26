@@ -7,7 +7,7 @@
 #   bench/rigs/hf-gpu/submit.sh               # submit (asks for confirmation)
 #
 # Knobs (env): MODEL, GIT_REF, LENGTHS, REPS, WARMUP, GEN_TOKENS,
-# MAX_MODEL_LEN, KVBD_ARENA_BYTES, LMC_MAX_LOCAL_CPU_GB, KV_BYTES_PER_TOKEN,
+# MAX_MODEL_LEN, KVBD_ARENA_BYTES, CONNECTOR_STAGING_GB, KV_BYTES_PER_TOKEN,
 # TIMEOUT, RESULTS_REPO, FLAVOR, HF_BIN.
 #
 # The job container clones the PUBLIC repo tarball at GIT_REF — local
@@ -77,7 +77,7 @@ CMD=("$HF_BIN" jobs run
   -e GEN_TOKENS="$GEN_TOKENS"
   -e FLAVOR="$FLAVOR")
 # optional knobs: forward only when the caller set them (job.sh has the defaults/derivations)
-for v in MAX_MODEL_LEN WARMUP KVBD_ARENA_BYTES LMC_MAX_LOCAL_CPU_GB KV_BYTES_PER_TOKEN RESULTS_REPO; do
+for v in MAX_MODEL_LEN WARMUP KVBD_ARENA_BYTES CONNECTOR_STAGING_GB KV_BYTES_PER_TOKEN RESULTS_REPO; do
   if [[ -n "${!v:-}" ]]; then CMD+=(-e "$v=${!v}"); fi
 done
 CMD+=("$IMAGE" /bin/bash -c "$BOOTSTRAP")

@@ -3,24 +3,32 @@
 # flavor a10g-large: 46 GB RAM, 1x A10G 24 GB; a10g-small's 15 GB got the run
 # OOM-killed). Runs unattended:
 #
-#   install Go + build kvblockd from THIS checkout  ->  pip lmcache + our two
-#   adapter packages  ->  write daemon + LMCache configs  ->  start kvblockd
-#   ->  driver selftest  ->  PHASE 1 (populate): vLLM #1 prefills every sweep
-#   prompt once; the driver asserts per prompt that kvblockd's put counters
-#   grew  ->  RESTART: kill vLLM, start a fresh one (LMCache's in-process
-#   local tier dies with the process; kvblockd keeps the blocks)  ->  PHASE 2
-#   (measure): all warm reps (exact populated prompts; per-rep kvb_hits_total
-#   growth proves the KV came from kvblockd over TCP), then all cold reps
-#   (fresh-nonce prompts, full prefill)  ->  JSONL to stdout (CHART2JSONL
-#   lines) + optional HF dataset upload  ->  exit nonzero on any failure.
+#   install Go + build kvblockd from THIS checkout  ->  pip our client + the
+#   NATIVE vLLM connector (vllm_kvblockd)  ->  write daemon + transfer configs
+#   ->  start kvblockd  ->  driver selftest  ->  PHASE 1 (populate): vLLM #1
+#   prefills every sweep prompt once; the driver asserts per prompt that
+#   kvblockd's put counters grew  ->  RESTART: kill vLLM, start a fresh one
+#   (any engine-local KV dies with the process; kvblockd keeps the blocks)
+#   ->  PHASE 2 (measure): all warm reps (exact populated prompts; per-rep
+#   kvb_hits_total growth proves the KV came from kvblockd over TCP), then
+#   all cold reps (fresh-nonce prompts, full prefill)  ->  JSONL to stdout
+#   (CHART2JSONL lines) + optional HF dataset upload  ->  exit nonzero on any
+#   failure.
+#
+# WHY THE NATIVE CONNECTOR (vllm_kvblockd.KvblockdConnector), NOT LMCache:
+#   the LMCache route ate seven GPU runs without moving one byte; the free CPU
+#   Docker rig (bench/e2e/cpu/local-docker.sh) then proved the native
+#   connector end-to-end — real prefill bytes into kvblockd, hits surviving an
+#   engine restart, mixed local+remote — while `lmcache-probe` pinned that
+#   LMCache cannot even construct its engine off-CUDA at the current releases.
+#   This rig runs the one path with demonstrated bytes. The LMCache GPU leg
+#   remains UNVALIDATED, not disproven — its configs live in git history and
+#   docs/INTEGRATIONS.md.
 #
 # Honesty properties (run-3 post-mortem; details in run_ttft.py's docstring):
-#   - lmcache local_cpu: true — the EXACT shape bench/e2e/cpu CI proves works.
-#     Run 3 set local_cpu: false to "force" remote reads, but LMCache stages
-#     remote writes THROUGH the local buffer, so that silently severed the
-#     store path and the warm arm measured LMCache's own cache. Isolation now
-#     comes from the vLLM restart (CI property (d): hits persist across a
-#     restart), never from disabling tiers.
+#   - isolation comes from the vLLM restart between populate and measure
+#     (CI property (d): hits persist across a restart), never from disabling
+#     tiers or trusting connector internals.
 #   - vLLM --no-enable-prefix-caching in BOTH phases: a warm hit can never
 #     come from vLLM's own prefix cache.
 #   - populate FAILS LOUDLY if kvblockd received nothing; every measured warm
@@ -50,18 +58,20 @@ GEN_TOKENS="${GEN_TOKENS:-16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"            # empty -> derived: max(LENGTHS) + GEN_TOKENS + 384
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 GO_VERSION="${GO_VERSION:-1.26.5}"
-LMCACHE_VERSION="${LMCACHE_VERSION:-0.5.1}"
 KV_BYTES_PER_TOKEN="${KV_BYTES_PER_TOKEN:-131072}"  # bf16 KV/token upper bound for the 7-8B class.
-                                              # Llama-3.1-8B measured 128KiB/token (run 3: LMCache
-                                              # allocated 32MiB per 256-token chunk); Qwen2.5-7B is 56KiB.
+                                              # Llama-3.1-8B measured 128KiB/token; Qwen2.5-7B is 56KiB.
+                                              # The native connector's blob = the raw paged block + 32B
+                                              # prefix, so the same per-token bound holds.
 KVBD_ARENA_BYTES="${KVBD_ARENA_BYTES:-}"      # empty -> derived from LENGTHS x pairs x KV_BYTES_PER_TOKEN
 KVBD_STREAMS="${KVBD_STREAMS:-4}"
-LMC_MAX_LOCAL_CPU_GB="${LMC_MAX_LOCAL_CPU_GB:-8.0}" # LMCache local tier + pinned staging. One 16k-token
-                                              # context at 128KiB/token = 2GiB, so 8GiB ≈ 4 contexts in
-                                              # flight; run 3's 3.0 threw 32MiB allocation failures.
+CONNECTOR_STAGING_GB="${CONNECTOR_STAGING_GB:-2}"   # native-connector host staging: it moves ONE paged
+                                              # block at a time through a transient CPU tensor (~MB
+                                              # scale), so this is headroom, not a tier.
 VLLM_HOST_RESERVE_GB="${VLLM_HOST_RESERVE_GB:-6}"   # RAM budgeted for the vLLM process in the fit check
 PUT_WAIT_S="${PUT_WAIT_S:-120}"               # populate: max wait for kvblockd put counters per prompt
-DRAIN_S="${DRAIN_S:-5}"                       # populate: async put queue must be quiet this long
+DRAIN_S="${DRAIN_S:-5}"                       # populate: put counters must be quiet this long (the
+                                              # native store path is synchronous, so this passes
+                                              # immediately; kept as armor if a connector goes async)
 TC_RATE_GBIT="${TC_RATE_GBIT:-}"              # optional loopback shaping; HF Jobs likely lack NET_ADMIN — detected, not assumed
 RESULTS_REPO="${RESULTS_REPO:-}"              # optional HF DATASET repo for the JSONL (e.g. binarybhakt/kvstash-bench)
 VLLM_PORT="${VLLM_PORT:-8000}"
@@ -136,15 +146,15 @@ fi
 
 # Fit check: the arena is PREFAULTED, so an oversubscribed box OOMs mid-run.
 if [[ -r /proc/meminfo ]]; then
-  awk -v arena="$KVBD_ARENA_BYTES" -v lmc="$LMC_MAX_LOCAL_CPU_GB" -v resv="$VLLM_HOST_RESERVE_GB" '
+  awk -v arena="$KVBD_ARENA_BYTES" -v stage="$CONNECTOR_STAGING_GB" -v resv="$VLLM_HOST_RESERVE_GB" '
     /^MemTotal:/ {
       total = $2 * 1024
-      need = arena + (lmc + resv) * 1073741824
-      printf "[job] RAM fit: arena %.1fGiB + lmcache %.1fGiB + vllm-reserve %.1fGiB = %.1fGiB of %.1fGiB total\n",
-             arena / 1073741824, lmc, resv, need / 1073741824, total / 1073741824
+      need = arena + (stage + resv) * 1073741824
+      printf "[job] RAM fit: arena %.1fGiB + connector-staging %.1fGiB + vllm-reserve %.1fGiB = %.1fGiB of %.1fGiB total\n",
+             arena / 1073741824, stage, resv, need / 1073741824, total / 1073741824
       exit (need > total * 0.92) ? 1 : 0
     }' /proc/meminfo \
-    || die "RAM budget exceeded (the kvblockd arena is prefaulted; the box would OOM mid-run). Cut REPS/LENGTHS, lower LMC_MAX_LOCAL_CPU_GB, or set KVBD_ARENA_BYTES explicitly."
+    || die "RAM budget exceeded (the kvblockd arena is prefaulted; the box would OOM mid-run). Cut REPS/LENGTHS or set KVBD_ARENA_BYTES explicitly."
 fi
 
 # ---- 2. Go toolchain + kvblockd from THIS checkout -------------------------
@@ -160,26 +170,23 @@ log "building kvblockd from source (latest release lags the current code)"
 
 # ---- 3. python stack (image already has CUDA torch + vLLM) ------------------
 pipi() { pip install "$@" || pip install --break-system-packages "$@"; }  # PEP-668 images
-log "pip: lmcache==$LMCACHE_VERSION + kvblockd + lmcache_kvblockd (editable)"
-pipi "lmcache==$LMCACHE_VERSION" || {
-  log "lmcache install failed (source build without nvcc?) — retrying with NO_GPU_EXT=1"
-  NO_GPU_EXT=1 pipi "lmcache==$LMCACHE_VERSION"
-}
-pipi -e "$ROOT/python/kvblockd" -e "$ROOT/python/lmcache_kvblockd"
-# lmcache's dependency tree must NOT have replaced the image's CUDA torch or vLLM:
+log "pip: kvblockd client + vllm_kvblockd native connector (editable, from THIS checkout)"
+pipi -e "$ROOT/python/kvblockd" -e "$ROOT/python/vllm_kvblockd"
+# The installs must NOT have replaced the image's CUDA torch or vLLM:
 python3 - <<PY
-import torch, vllm, lmcache, kvblockd, lmcache_kvblockd
-assert torch.version.cuda, "torch lost CUDA — lmcache install replaced it"
+import torch, vllm, kvblockd, vllm_kvblockd
+from vllm_kvblockd.connector import KvblockdConnector  # the class vLLM will load
+assert torch.version.cuda, "torch lost CUDA — a dependency replaced it"
 assert torch.cuda.is_available(), "CUDA not available to torch"
 assert vllm.__version__ == "$VLLM_VER", f"vllm changed: {vllm.__version__} != $VLLM_VER"
-print("imports OK: vllm", vllm.__version__, "lmcache", lmcache.__version__,
+print("imports OK: vllm", vllm.__version__, "vllm_kvblockd", vllm_kvblockd.__version__,
       "torch", torch.__version__, "cuda", torch.version.cuda)
 PY
 
-# ---- 4. configs (shape: bench/e2e/cpu/*, deltas documented in the header) ---
+# ---- 4. configs (shape: bench/e2e/cpu/local-docker.sh, the proven rig) ------
 cat > "$WORK/namespaces.yaml" <<EOF
 namespaces:
-  - { name: lmcache, id: 1, token: $KVBD_TOKEN }
+  - { name: vllm, id: 1, token: $KVBD_TOKEN }
 EOF
 cat > "$WORK/kvblockd.yaml" <<EOF
 # DRAM-only daemon for the TTFT rig (single box; NVMe/S3 tiers not exercised
@@ -192,51 +199,19 @@ pinned_bytes_cap: 268435456
 eviction_policy: "s3fifo"
 namespaces_path: "$WORK/namespaces.yaml"
 EOF
-cat > "$WORK/lmcache_kvblockd.yaml" <<EOF
-# LMCache -> kvblockd (plugin path) — the EXACT shape bench/e2e/cpu proves in
-# CI. local_cpu stays ON: LMCache stages remote writes through the local
-# buffer, so turning it off severs the store path (run-3 failure). Warm-arm
-# isolation comes from the vLLM restart between populate and measure, not
-# from this file.
-chunk_size: 256
-local_cpu: true
-max_local_cpu_size: $LMC_MAX_LOCAL_CPU_GB
-remote_storage_plugins: ["kvblockd"]
-extra_config:
-  kvblockd_token: "$KVBD_TOKEN"
-  remote_storage_plugin.kvblockd.module_path: "lmcache_kvblockd.adapter"
-  remote_storage_plugin.kvblockd.class_name: "KvblockdConnectorAdapter"
-  # The plugin backend dials the virtual url "plugin://kvblockd"; the REAL
-  # endpoint must be THIS extra_config key (remote_url would create a second,
-  # deprecated backend and double every put — and was the silent zero-bytes
-  # failure when it was the only endpoint the adapter understood).
-  remote_storage_plugin.kvblockd.url: "kvblockd://$KVBD_ADDR?namespace=lmcache&streams=$KVBD_STREAMS"
-EOF
-# The cache library is configured through this transfer config, using its own
-# "lmcache."-prefixed keys. That prefix is the only extra-config channel the
-# integration reads (everything else is silently discarded), and this argument
-# is proven to reach the engine's separate process because the connector
-# itself is constructed from it.
-#
-# An earlier form pointed at the YAML above via an "lmcache_config_file" key.
-# That key exists in neither the engine nor the cache library at these pinned
-# versions — searching both trees finds nothing — so the file was never read
-# and the library ran on defaults: a local tier only, no remote backend, and
-# therefore not one log line about a plugin. The YAML remains as the reference
-# for operators who prefer the environment-variable route.
+# The EXACT transfer-config shape the free Docker rig proved moves bytes
+# (bench/e2e/cpu/local-docker.sh): vLLM loads KvblockdConnector out-of-tree
+# via kv_connector_module_path and hands it the kvblockd_* extra-config keys.
+# There is no library between the engine and the daemon — no second config
+# channel to silently miss.
 cat > "$WORK/kv_transfer.json" <<EOF
-{"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both",
+{"kv_connector": "KvblockdConnector", "kv_role": "kv_both",
+ "kv_connector_module_path": "vllm_kvblockd.connector",
  "kv_connector_extra_config": {
-   "lmcache.remote_storage_plugins": "kvblockd",
-   "lmcache.local_cpu": true,
-   "lmcache.max_local_cpu_size": $LMC_MAX_LOCAL_CPU_GB,
-   "lmcache.chunk_size": 256,
-   "lmcache.extra_config": {
-     "kvblockd_token": "$KVBD_TOKEN",
-     "remote_storage_plugin.kvblockd.module_path": "lmcache_kvblockd.adapter",
-     "remote_storage_plugin.kvblockd.class_name": "KvblockdConnectorAdapter",
-     "remote_storage_plugin.kvblockd.url": "kvblockd://$KVBD_ADDR?namespace=lmcache&streams=$KVBD_STREAMS"
-   }}}
+   "kvblockd_endpoint": "kvblockd://$KVBD_ADDR",
+   "kvblockd_namespace": "vllm",
+   "kvblockd_token": "$KVBD_TOKEN",
+   "kvblockd_streams": $KVBD_STREAMS}}
 EOF
 python3 -c "import json,sys; json.load(open('$WORK/kv_transfer.json'))" \
   || die "generated kv_transfer.json is not valid JSON"
@@ -270,29 +245,24 @@ VLLM_LOG=""
 start_vllm() {  # $1 = log file, $2 = health timeout seconds
   VLLM_LOG="$1"
   log "starting vLLM: $MODEL (max_len=$MAX_MODEL_LEN, gpu_util=$GPU_MEM_UTIL) -> $VLLM_LOG"
-  # LMCACHE_CONFIG_FILE is load-bearing: vLLM spawns the engine core in a
-  # separate process, and passing the path only through --kv-transfer-config
-  # left that process reading LMCache's defaults — it initialised, logged its
-  # CUDA backends, and never mentioned a plugin, so nothing was ever stored
-  # remotely. The environment variable reaches every child.
-  PYTHONHASHSEED=0 LMCACHE_CONFIG_FILE="$WORK/lmcache_kvblockd.yaml" \
-  LMCACHE_LOG_LEVEL="${LMCACHE_LOG_LEVEL:-INFO}" \
+  # PYTHONHASHSEED=0: the connector's key chain seeds from a determinism check
+  # (config.require_pinned_hashseed) — unpinned, it refuses to boot rather
+  # than silently never sharing cache. The env var reaches every child, and
+  # vLLM spawns the engine core in a separate process.
+  # --disable-hybrid-kv-cache-manager: v0.25's factory refuses external
+  # connectors without SupportsHMA otherwise (connector.py docstring; the
+  # Docker rig serves with the same flag).
+  PYTHONHASHSEED=0 \
   vllm serve "$MODEL" --port "$VLLM_PORT" --dtype bfloat16 \
     --max-model-len "$MAX_MODEL_LEN" --max-num-seqs 1 \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --no-enable-prefix-caching \
+    --disable-hybrid-kv-cache-manager \
     --kv-transfer-config "$(cat "$WORK/kv_transfer.json")" \
     > "$VLLM_LOG" 2>&1 &
   VLLM_PID=$!
   # Passing the pid makes a crashed server fail in seconds instead of burning
   # the whole deadline (scripts/wait-http.sh).
-  # Report what LMCache actually loaded, so a silent local-only fallback is
-  # visible in the log instead of being inferred from an absence of lines.
-  ( sleep 20
-    echo "=== LMCache config as the server sees it ==="
-    grep -icE 'plugin://kvblockd|remote_storage_plugin' "$VLLM_LOG" 2>/dev/null \
-      | sed 's/^/  plugin mentions in vllm log: /'
-  ) &
   if ! bash "$ROOT/scripts/wait-http.sh" "http://127.0.0.1:$VLLM_PORT/health" "$2" "$VLLM_PID"; then
     # vLLM reports the engine-core failure as "See root cause above": the
     # worker process writes its real error well before the API-server
@@ -307,6 +277,25 @@ start_vllm() {  # $1 = log file, $2 = health timeout seconds
     tail -250 "$VLLM_LOG" >&2
     exit 1
   fi
+  # FAST-FAIL GATE. The native path has no LMCache-style "healthy but
+  # silently degraded" init mode: if the connector class can't be imported or
+  # constructed, the vLLM factory raises and /health never comes up. What CAN
+  # still be silently wrong at this point is a dropped transfer config (vLLM
+  # serving with no connector at all). Gate on the FACTORY'S construction
+  # line — vendored at python/vllm_kvblockd/upstream_refs/
+  # kv_connector_factory.py:62-66, logged at INFO strictly before serving —
+  # NOT the bare class name: vLLM echoes its parsed config at API-server
+  # startup, so the class name alone can appear in the log of an engine that
+  # never built the connector. Byte-level proof stays where it belongs: the
+  # populate phase's per-prompt put receipt (kvb_bytes_total{dir="in"} must
+  # grow within PUT_WAIT_S or the driver aborts loudly).
+  if ! grep -q "Creating v1 connector with name: KvblockdConnector" "$VLLM_LOG"; then
+    log "FATAL: vLLM is healthy but the connector factory never constructed KvblockdConnector — the kv-transfer config was dropped or ignored and the engine is serving with no KV connector"
+    log "connector/config lines from $VLLM_LOG:"
+    grep -inE "kv_transfer|kv_connector|KVConnector|connector" "$VLLM_LOG" | tail -30 >&2 || true
+    exit 1
+  fi
+  log "native connector confirmed: $(grep -m1 'Creating v1 connector with name: KvblockdConnector' "$VLLM_LOG")"
 }
 
 stop_vllm() {
@@ -347,7 +336,7 @@ stop_vllm
 start_vllm "$WORK/vllm-measure.log" 1200    # weights already on disk
 
 # ---- 11. PHASE 2: measure (warm reps first, then cold — see run_ttft.py) -----
-LMCACHE_VER="$(python3 -c 'import lmcache; print(lmcache.__version__)')"
+CONNECTOR_VER="$(python3 -c 'import vllm_kvblockd; print(vllm_kvblockd.__version__)')"
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | sed 's/^ *//;s/ *$//')"
 log "phase 2/2 measure: reps=$REPS(+$WARMUP warmup) gen=$GEN_TOKENS link='$TC_LINK'"
 rc=0
@@ -356,7 +345,8 @@ python3 "$HERE/run_ttft.py" --phase measure \
   --model "$MODEL" --gen-tokens "$GEN_TOKENS" \
   --state "$STATE_JSON" --out "$OUT_JSONL" \
   --stamp gpu="$GPU_NAME (hf-jobs ${FLAVOR:-flavor-unset})" \
-  --stamp vllm="$VLLM_VER" --stamp lmcache="$LMCACHE_VER" \
+  --stamp vllm="$VLLM_VER" \
+  --stamp connector="vllm_kvblockd $CONNECTOR_VER (native)" \
   --stamp tc_link="$TC_LINK" --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
   --stamp git_sha="$GIT_SHA" || rc=$?
 
