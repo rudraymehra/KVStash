@@ -80,6 +80,60 @@ def test_batch_get_deadline_bounds_a_trickling_server():
     b.close()
 
 
+def _midbody_trickle_server(sock, blob_len, grain_s):
+    """Answer one BATCH_GET whose header/preamble/descriptor arrive instantly,
+    then trickle the SINGLE blob's body one byte per grain_s — the pathological
+    server the per-frame/per-descriptor deadline checks are blind to, because
+    the whole stall happens inside one block's recv loop."""
+    try:
+        hdr = p.Header.parse(_recv_exact(sock, p.HEADER_SIZE))
+        _recv_exact(sock, hdr.payload_len)  # the keylist; content irrelevant
+        head = p.pack_preamble(p.Status.OK, 1) + struct.pack("<II", 0, 1)
+        desc = p._DESC.pack(p.Status.OK, blob_len, 0)
+        rh = p.Header(p.Op.BATCH_GET, flags=p.F_RESP, ns=1, request_id=1)
+        rh.payload_len = len(head) + len(desc) + blob_len
+        sock.sendall(rh.pack() + head + desc)
+        for _ in range(blob_len):
+            time.sleep(grain_s)
+            sock.sendall(b"\x00")
+    except OSError:
+        return  # client gave up (the point of the test)
+
+
+def test_deadline_bounds_a_mid_body_trickle():
+    """One byte per 0.05s INSIDE one blob's body: each recv succeeds well
+    inside any sane op timeout, and after the descriptors no between-frame or
+    between-descriptor deadline check ever runs again — only a deadline
+    threaded into the recv loop itself can stop it. Full delivery would take
+    ~3s; the 0.4s deadline must turn it into a bounded ConnectionLost, never a
+    COMPLETE at 3s."""
+    grain_s = 0.05
+    blob_len = 60  # 60 bytes x 0.05s = 3s full delivery
+    deadline_s = 0.4
+    a, b = socket.socketpair()
+    a.settimeout(5.0)  # per-recv op timeout: NEVER hit here — that's the trap
+    limits = SimpleNamespace(max_batch_keys=64, max_frame_len=1 << 20,
+                             max_blob_len=1 << 20, initial_credit=0, features=0)
+    conn = _Conn(a, limits, namespace_id=1, verify=False)
+    t = threading.Thread(target=_midbody_trickle_server, args=(b, blob_len, grain_s),
+                         daemon=True)
+    t.start()
+
+    def alloc(idx, prefix, body_len):
+        return memoryview(bytearray(body_len))
+
+    t0 = time.monotonic()
+    with pytest.raises(ConnectionLost):  # mid-body abandon MUST evict the conn
+        conn.batch_get_scatter([bytes(32)], 0, alloc,
+                               deadline=time.monotonic() + deadline_s)
+    elapsed = time.monotonic() - t0
+    # Bound: the deadline plus one trickle grain and slack — nowhere near the
+    # 3s a deadline-blind body drain takes.
+    assert elapsed < deadline_s + 0.6, f"mid-body drain ran {elapsed:.2f}s"
+    a.close()
+    b.close()
+
+
 def test_client_expired_deadline_is_all_misses(daemon):
     """Client level: a deadline already in the past yields NOT_FOUND for every
     key WITHOUT starting a tile — no request goes out, and (the observable

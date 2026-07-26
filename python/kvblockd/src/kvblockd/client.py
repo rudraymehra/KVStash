@@ -51,6 +51,15 @@ class _Conn:
         self._scratch = bytearray(_MAX_SCRATCH)
         self._pfxbuf = bytearray(64)  # reused per-block prefix staging (grown on demand)
         self.granted_rcvbuf = 0  # stamped by _dial_one (the kernel-GRANTED SO_RCVBUF)
+        # The steady-state per-recv timeout (what the dialer configured on the
+        # socket); restored after any deadline-clamped call. None = blocking.
+        self._op_timeout = sock.gettimeout()
+        # Per-CALL hard deadline (monotonic), armed by batch_get_scatter and
+        # consulted by EVERY _recv_into — header, preamble, descriptors,
+        # prefix, body, and drain reads are all bounded in one place. A
+        # trickling server passes every per-recv op-timeout check forever;
+        # only clamping each recv to the remaining budget stops it.
+        self._deadline: float | None = None
 
     def close(self):
         try:
@@ -70,10 +79,24 @@ class _Conn:
             raise ConnectionLost(f"send: {e}") from e
 
     def _recv_into(self, view: memoryview):
-        """Fill view completely or raise ConnectionLost."""
+        """Fill view completely or raise ConnectionLost. When a per-call
+        deadline is armed (see __init__/_arm_deadline), each recv is clamped
+        to min(op_timeout, remaining budget) and an exhausted budget raises —
+        abandoning mid-read leaves the stream state unknown, so the caller
+        must evict the connection (Pool.run does, on any non-StatusError)."""
         got = 0
         n = len(view)
+        deadline = self._deadline
         while got < n:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ConnectionLost("recv deadline exceeded (conn evicted)")
+                try:
+                    self._sock.settimeout(remaining if self._op_timeout is None
+                                          else min(self._op_timeout, remaining))
+                except OSError as e:
+                    raise ConnectionLost(f"settimeout: {e}") from e
             try:
                 r = self._sock.recv_into(view[got:], n - got)
             except OSError as e:
@@ -144,8 +167,10 @@ class _Conn:
         keyspace (so tiled batches never collide). Returns tile-local statuses.
 
         deadline (optional, time.monotonic()-based): a hard wall-clock ceiling
-        for the WHOLE drain. The socket op timeout bounds each recv, but a
-        trickling server passes every per-recv check forever; past the
+        for the WHOLE drain, threaded into _recv_into itself — every read
+        (header, preamble, descriptors, prefix, body, drain) is clamped to
+        the remaining budget, so a server trickling bytes INSIDE one blob's
+        body is cut off just like one stalling between frames. Past the
         deadline this raises ConnectionLost — abandoning mid-stream leaves the
         conn's read state unknown, so evicting it is the only safe degrade
         (the caller's shard turns its remaining keys into misses)."""
@@ -153,39 +178,51 @@ class _Conn:
         statuses = [p.Status.NOT_FOUND] * n
         if n == 0:
             return statuses
-        self._send_frame(p.Header(p.Op.BATCH_GET, ns=self.namespace_id, request_id=1),
-                         [p.pack_keylist(keys)])
-        seen = 0
-        while True:
-            if deadline is not None and time.monotonic() > deadline:
-                raise ConnectionLost("GET deadline exceeded between frames (conn evicted)")
-            h = self._next_header()
-            status, first, total, descs, lead = self._read_region(h, n, prefix_len)
-            if not p.status_ok(status):
-                raise p.StatusError(p.Op.BATCH_GET, status)
-            # Validate the frame window against the request (a desynced or
-            # buggy server must not drive an IndexError or a silent short read).
-            if total != n:
-                raise ConnectionLost(f"GET total_keys {total} != requested {n}")
-            if first != seen or first + len(descs) > n:
-                raise ConnectionLost(f"GET frame window [{first},{first+len(descs)}) invalid at seen={seen}, n={n}")
-            for j, (dstatus, dlen, dxxh) in enumerate(descs):
-                local = first + j
-                if not p.status_ok(dstatus):  # NOT_FOUND / EVICTED / any non-OK: no payload
-                    statuses[local] = p.Status.NOT_FOUND
-                    continue
+        self._deadline = deadline  # armed for every _recv_into below
+        try:
+            self._send_frame(p.Header(p.Op.BATCH_GET, ns=self.namespace_id, request_id=1),
+                             [p.pack_keylist(keys)])
+            seen = 0
+            while True:
                 if deadline is not None and time.monotonic() > deadline:
-                    raise ConnectionLost("GET deadline exceeded mid-frame (conn evicted)")
-                lead = self._scatter_one(idx_base + local, local, dlen, dxxh,
-                                         prefix_len, alloc, statuses, lead)
-            if lead:  # every pre-read byte belongs to some OK payload above
-                raise ConnectionLost(f"GET frame left {len(lead)} unclaimed payload bytes")
-            seen = first + len(descs)
-            if not (h.flags & p.F_MORE):
-                break
-        if seen != n:
-            raise ConnectionLost(f"GET returned {seen} of {n} descriptors")
-        return statuses
+                    raise ConnectionLost("GET deadline exceeded between frames (conn evicted)")
+                h = self._next_header()
+                status, first, total, descs, lead = self._read_region(h, n, prefix_len)
+                if not p.status_ok(status):
+                    raise p.StatusError(p.Op.BATCH_GET, status)
+                # Validate the frame window against the request (a desynced or
+                # buggy server must not drive an IndexError or a silent short read).
+                if total != n:
+                    raise ConnectionLost(f"GET total_keys {total} != requested {n}")
+                if first != seen or first + len(descs) > n:
+                    raise ConnectionLost(f"GET frame window [{first},{first+len(descs)}) invalid at seen={seen}, n={n}")
+                for j, (dstatus, dlen, dxxh) in enumerate(descs):
+                    local = first + j
+                    if not p.status_ok(dstatus):  # NOT_FOUND / EVICTED / any non-OK: no payload
+                        statuses[local] = p.Status.NOT_FOUND
+                        continue
+                    if deadline is not None and time.monotonic() > deadline:
+                        raise ConnectionLost("GET deadline exceeded mid-frame (conn evicted)")
+                    lead = self._scatter_one(idx_base + local, local, dlen, dxxh,
+                                             prefix_len, alloc, statuses, lead)
+                if lead:  # every pre-read byte belongs to some OK payload above
+                    raise ConnectionLost(f"GET frame left {len(lead)} unclaimed payload bytes")
+                seen = first + len(descs)
+                if not (h.flags & p.F_MORE):
+                    break
+            if seen != n:
+                raise ConnectionLost(f"GET returned {seen} of {n} descriptors")
+            return statuses
+        finally:
+            # Disarm and restore the steady-state op timeout: on success the
+            # conn is re-pooled and must not carry a stale clamp; on a
+            # deadline raise it is evicted anyway, restoring is just hygiene.
+            self._deadline = None
+            if deadline is not None:
+                try:
+                    self._sock.settimeout(self._op_timeout)
+                except OSError:
+                    pass  # dead socket: the conn is being evicted regardless
 
     def _read_region(self, h: p.Header, n: int, prefix_len: int = 0):
         """Read + parse a GET response region incrementally (the payloads are
