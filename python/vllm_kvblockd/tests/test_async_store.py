@@ -203,6 +203,54 @@ def test_tail_skip_after_drop(daemon):
     conn.shutdown()
 
 
+def test_tail_skip_persists_across_chunked_prefill_steps(daemon):
+    """Once block j of a request drops, LATER _stage_one calls for the SAME
+    request (chunked-prefill continuation stores) must not copy or queue rows
+    past the hole: prefix-chain keys make them unreachable by the
+    consecutive-prefix lookup, so they are dead bytes even when the budget
+    has freed up again — skip them AND count them dropped. The recorded hole
+    is pruned when the request finishes."""
+    from vllm_kvblockd.connector import KvbReqMeta
+
+    conn = make_conn(daemon, kvblockd_store_queue_bytes=3 * TOTAL + TOTAL // 2)
+    pause_drain(conn)
+    kv = fresh_kv()
+    for bid in range(6):
+        fill_block(kv, bid, seed=240 + bid)
+    for name, t in kv.items():
+        conn.save_kv_layer(name, t, None)
+    toks = list(range(450, 475))  # 25 tokens -> 6 full blocks
+
+    def meta(start, end):
+        return KvbReqMeta(req_id="tsp1", token_ids=toks[:24], cache_salt="as-persist",
+                          mm_ids=[], lora_name="", block_ids=[0, 1, 2, 3, 4, 5],
+                          load_start_block=0, num_load_blocks=0,
+                          store_start_block=start, store_end_block=end)
+
+    conn._stage_one(meta(0, 4))  # step 1: three fit, block 3 drops -> the hole
+    assert len(conn._sq) == 3 and conn.dropped_puts == 1
+    resume_drain(conn)
+    assert conn._store_flush(10.0) == 0  # the budget is fully free again
+    pause_drain(conn)
+
+    offered = []
+    real_enqueue = conn._sq_enqueue
+
+    def spy(key, buf):
+        offered.append(bytes(key))
+        return real_enqueue(key, buf)
+
+    conn._sq_enqueue = spy
+    conn._stage_one(meta(4, 6))  # step 2 (later chunk): rows 4,5 are past the hole
+    assert offered == [], "post-hole rows must never be copied or offered to the queue"
+    assert len(conn._sq) == 0
+    assert conn.dropped_puts == 3  # block 3 (budget) + blocks 4,5 (persisted skip)
+    assert conn.dropped_put_bytes == 3 * TOTAL
+    conn.request_finished(StubRequest("tsp1", toks), [])
+    assert conn._store_holes == {}  # pruned with the request
+    conn.shutdown()
+
+
 def test_delivery_order_and_completeness(daemon):
     """The drain is FIFO and complete: delivery order == enqueue order,
     exactly — per-request block order is what makes a partial delivery a

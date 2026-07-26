@@ -367,6 +367,12 @@ class KvblockdConnector(_Base):
         # finally returns: delivered -> un-count the pessimistic drop; failed
         # -> already disclosed dropped, must not ALSO count failed.
         self._sq_inflight_counted = 0
+        # req_id -> FIRST store block that was dropped for that request. The
+        # keys are a prefix chain, so every later block of the request is
+        # unreachable by the consecutive-prefix lookup — later _stage_one
+        # calls (chunked-prefill continuations) skip past the hole instead of
+        # queueing dead bytes. Pruned in request_finished.
+        self._store_holes: dict[str, int] = {}
         self._store_thread: threading.Thread | None = None
         self._store_stop = False      # shutdown: drain the remainder, then exit
         self._store_abort = False     # wedged flush: exit without draining
@@ -716,6 +722,7 @@ class KvblockdConnector(_Base):
             self._local_hit_tokens.pop(rid, None)
             self._seeds.pop(rid, None)
             self._blocks.pop(rid, None)
+            self._store_holes.pop(rid, None)
             # Async-lookup abort cleanup (the #42372 leak class): an aborted
             # request must not leave a pending deadline or an unclaimed result.
             self._lookup_pending.pop(rid, None)
@@ -1233,6 +1240,19 @@ class KvblockdConnector(_Base):
         seed = self._seed(req.cache_salt, req.mm_ids, req.lora_name)
         keys = block_chain_keys(seed, req.token_ids, self._block_size)
         end = min(req.store_end_block, len(keys), len(req.block_ids))
+        hole = self._store_holes.get(req.req_id)
+        if hole is not None and end > hole:
+            # TAIL-SKIP, PERSISTED: an earlier step of this request already
+            # dropped block `hole`, so every row at/past it is unreachable by
+            # the consecutive-prefix lookup no matter how much budget freed up
+            # since — count those rows dropped (no copies built) and cap the
+            # loop below the hole.
+            skipped = end - max(req.store_start_block, hole)
+            if skipped > 0:
+                with self._sq_cond:
+                    self.dropped_puts += skipped
+                    self.dropped_put_bytes += skipped * total
+            end = hole
         for j in range(req.store_start_block, end):
             bid = req.block_ids[j]
             buf = bytearray(total)
@@ -1247,7 +1267,9 @@ class KvblockdConnector(_Base):
                 # missing every later block of THIS request is unreachable by
                 # BATCH_EXISTS's consecutive-prefix count — copying/queueing
                 # them would spend budget on bytes no lookup can ever count.
-                # Count them dropped (without building the copies) and stop.
+                # Count them dropped (without building the copies), record the
+                # hole so LATER steps of this request skip past it too, stop.
+                self._store_holes[req.req_id] = j  # j < any prior hole (end is capped)
                 skipped = end - j - 1
                 if skipped > 0:
                     with self._sq_cond:
