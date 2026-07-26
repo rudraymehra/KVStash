@@ -161,6 +161,8 @@ class AdapterConfig:
         "namespace",
         "op_timeout",
         "port",
+        "so_rcvbuf",
+        "staging_bytes",
         "streams",
         "token",
         "verify",
@@ -179,6 +181,17 @@ class AdapterConfig:
         )
         c.streams = int(get_extra_config(ktc, "kvblockd_streams", 4))
         c.verify = bool(get_extra_config(ktc, "kvblockd_verify", True))
+        # OPT-IN SO_RCVBUF override (bytes). None/unset = leave kernel
+        # receive-window autotuning alone (setting SO_RCVBUF disables it and
+        # clamps at the non-netns-writable net.core.rmem_max — see the
+        # client's _connect for the full rationale).
+        rcvbuf = get_extra_config(ktc, "kvblockd_so_rcvbuf", None)
+        c.so_rcvbuf = int(rcvbuf) if rcvbuf not in (None, "", 0, "0") else None
+        # Pinned host staging CAP (bytes) for the connector's CUDA load slab:
+        # the slab grows up to this and never past it; loads bigger than the
+        # cap drain through it in cap-sized passes. <=0 disables the slab
+        # (per-block loads only).
+        c.staging_bytes = int(get_extra_config(ktc, "kvblockd_staging_bytes", 2 * 2**30))
         c.op_timeout = float(get_extra_config(ktc, "kvblockd_op_timeout_s", 10.0))
         c.connect_timeout = float(get_extra_config(ktc, "kvblockd_connect_timeout_s", 5.0))
 

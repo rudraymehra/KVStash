@@ -208,6 +208,33 @@ def test_cache_salt_isolates(daemon):
     conn.shutdown()
 
 
+def test_op_failure_drops_client_and_arms_dial_breaker(daemon):
+    """ConnectionLost out of a batch op must drop the pooled client and arm
+    the redial breaker: a daemon that dies (or blackholes) mid-run then costs
+    ONE connect timeout per backoff window, not one per load — and a
+    dial-suppressed call must NOT extend the window (that would starve the
+    retry forever under constant traffic)."""
+    import time as _time
+
+    from kvblockd.errors import ConnectionLost
+
+    conn = make_connector(daemon)
+    client = conn._ensure()
+
+    def boom(keys):
+        raise ConnectionLost("injected mid-op death")
+
+    client.batch_exists = boom
+    req = StubRequest("dc1", list(range(9)), "t-dropclient")
+    assert conn.get_num_new_matched_tokens(req, 0) == (0, False)  # never raises
+    assert conn._client is None                    # dropped (and closed)
+    assert conn._next_dial > _time.monotonic()     # breaker armed
+    armed = conn._next_dial
+    assert conn.get_num_new_matched_tokens(req, 0) == (0, False)  # instant miss
+    assert conn._next_dial == armed                # suppression never re-arms
+    conn.shutdown()
+
+
 def test_never_raise_daemon_absent():
     """Dead endpoint: every serving-path method degrades to a miss/no-op."""
     cfg = StubVllmConfig(1)  # nothing listens on port 1

@@ -67,9 +67,16 @@ KV_BYTES_PER_TOKEN="${KV_BYTES_PER_TOKEN:-131072}"  # bf16 KV/token upper bound 
                                               # prefix, so the same per-token bound holds.
 KVBD_ARENA_BYTES="${KVBD_ARENA_BYTES:-}"      # empty -> derived from LENGTHS x pairs x KV_BYTES_PER_TOKEN
 KVBD_STREAMS="${KVBD_STREAMS:-4}"
-CONNECTOR_STAGING_GB="${CONNECTOR_STAGING_GB:-2}"   # native-connector host staging: it moves ONE paged
-                                              # block at a time through a transient CPU tensor (~MB
-                                              # scale), so this is headroom, not a tier.
+KVBD_VERIFY="${KVBD_VERIFY:-1}"               # 1 (default) = xxh3-verify every loaded block.
+                                              # 0 = DIAGNOSTIC arm only: skips the client-side
+                                              # digest to isolate hash cost; labelled in the
+                                              # connector stamp, never a headline number.
+CONNECTOR_STAGING_GB="${CONNECTOR_STAGING_GB:-2}"   # native-connector pinned staging CAP: the connector
+                                              # keeps ONE persistent pinned host slab, grown to the
+                                              # largest load up to this cap (bigger loads drain
+                                              # through it in cap-sized passes). Plumbed to the
+                                              # connector as kvblockd_staging_bytes below and counted
+                                              # 1:1 in the RAM fit check.
 VLLM_HOST_RESERVE_GB="${VLLM_HOST_RESERVE_GB:-6}"   # RAM budgeted for the vLLM process in the fit check
 PUT_WAIT_S="${PUT_WAIT_S:-120}"               # populate: max wait for kvblockd put counters per prompt
 DRAIN_S="${DRAIN_S:-5}"                       # populate: put counters must be quiet this long (the
@@ -212,6 +219,13 @@ EOF
 # via kv_connector_module_path and hands it the kvblockd_* extra-config keys.
 # There is no library between the engine and the daemon — no second config
 # channel to silently miss.
+# kvblockd_verify maps KVBD_VERIFY onto the connector's existing extra-config
+# key (config.py reads it; default true). 0 is a labelled diagnostic arm.
+# kvblockd_staging_bytes caps the connector's persistent pinned staging slab
+# at CONNECTOR_STAGING_GB — the same number the RAM fit check budgeted above.
+KVBD_VERIFY_JSON=true
+[[ "$KVBD_VERIFY" == "0" ]] && KVBD_VERIFY_JSON=false
+CONNECTOR_STAGING_BYTES=$((CONNECTOR_STAGING_GB * 1073741824))
 cat > "$WORK/kv_transfer.json" <<EOF
 {"kv_connector": "KvblockdConnector", "kv_role": "kv_both",
  "kv_connector_module_path": "vllm_kvblockd.connector",
@@ -219,7 +233,9 @@ cat > "$WORK/kv_transfer.json" <<EOF
    "kvblockd_endpoint": "kvblockd://$KVBD_ADDR",
    "kvblockd_namespace": "vllm",
    "kvblockd_token": "$KVBD_TOKEN",
-   "kvblockd_streams": $KVBD_STREAMS}}
+   "kvblockd_streams": $KVBD_STREAMS,
+   "kvblockd_staging_bytes": $CONNECTOR_STAGING_BYTES,
+   "kvblockd_verify": $KVBD_VERIFY_JSON}}
 EOF
 python3 -c "import json,sys; json.load(open('$WORK/kv_transfer.json'))" \
   || die "generated kv_transfer.json is not valid JSON"
@@ -385,18 +401,39 @@ start_vllm "$WORK/vllm-measure.log" 1200    # weights already on disk
 
 # ---- 11. PHASE 2: measure (warm reps first, then cold — see run_ttft.py) -----
 CONNECTOR_VER="$(python3 -c 'import vllm_kvblockd; print(vllm_kvblockd.__version__)')"
+CONNECTOR_STAMP="vllm_kvblockd $CONNECTOR_VER (native)"
+[[ "$KVBD_VERIFY" == "0" ]] && CONNECTOR_STAMP="$CONNECTOR_STAMP verify=off (DIAGNOSTIC arm)"
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | sed 's/^ *//;s/ *$//')"
 log "phase 2/2 measure: reps=$REPS(+$WARMUP warmup) gen=$GEN_TOKENS link='$TC_LINK'"
+# --block-size 16: vLLM's CUDA default; the driver verifies each warm rep's
+# kvb_hits_total delta EQUALS the expected block count (partial hits flagged).
+# --vllm-log: after the warm pass the driver greps the engine log for the
+# connector's 'kvblockd load path:' line and appends path=... to the
+# connector stamp, so every JSONL record names the path that produced it.
 rc=0
 python3 "$HERE/run_ttft.py" --phase measure \
   --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
-  --model "$MODEL" --gen-tokens "$GEN_TOKENS" \
-  --state "$STATE_JSON" --out "$OUT_JSONL" \
+  --model "$MODEL" --gen-tokens "$GEN_TOKENS" --block-size 16 \
+  --state "$STATE_JSON" --out "$OUT_JSONL" --vllm-log "$WORK/vllm-measure.log" \
   --stamp gpu="$GPU_NAME (hf-jobs ${FLAVOR:-flavor-unset})" \
   --stamp vllm="$VLLM_VER" \
-  --stamp connector="vllm_kvblockd $CONNECTOR_VER (native)" \
+  --stamp connector="$CONNECTOR_STAMP" \
   --stamp tc_link="$TC_LINK" --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
   --stamp git_sha="$GIT_SHA" || rc=$?
+
+# Path attribution receipt (the driver already stamped it into the JSONL):
+# on a CUDA run the fast path is chunked-slab — per-block means the pinned
+# slab or the GPU scratch never came up, so the warm numbers measured the
+# slow lane. Loud WARN, never a failure: the numbers are honest, just slower.
+LOAD_PATH="$(grep -h -o 'kvblockd load path: [a-z-]*' "$WORK"/vllm-populate.log "$WORK"/vllm-measure.log 2>/dev/null | tail -1 | awk '{print $NF}')"
+if [[ -n "$LOAD_PATH" ]]; then
+  log "connector load path: $LOAD_PATH (JSONL connector stamp carries path=$LOAD_PATH)"
+  if [[ "$LOAD_PATH" != "chunked-slab" ]]; then
+    log "WARN WARN WARN: warm loads ran on the '$LOAD_PATH' path on a CUDA run — the pinned-slab chunked scatter did NOT serve these numbers (pin/scratch alloc failed or the paged layout was not viewable). Attribute the results to path=$LOAD_PATH."
+  fi
+else
+  log "WARN: no 'kvblockd load path:' line found in the engine logs — load path unattributed"
+fi
 
 # ---- 12. results out ---------------------------------------------------------
 log "JSONL at $OUT_JSONL ($(wc -l < "$OUT_JSONL" 2>/dev/null || echo 0) records); every record was also printed above as a CHART2JSONL line"

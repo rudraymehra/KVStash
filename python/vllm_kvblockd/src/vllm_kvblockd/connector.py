@@ -33,6 +33,7 @@ refusing to start beats a fleet that silently never shares cache.
 from __future__ import annotations
 
 import logging
+import os
 import struct
 import threading
 import time
@@ -40,6 +41,7 @@ from dataclasses import dataclass, field
 
 from kvblockd import protocol as kp
 from kvblockd.client import Client
+from kvblockd.errors import ConnectionLost
 
 from .config import AdapterConfig, block_chain_keys, chain_seed, require_pinned_hashseed
 
@@ -110,6 +112,20 @@ CODE_DTYPES = {v: k for k, v in DTYPE_CODES.items()}
 # After a failed dial, further dial attempts short-circuit for this long —
 # callers degrade to a miss instantly instead of each eating a connect timeout.
 _REDIAL_BACKOFF_S = 5.0
+
+# Chunked H2D scatter: blocks per chunk and the GPU scratch depth. One chunk
+# = one non_blocking H2D of a contiguous pinned-slab region + one index_copy_
+# per layer, replacing chunk×layers synchronous pageable copies. Depth 1 is
+# deliberate (reviewer-verified): every chunk runs on the SAME stream, so the
+# copy_ into the scratch buffer cannot start until the previous chunk's
+# index_copy_ reads finished — a second buffer bought no overlap, only VRAM.
+_SCATTER_CHUNK = 64
+_SCRATCH_RING = 1
+
+# Consecutive chunked-scatter setup failures (scratch alloc / paged view)
+# before the chunked path latches OFF for the connector's lifetime — the
+# per-block-from-slab copies keep serving loads either way.
+_SCRATCH_MAX_FAILS = 3
 
 
 class BlobError(ValueError):
@@ -227,6 +243,28 @@ class KvblockdConnector(_Base):
         self._layer_kv: dict[str, object] = {}        # layer_name -> paged KV tensor
         self._load_errors: set[int] = set()
 
+        # Pinned staging slab (CUDA loads only): lazily allocated on the first
+        # CUDA-device load, grown geometrically UP TO the configured cap
+        # (kvblockd_staging_bytes), REUSED across loads — never freed
+        # per-load. Loads bigger than the cap drain through the slab in
+        # cap-sized passes. Slots are disjoint by pass-local block index,
+        # which is what makes the client's concurrent drain threads safe.
+        self._staging_bytes = self._cfg.staging_bytes
+        self._slab = None                 # 1-D pinned uint8 torch tensor
+        self._slab_np = None              # numpy view of the slab (memoryview source)
+        self._slab_disabled = False       # first-pin failure -> permanent per-block fallback
+        # GPU scratch for the chunked scatter: _SCRATCH_RING × [chunk,
+        # n_layers, bytes_per_layer] uint8, cached per (device, layout).
+        self._gpu_scratch = None
+        self._gpu_scratch_key = None
+        self._scratch_fails = 0           # consecutive chunked-setup failures
+        self._chunked_disabled = False    # latched after _SCRATCH_MAX_FAILS in a row
+        # Machine-readable path attribution: one INFO line on the first
+        # completed load, one more if the path ever switches mid-run.
+        self._reported_path = None
+        self._path_switch_logged = False
+        self._debug_scatter_checked = False  # KVBLOCKD_DEBUG_SCATTER_CHECK=1, once
+
     # ------------------------------------------------------------------
     # client plumbing (lazy: import/instantiate must succeed with no daemon)
     # ------------------------------------------------------------------
@@ -250,11 +288,29 @@ class KvblockdConnector(_Base):
                         connect_timeout=self._cfg.connect_timeout,
                         op_timeout=self._cfg.op_timeout,
                         verify=self._cfg.verify,
+                        so_rcvbuf=self._cfg.so_rcvbuf,
                     )
                 except Exception:
                     self._next_dial = time.monotonic() + _REDIAL_BACKOFF_S
                     raise
             return self._client
+
+    def _drop_client(self, exc: BaseException) -> None:
+        """ConnectionLost/OSError out of a batch op means the pooled
+        connections are dead (daemon gone or blackholed): drop the whole
+        client and re-arm the dial breaker, so the outage costs ONE
+        connect_timeout per backoff window — not one per load, with every
+        pooled conn re-dialing under it. A dial-suppressed ConnectionError
+        (client already None) re-arms nothing: extending the window on every
+        suppressed call would starve the retry forever under constant load."""
+        if not isinstance(exc, (ConnectionLost, OSError)):
+            return  # e.g. StatusError: the conn is in sync, keep the pool
+        with self._client_lock:
+            client, self._client = self._client, None
+            if client is None:
+                return  # dial failure/suppression: _ensure already armed it
+            self._next_dial = time.monotonic() + _REDIAL_BACKOFF_S
+        client.close()
 
     def shutdown(self):
         with self._client_lock:
@@ -318,6 +374,7 @@ class KvblockdConnector(_Base):
             return max(0, hit_tokens - num_computed_tokens), False
         except Exception as e:  # noqa: BLE001 — never raise: a failed lookup is a miss
             self._log.maybe("lookup", "kvblockd BATCH_EXISTS failed (treated as miss)", e)
+            self._drop_client(e)
             return 0, False
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
@@ -566,10 +623,10 @@ class KvblockdConnector(_Base):
                     self._load_one(req)
                 except Exception as e:  # noqa: BLE001 — never raise; blocks flagged as errors
                     self._log.maybe("load", f"kvblockd load failed req={req.req_id}", e)
+                    self._drop_client(e)
                     self._load_errors.update(self._load_range_ids(req))
 
     def _load_one(self, req: KvbReqMeta) -> None:
-        torch = _torch()
         names, dtype_name, bytes_per_layer = self._layout()
         if not names:
             self._load_errors.update(self._load_range_ids(req))
@@ -585,6 +642,44 @@ class KvblockdConnector(_Base):
             if blk < len(req.block_ids):
                 self._load_errors.add(req.block_ids[blk])
 
+        body_len = total - BLOB_PREFIX_LEN
+        dev = self._layer_kv[names[0]].device
+        used_ring = False
+        took_slab = False
+        if keys and self._slab_path_ok(dev):
+            # Cap-sized passes: the slab never grows past the configured cap;
+            # a load bigger than the cap drains through it pass by pass.
+            cap_blocks = self._staging_bytes // body_len if body_len > 0 else 0
+            pass_blocks = min(len(keys), cap_blocks)
+            if pass_blocks > 0 and self._slab_reserve(pass_blocks * body_len):
+                took_slab = True
+                used_ring = self._load_slab(req, names, dtype_name, bytes_per_layer,
+                                            total, keys, pass_blocks)
+        if keys and not took_slab:
+            self._load_perblock(req, names, dtype_name, bytes_per_layer, total, keys)
+        if keys:
+            self._note_path("chunked-slab" if used_ring else "per-block")
+
+    def _note_path(self, path: str) -> None:
+        """One machine-readable INFO line on the first completed load — the
+        bench rig greps it to attribute measured numbers to the path that
+        produced them — plus one more line if the path ever switches mid-run."""
+        if self._reported_path is None:
+            self._reported_path = path
+            logger.info("kvblockd load path: %s", path)
+        elif path != self._reported_path and not self._path_switch_logged:
+            self._path_switch_logged = True
+            logger.info("kvblockd load path: %s (switched from %s mid-run)",
+                        path, self._reported_path)
+
+    def _load_perblock(self, req: KvbReqMeta, names, dtype_name, bytes_per_layer,
+                       total, keys) -> None:
+        """The original per-block load: pageable torch.empty staging + one
+        synchronous dst.copy_ per (block, layer). This is THE path for CPU
+        paged tensors (the CI backend / bench/e2e/cpu rig depend on it staying
+        byte-identical in behavior) and the degrade when pinning fails."""
+        torch = _torch()
+        start = req.load_start_block
         staged: dict[int, object] = {}
 
         def alloc(idx, prefix, body_len):
@@ -621,6 +716,233 @@ class KvblockdConnector(_Base):
                     self._load_errors.add(bid)
                     break
 
+    # ------------------------------------------------------------------
+    # pinned-slab load path (CUDA paged tensors)
+    # ------------------------------------------------------------------
+    def _slab_path_ok(self, device) -> bool:
+        """Slab staging + chunked H2D only pays (and only pins) for CUDA paged
+        tensors; the CPU backend keeps the original per-block path unchanged."""
+        return getattr(device, "type", "") == "cuda"
+
+    def _alloc_pinned(self, nbytes: int):
+        """cudaHostAlloc via torch — a seam the tests mock (pin failure / CPU CI)."""
+        torch = _torch()
+        return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+
+    def _slab_reserve(self, nbytes: int) -> bool:
+        """Ensure the connector-owned pinned uint8 slab holds nbytes: lazily
+        allocated on first use, grown geometrically (>= 2x) up to the
+        configured cap, REUSED across loads — never freed per-load. A pin
+        failure with NO working slab disables the slab for the connector's
+        lifetime; a GROWTH failure keeps the old slab (this load falls back
+        per-block, smaller loads keep the slab lane). Never raises."""
+        if self._slab_disabled:
+            return False
+        if nbytes > self._staging_bytes:
+            return False  # over the cap: callers split loads into cap-sized passes
+        if self._slab is not None and self._slab.numel() >= nbytes:
+            return True
+        want = nbytes if self._slab is None else max(nbytes, 2 * self._slab.numel())
+        want = min(want, self._staging_bytes)  # still >= nbytes (checked above)
+        try:
+            slab = self._alloc_pinned(want)
+            slab_np = slab.numpy()
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: cudaHostAlloc failure degrades to the per-block path
+            if self._slab is None:
+                self._log.maybe("slab", "pinned slab allocation failed — per-block fallback", e)
+                self._slab_disabled = True
+            else:
+                self._log.maybe("slab", "pinned slab GROWTH failed — keeping the "
+                                        "existing slab; per-block fallback for this load", e)
+            return False
+        self._slab, self._slab_np = slab, slab_np
+        return True
+
+    def _load_slab(self, req: KvbReqMeta, names, dtype_name, bytes_per_layer,
+                   total, keys, pass_blocks: int) -> bool:
+        """Slab-staged load: the client drains block bodies straight into
+        disjoint pinned-slab slots (the layout gate runs in alloc BEFORE any
+        body byte is accepted, exactly like the per-block path), then
+        _scatter_slab moves them to the GPU in chunked batches. Loads bigger
+        than pass_blocks drain through the slab in pass_blocks-sized passes —
+        _scatter_slab's trailing stream synchronize makes reusing the slots
+        for the next pass safe, and key_offset keeps every pass's statuses
+        mapped to the right GLOBAL block ids. Returns whether any pass used
+        the chunked fast path (path attribution)."""
+        body_len = total - BLOB_PREFIX_LEN
+        slab_np = self._slab_np
+        used_ring = False
+        for p0 in range(0, len(keys), pass_blocks):
+            sub = keys[p0:p0 + pass_blocks]
+
+            def alloc(idx, prefix, blen):
+                # Runs on the client's concurrent drain threads: slots are
+                # disjoint by (pass-local) idx and nothing else is mutated
+                # here — thread-safe by construction. idx is 0-based within
+                # this batch_get_scatter call, so slots never exceed the pass.
+                try:
+                    d, n_layers, tpb, bpl, tot = decode_blob_prefix(prefix)
+                except BlobError:
+                    return None
+                if (d != dtype_name or n_layers != len(names) or tpb != self._block_size
+                        or bpl != bytes_per_layer or tot != total or blen != body_len):
+                    return None  # layout drift -> miss, never a corrupt scatter
+                off = idx * body_len
+                return memoryview(slab_np[off:off + blen])
+
+            statuses = self._ensure().batch_get_scatter(sub, BLOB_PREFIX_LEN, alloc)
+            used_ring |= self._scatter_slab(req, names, bytes_per_layer, statuses,
+                                            key_offset=p0)
+        return used_ring
+
+    def _scratch_ring(self, dev, n_layers, bytes_per_layer):
+        """The GPU scratch ring (2 × [chunk, n_layers, bytes_per_layer] uint8),
+        cached per (device, layout) and reused across loads."""
+        key = (str(dev), n_layers, bytes_per_layer)
+        if self._gpu_scratch is not None and self._gpu_scratch_key == key:
+            return self._gpu_scratch
+        torch = _torch()
+        ring = [
+            torch.empty((_SCATTER_CHUNK, n_layers, bytes_per_layer),
+                        dtype=torch.uint8, device=dev)
+            for _ in range(_SCRATCH_RING)
+        ]
+        self._gpu_scratch, self._gpu_scratch_key = ring, key
+        return ring
+
+    def _scatter_slab(self, req: KvbReqMeta, names, bytes_per_layer, statuses,
+                      key_offset: int = 0) -> bool:
+        """Chunked batched H2D scatter from the slab. A chunk whose statuses
+        are ALL OK takes the fast path: ONE non_blocking H2D of the contiguous
+        slab region into the scratch buffer, then per layer one index_copy_
+        into the paged buffer viewed as uint8 rows (bid index built only from
+        status-OK blocks — in the fast path that is the whole chunk). Any
+        chunk containing a non-OK/missing block falls back to per-block copies
+        for THAT chunk only. Never raises: any failure flags the affected
+        block ids (chunk-superset flagging allowed) and degrades. One stream
+        synchronize at the end — the load is synchronous by contract, and the
+        sync is what makes reusing the slab for a next pass safe. key_offset
+        maps this pass's statuses onto the request's global block range.
+        Returns whether the chunked fast path was available (path attribution)."""
+        torch = _torch()
+        n_layers = len(names)
+        body_len = n_layers * bytes_per_layer
+        start = req.load_start_block + key_offset
+        n = len(statuses)
+        # Physical bid per local index; None = skip (non-OK — flagged — or no id).
+        bids: list[int | None] = [None] * n
+        for j, st in enumerate(statuses):
+            blk = start + j
+            bid = req.block_ids[blk] if blk < len(req.block_ids) else None
+            if st != kp.Status.OK:
+                if bid is not None:
+                    self._load_errors.add(bid)
+                continue
+            bids[j] = bid
+        dev = self._layer_kv[names[0]].device
+        paged_u8 = None
+        ring = None
+        if not self._chunked_disabled:
+            try:
+                paged_u8 = {}
+                for name in names:
+                    t = self._layer_kv[name]
+                    # view, NEVER reshape: view aliases or raises, and the
+                    # raise lands here -> per-block fallback. reshape silently
+                    # COPIES a non-contiguous paged tensor, so index_copy_
+                    # would write into a temporary and every byte would be
+                    # silently lost (the refuter-verified BLOCKER).
+                    paged_u8[name] = t.view(torch.uint8).view(t.shape[0], -1)
+                ring = self._scratch_ring(dev, n_layers, bytes_per_layer)
+                self._scratch_fails = 0
+            except Exception as e:  # noqa: BLE001 — never-raise boundary: non-viewable layout / scratch OOM degrades to per-block copies
+                ring = None
+                self._scratch_fails += 1
+                if self._scratch_fails >= _SCRATCH_MAX_FAILS:
+                    self._chunked_disabled = True
+                    self._log.maybe(
+                        "scatter",
+                        f"chunked-scatter setup failed {self._scratch_fails}x in a row "
+                        "— latched OFF for this connector's lifetime (per-block copies)", e)
+                else:
+                    self._log.maybe("scatter", "chunked-scatter setup failed — per-block fallback", e)
+        first_fast: tuple[int, int] | None = None  # (slab slot j, bid) for the debug check
+        for c0 in range(0, n, _SCATTER_CHUNK):
+            c1 = min(c0 + _SCATTER_CHUNK, n)
+            chunk_bids = bids[c0:c1]
+            if ring is not None and all(b is not None for b in chunk_bids):
+                try:
+                    nblk = c1 - c0
+                    src = self._slab[c0 * body_len : c1 * body_len].view(
+                        nblk, n_layers, bytes_per_layer)
+                    scratch = ring[0]
+                    scratch[:nblk].copy_(src, non_blocking=True)
+                    idx = torch.tensor(chunk_bids, dtype=torch.long, device=dev)
+                    for li, name in enumerate(names):
+                        paged_u8[name].index_copy_(0, idx, scratch[:nblk, li])
+                    if first_fast is None:
+                        first_fast = (c0, chunk_bids[0])
+                except Exception as e:  # noqa: BLE001 — never-raise boundary: a failed chunk flags its blocks, not the engine
+                    self._log.maybe("scatter", "chunked H2D scatter failed", e)
+                    self._load_errors.update(b for b in chunk_bids if b is not None)
+                continue
+            # Mixed / degraded chunk: per-block copies for this chunk only.
+            for j in range(c0, c1):
+                bid = bids[j]
+                if bid is None:
+                    continue
+                self._scatter_block_from_slab(j, bid, names, bytes_per_layer)
+        if getattr(dev, "type", "") == "cuda":
+            try:
+                torch.cuda.current_stream(dev).synchronize()
+            except Exception as e:  # noqa: BLE001 — never-raise boundary: an unfinished stream means nothing is provably loaded
+                self._log.maybe("scatter", "stream synchronize failed", e)
+                self._load_errors.update(b for b in bids if b is not None)
+        if (first_fast is not None and not self._debug_scatter_checked
+                and os.environ.get("KVBLOCKD_DEBUG_SCATTER_CHECK") == "1"):
+            self._debug_check_scatter(first_fast, names, bytes_per_layer)
+        return ring is not None
+
+    def _debug_check_scatter(self, first_fast: tuple[int, int], names,
+                             bytes_per_layer) -> None:
+        """KVBLOCKD_DEBUG_SCATTER_CHECK=1: after the first chunked-scatter
+        load, compare ONE scattered block's bytes on the paged tensor against
+        its slab source (uint8 equality) and log PASS/FAIL once. Runs after
+        the stream synchronize; off by default; never raises."""
+        self._debug_scatter_checked = True
+        torch = _torch()
+        j, bid = first_fast
+        try:
+            body_len = len(names) * bytes_per_layer
+            slot = self._slab[j * body_len : (j + 1) * body_len]
+            ok = True
+            for li, name in enumerate(names):
+                got = (self._layer_kv[name][bid].contiguous()
+                       .view(torch.uint8).reshape(-1).cpu())
+                want = slot[li * bytes_per_layer : (li + 1) * bytes_per_layer]
+                if not torch.equal(got, want):
+                    ok = False
+                    break
+            logger.info("kvblockd debug scatter check: %s (slab slot %d -> paged block %d)",
+                        "PASS" if ok else "FAIL", j, bid)
+        except Exception as e:  # noqa: BLE001 — a broken debug probe must not break the load
+            logger.info("kvblockd debug scatter check: FAIL (comparison errored: %s)", e)
+
+    def _scatter_block_from_slab(self, j: int, bid: int, names, bytes_per_layer) -> None:
+        """Per-block scatter of slab slot j into physical block bid — the same
+        per-layer copy_ as the original path, sourced from the slab."""
+        body_len = len(names) * bytes_per_layer
+        buf = self._slab[j * body_len : (j + 1) * body_len]
+        for li, name in enumerate(names):
+            dst = self._layer_kv[name][bid]
+            src = buf[li * bytes_per_layer : (li + 1) * bytes_per_layer]
+            try:
+                dst.copy_(src.view(dst.dtype).reshape(dst.shape))
+            except Exception as e:  # noqa: BLE001 — never-raise boundary: a failed scatter marks the block errored, not the engine
+                self._log.maybe("scatter", f"scatter into {name} failed", e)
+                self._load_errors.add(bid)
+                break
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         # No-op by design: blob granularity is a whole block across ALL layers,
         # and start_load_kv loads synchronously before the forward pass — there
@@ -644,6 +966,7 @@ class KvblockdConnector(_Base):
                     self._store_one(req)
                 except Exception as e:  # noqa: BLE001 — never raise: a lost store is a future miss
                     self._log.maybe("store", f"kvblockd store failed req={req.req_id}", e)
+                    self._drop_client(e)
 
     def _store_one(self, req: KvbReqMeta) -> None:
         names, dtype_name, bytes_per_layer = self._layout()

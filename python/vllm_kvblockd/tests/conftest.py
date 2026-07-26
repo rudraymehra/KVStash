@@ -63,6 +63,8 @@ def daemon():
     (tmp / "ns.yaml").write_text("namespaces:\n  - { name: vllm, id: 1, token: tok }\n")
     (tmp / "cfg.yaml").write_text(
         f'listen_addr: "127.0.0.1:{dp}"\nmetrics_addr: "127.0.0.1:{mp}"\n'
+        f'admin_addr: ""\n'  # disabled: default 9441 is FIXED and collides with the
+        # kvblockd suite's session daemon when both suites run in one pytest invocation
         f"dram_arena_bytes: 134217728\npinned_bytes_cap: 33554432\n"
         f'namespaces_path: "{tmp / "ns.yaml"}"\n'
     )

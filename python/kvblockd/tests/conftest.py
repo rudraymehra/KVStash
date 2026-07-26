@@ -56,6 +56,8 @@ def daemon():
     (tmp / "cfg.yaml").write_text(
         f'listen_addr: "127.0.0.1:{data_port}"\n'
         f'metrics_addr: "127.0.0.1:{metrics_port}"\n'
+        f'admin_addr: ""\n'  # disabled: the default is a FIXED port (9441), and two
+        # session daemons (this suite + vllm_kvblockd's, one pytest run) collide on it
         f"dram_arena_bytes: 67108864\n"
         f"pinned_bytes_cap: 16777216\n"  # must be <= arena (default 128 MiB > 64 MiB fails)
         f'namespaces_path: "{tmp / "ns.yaml"}"\n'

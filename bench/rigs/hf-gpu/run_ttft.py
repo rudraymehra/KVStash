@@ -66,6 +66,7 @@ import argparse
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import time
@@ -245,6 +246,49 @@ def parse_lengths(s: str) -> list[int]:
     return lengths
 
 
+# ------------------------------------------------------- hit attribution
+
+def expected_hit_blocks(prompt_tokens: int, block_size: int) -> int:
+    """Blocks a FULL warm hit must read from kvblockd for an n-token prompt,
+    using the connector's own alignment rule (align_to_block_size: vLLM always
+    recomputes the last token, so only ((n-1)//B)*B tokens are loadable)."""
+    aligned = (prompt_tokens - 1) // block_size * block_size
+    return aligned // block_size
+
+
+def judge_warm_rep(hit_delta: float, expected: int) -> tuple[bool, str | None]:
+    """(verified, reason). Verified iff the hit delta is EXACTLY the expected
+    block count — a partial delta means some 'warm' blocks were recomputed or
+    served from somewhere else, and an excess delta means the attribution
+    window caught someone else's reads; both are distinct UNVERIFIED reasons."""
+    if expected <= 0:
+        return False, "no-loadable-blocks (prompt shorter than block_size+1)"
+    if hit_delta == expected:
+        return True, None
+    if hit_delta == 0:
+        return False, "no-hits"
+    if hit_delta < expected:
+        return False, f"partial-hit ({hit_delta:.0f} of {expected} expected blocks)"
+    return False, f"hit-delta-exceeds-expected ({hit_delta:.0f} > {expected} blocks)"
+
+
+def grep_load_path(log_path: str) -> str | None:
+    """Last `kvblockd load path: <path>` line from the engine log — the
+    connector emits it on the first completed load (and once more if the path
+    degrades mid-run), so the LAST match names the path that served the run's
+    tail. None if the log is unreadable or the line never appeared."""
+    path = None
+    try:
+        with open(log_path, errors="replace") as f:
+            for line in f:
+                m = re.search(r"kvblockd load path: (\S+)", line)
+                if m:
+                    path = m.group(1)
+    except OSError:
+        return None
+    return path
+
+
 # -------------------------------------------------------------------- stats
 
 def _p95(xs):
@@ -367,15 +411,40 @@ def run_measure(args, stamp: dict) -> int:
                                args.gen_tokens, args.request_timeout)
             c1 = read_counters(args.metrics)
             hit_delta = c1["hits"] - c0["hits"]
-            verified = hit_delta > 0
             usage = m.get("usage") or {}
+            ptoks = int(usage.get("prompt_tokens", e["prompt_tokens"]))
+            if args.block_size > 0:
+                # Attribution gate: EVERY promised block must have come from
+                # kvblockd — a merely-positive delta can hide a partial hit
+                # whose missing blocks were silently recomputed.
+                expected = expected_hit_blocks(ptoks, args.block_size)
+                verified, reason = judge_warm_rep(hit_delta, expected)
+            else:  # legacy gate: any growth counts
+                expected = None
+                verified = hit_delta > 0
+                reason = None if verified else "no-hits"
             r = {"ttft_ms": m["ttft_s"] * 1e3, "total_ms": m["total_s"] * 1e3,
-                 "hit_delta": hit_delta, "verified": verified,
-                 "prompt_tokens": int(usage.get("prompt_tokens", e["prompt_tokens"]))}
+                 "hit_delta": hit_delta, "verified": verified, "reason": reason,
+                 "expected_hit_blocks": expected, "prompt_tokens": ptoks}
             warm_res[(L, e["rep"])] = r
-            print(f"[warm] L={L} rep={e['rep']} tokens={r['prompt_tokens']} "
-                  f"ttft={r['ttft_ms']:.0f}ms hits+={hit_delta:.0f} verified={verified}",
+            print(f"[warm] L={L} rep={e['rep']} tokens={ptoks} "
+                  f"ttft={r['ttft_ms']:.0f}ms hits+={hit_delta:.0f} "
+                  f"expected={expected} verified={verified}"
+                  + (f" reason={reason}" if reason else ""),
                   flush=True)
+
+    # Path attribution: all loads happened in the warm pass just finished, so
+    # the engine log now names which connector path served them.
+    stamp = dict(stamp)
+    if getattr(args, "vllm_log", ""):
+        load_path = grep_load_path(args.vllm_log)
+        if load_path is not None:
+            stamp["connector"] = f"{stamp.get('connector', '')} path={load_path}".strip()
+            print(f"[measure] connector load path: {load_path} (stamped into the JSONL)",
+                  flush=True)
+        else:
+            print("[measure] WARN: no 'kvblockd load path:' line in "
+                  f"{args.vllm_log} — path unattributed", flush=True)
 
     # ---- pass 2: COLD — fresh nonce at token 0 -> guaranteed miss.
     cold_res = {}
@@ -411,11 +480,14 @@ def run_measure(args, stamp: dict) -> int:
         for rep in range(n_pairs):
             w, c = warm_res[(L, rep)], cold_res[(L, rep)]
             pairs.append({
+                "rep": rep,
                 "warmup": rep < warmup, "prompt_tokens": w["prompt_tokens"],
                 "cold_ttft_ms": c["ttft_ms"], "warm_ttft_ms": w["ttft_ms"],
                 "cold_total_ms": c["total_ms"], "warm_total_ms": w["total_ms"],
                 "kvb_hit_delta": w["hit_delta"], "kvb_miss_delta": c["miss_delta"],
+                "expected_hit_blocks": w["expected_hit_blocks"],
                 "warm_verified": w["verified"],
+                "warm_verify_reason": w["reason"],
             })
         used = [p for p in pairs if not p["warmup"]]
         colds = [p["cold_ttft_ms"] for p in used]
@@ -444,6 +516,14 @@ def run_measure(args, stamp: dict) -> int:
               "ttft_p95_ms": _p95(warms), "ttft_all_ms": [round(x, 3) for x in warms],
               "warm_hits_verified": verified,
               "kvb_hit_delta_total": sum(p["kvb_hit_delta"] for p in used),
+              "hit_gate_block_size": args.block_size,
+              # Per-rep attribution (warmup pairs included, flagged): the
+              # aggregate can hide which rep fell short and why.
+              "pairs": [{"rep": p["rep"], "warmup": p["warmup"],
+                         "hit_delta": p["kvb_hit_delta"],
+                         "expected_hit_blocks": p["expected_hit_blocks"],
+                         "verified": p["warm_verified"],
+                         "reason": p["warm_verify_reason"]} for p in pairs],
               "speedup_p50_vs_cold": (cold_p50 / warm_p50) if warm_p50 > 0 else None})
         summary.append((L, base["prefix_tokens"], cold_p50, warm_p50, verified))
     out.close()
@@ -455,8 +535,10 @@ def run_measure(args, stamp: dict) -> int:
         sp = f"{c / w:.2f}x" if w > 0 else "n/a"
         print(f"{target:>8} {ntok:>8} {c:>10.0f} {w:>10.0f} {sp:>8} {v}")
     if failures:
-        print(f"\nFAIL: {failures} length cell(s) had warm reps whose kvb_hits_total "
-              "did not grow — the warm arm is UNVERIFIED there (flagged in the JSONL).",
+        print(f"\nFAIL: {failures} length cell(s) had warm reps that failed the "
+              "hit-attribution gate (kvb_hits_total flat, or its delta did not match "
+              "the expected block count — partial hits included) — the warm arm is "
+              "UNVERIFIED there (per-rep reasons in the JSONL).",
               file=sys.stderr)
         return 3
     return 0
@@ -616,7 +698,8 @@ def selftest() -> int:
         d = dict(vllm=url, metrics=url, model="stub", gen_tokens=2,
                  request_timeout=15.0, print_prefix=PRINT_PREFIX,
                  put_wait_s=0.6, drain_s=0.1, drain_timeout_s=3.0, poll_s=0.05,
-                 lengths="96,160", reps=1, warmup=1, state="", out="")
+                 lengths="96,160", reps=1, warmup=1, state="", out="",
+                 block_size=0, vllm_log="")
         d.update(kw)
         return argparse.Namespace(**d)
 
@@ -706,6 +789,52 @@ def selftest() -> int:
             print(f"[selftest] no-hit measure: rc=3, {len(bad_warm)} warm records flagged "
                   "warm_hits_verified=false, kvb_hit_delta_total=0")
 
+        # 6c) hit-attribution gate (--block-size > 0): the stub credits EXACTLY
+        #     8 hits per completion; its L=96 prompts calibrate to 101 tokens
+        #     (deterministic: 12-hex nonce + fixed head), so
+        #     expected = ((101-1)//B*B)//B. B=12 -> expected 8 == delta 8:
+        #     verified. B=8 -> expected 12 > delta 8: a PARTIAL hit must be
+        #     UNVERIFIED (rc 3) with a distinct reason, never silently green.
+        ctl["on_completion"] = "store"
+        gate_state = os.path.join(tmp, "gate-state.json")
+        rc = run_populate(mkargs(lengths="96", state=gate_state))
+        if rc != 0:
+            print("FAIL: gate-case populate rc != 0", file=sys.stderr)
+            ok = False
+        ctl["on_completion"] = "hit"
+        out_gate = os.path.join(tmp, "gate.jsonl")
+        rc = run_measure(mkargs(lengths="96", state=gate_state, out=out_gate,
+                                block_size=12),
+                         {"model": "stub", "rig": "selftest"})
+        with open(out_gate) as f:
+            gate_warm = [r for r in map(json.loads, f) if r["arm"] == "warm"]
+        gw_pairs = gate_warm[0]["pairs"] if gate_warm else []
+        if rc != 0 or len(gate_warm) != 1 or not gate_warm[0]["warm_hits_verified"] \
+                or gate_warm[0]["hit_gate_block_size"] != 12 \
+                or any(p["expected_hit_blocks"] != 8 or p["hit_delta"] != 8
+                       or not p["verified"] or p["reason"] is not None for p in gw_pairs):
+            print(f"FAIL: exact-match gate: rc={rc} warm={gate_warm}", file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] hit gate (block_size=12): rc=0, expected==delta==8 per rep, verified")
+        out_part = os.path.join(tmp, "gate-partial.jsonl")
+        rc = run_measure(mkargs(lengths="96", state=gate_state, out=out_part,
+                                block_size=8),
+                         {"model": "stub", "rig": "selftest"})
+        with open(out_part) as f:
+            part_warm = [r for r in map(json.loads, f) if r["arm"] == "warm"]
+        pw_pairs = part_warm[0]["pairs"] if part_warm else []
+        if rc != 3 or len(part_warm) != 1 or part_warm[0]["warm_hits_verified"] \
+                or any(p["expected_hit_blocks"] != 12 or p["hit_delta"] != 8
+                       or p["verified"] or not (p["reason"] or "").startswith("partial-hit")
+                       for p in pw_pairs):
+            print(f"FAIL: partial-delta gate not flagged: rc={rc} warm={part_warm}",
+                  file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] hit gate (block_size=8): rc=3, partial delta (8 of 12) "
+                  "UNVERIFIED with reason 'partial-hit...'")
+
         # 6b) baseline phase: cold-only control, no daemon dependency — must
         #     produce one arm="baseline" record per length with NO
         #     verification fields (there is nothing to verify against), even
@@ -786,6 +915,17 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=5, help="measured rep pairs per length")
     ap.add_argument("--warmup", type=int, default=1, help="discarded warmup pairs per length")
     ap.add_argument("--gen-tokens", type=int, default=16)
+    ap.add_argument("--block-size", type=int, default=0,
+                    help="engine KV block size for the warm hit-attribution gate: "
+                         "when >0 a warm rep is verified only if kvb_hits_total grew "
+                         "by EXACTLY the expected block count "
+                         "(((prompt_tokens-1)//B*B)//B — the connector's alignment "
+                         "rule); 0 = legacy any-growth gate")
+    ap.add_argument("--vllm-log", default="",
+                    help="measure phase: engine log to grep for the connector's "
+                         "'kvblockd load path:' line; the path is appended to the "
+                         "connector stamp so the JSONL attributes which load path "
+                         "produced the numbers")
     ap.add_argument("--put-wait-s", type=float, default=120.0,
                     help="populate: max wait for kvblockd's put counters to grow per prompt")
     ap.add_argument("--drain-s", type=float, default=5.0,

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
+import threading
 
 import pytest
 
+from kvblockd import client as client_mod
 from kvblockd import protocol as p
-from kvblockd.client import Client
+from kvblockd.client import Client, _Conn
 from kvblockd.errors import ConnectionLost
 
 
@@ -115,6 +118,164 @@ def test_tiled_get_global_indices(client):
             assert vals[i] == present[i], f"index {i}: wrong bytes (tile collision?)"
         else:
             assert sts[i] == p.Status.NOT_FOUND, f"index {i} unexpectedly present"
+
+
+def test_rcvbuf_granted_exposed(client, daemon):
+    # Default: SO_RCVBUF is NOT set (autotuning preserved) but the effective
+    # buffer the kernel reports is still exposed — truth for the JSONL.
+    assert isinstance(client.granted_rcvbuf, int)
+    assert client.granted_rcvbuf > 0
+    # Opt-in: an explicit so_rcvbuf asks before connect and exposes what the
+    # kernel GRANTED (containers clamp silently; Linux doubles the ask).
+    c = Client(daemon["addr"], namespace=daemon["namespace"], token=daemon["token"],
+               streams=1, so_rcvbuf=1 << 20)
+    try:
+        assert isinstance(c.granted_rcvbuf, int)
+        assert c.granted_rcvbuf > 0
+    finally:
+        c.close()
+
+
+def test_shard_bounds_contiguous_cover():
+    for n, k in ((7, 4), (8, 4), (600, 4), (3, 4), (1, 1), (5, 2)):
+        bounds = Client._shard_bounds(n, min(k, n))
+        assert bounds[0][0] == 0 and bounds[-1][1] == n
+        for (_, e0), (s1, _) in itertools.pairwise(bounds):
+            assert e0 == s1  # contiguous, no gap/overlap
+        assert all(e > s for s, e in bounds)
+
+
+def test_scatter_fanout_stitches_key_order_and_global_idx(daemon):
+    # 4-way fan-out: statuses stitched back in key order across shards, and
+    # alloc sees a GLOBALLY unique index (the slab-slot safety contract).
+    c = Client(daemon["addr"], namespace=daemon["namespace"], token=daemon["token"], streams=4)
+    try:
+        n = 64
+        ks = [_key(f"fan{i}") for i in range(n)]
+        present = {i: bytes([i]) * (256 + i) for i in range(0, n, 3)}
+        for i, blob in present.items():
+            c.put(ks[i], blob)
+
+        seen_idx = []
+        lock = threading.Lock()
+        bodies = {}
+
+        def alloc(idx, prefix, body_len):
+            with lock:
+                seen_idx.append(idx)
+            buf = bytearray(body_len)
+            bodies[idx] = buf
+            return memoryview(buf)
+
+        sts = c.batch_get_scatter(ks, prefix_len=0, alloc=alloc)
+        assert len(sts) == n
+        for i in range(n):
+            if i in present:
+                assert sts[i] == p.Status.OK, f"index {i} missing"
+                assert bytes(bodies[i]) == present[i], f"index {i}: wrong bytes"
+            else:
+                assert sts[i] == p.Status.NOT_FOUND
+        assert len(seen_idx) == len(set(seen_idx)), "alloc saw a duplicate global idx"
+        assert set(seen_idx) == set(present), "alloc invoked for a non-OK descriptor"
+    finally:
+        c.close()
+
+
+def test_shard_connection_failure_yields_misses_for_that_shard_only(daemon, monkeypatch):
+    # Kill exactly ONE shard's drain: its keys become misses; every other
+    # shard's blocks stay valid and correctly stitched.
+    c = Client(daemon["addr"], namespace=daemon["namespace"], token=daemon["token"], streams=4)
+    try:
+        n = 8
+        ks = [_key(f"die{i}") for i in range(n)]
+        blobs = {i: bytes([0xA0 + i]) * 512 for i in range(n)}
+        for i, blob in blobs.items():
+            c.put(ks[i], blob)
+
+        bounds = Client._shard_bounds(n, 4)
+        dead_base = bounds[1][0]  # second shard
+        orig = _Conn.batch_get_scatter
+
+        def flaky(self, keys, prefix_len, alloc, idx_base=0):
+            if idx_base == dead_base:
+                raise ConnectionLost("injected shard death")
+            return orig(self, keys, prefix_len, alloc, idx_base)
+
+        monkeypatch.setattr(client_mod._Conn, "batch_get_scatter", flaky)
+        bodies = {}
+
+        def alloc(idx, prefix, body_len):
+            buf = bytearray(body_len)
+            bodies[idx] = buf
+            return memoryview(buf)
+
+        sts = c.batch_get_scatter(ks, prefix_len=0, alloc=alloc)
+        dead = set(range(*bounds[1]))
+        for i in range(n):
+            if i in dead:
+                assert sts[i] == p.Status.NOT_FOUND, f"dead-shard key {i} not a miss"
+            else:
+                assert sts[i] == p.Status.OK, f"live-shard key {i} lost"
+                assert bytes(bodies[i]) == blobs[i], f"live-shard key {i}: wrong bytes"
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("verify", [True, False], ids=["verify-on", "verify-off"])
+def test_streams1_mixed_sizes_scatter_then_stream_stays_in_sync(daemon, verify):
+    """streams=1: ONE connection drains a single batch_get_scatter whose OK
+    blocks span every size class around the 32B prefix boundary — dlen < 32
+    (prefix-only, empty body), dlen == 31/32/33 (the exact boundary), mid
+    (1000), large (100000) and a ZERO-length blob — interleaved with misses.
+    Statuses, prefix bytes and body bytes must all be exact, misses must never
+    invoke alloc, and a follow-up verb on the SAME connection must work (the
+    drain left no unread payload on the stream). Run under verify on AND off:
+    the xxh3 digest path consumes the same bytes a digest-less drain must.
+
+    Multi-frame (F_MORE) NOTE: the python client hard-codes its HELLO
+    proposal to (0, 0) — it cannot negotiate a smaller max_frame_len from the
+    client side, and the protocol floor is 16 MiB anyway, so this batch
+    (~101KB) always arrives in one frame; multi-frame reassembly is covered
+    by the Go wire tests, not forcible here."""
+    c = Client(daemon["addr"], namespace=daemon["namespace"], token=daemon["token"],
+               streams=1, verify=verify)
+    try:
+        sizes = [5, 31, 32, 33, 1000, 100000, 0]
+        keys, blobs = [], {}
+        for i, sz in enumerate(sizes):
+            k = _key(f"mix-{verify}-{i}")
+            blob = bytes((i * 37 + j) % 256 for j in range(sz))
+            assert c.put(k, blob) in (p.Status.OK, p.Status.OK_EXISTS)
+            blobs[len(keys)] = blob
+            keys.append(k)
+            keys.append(_key(f"mix-miss-{verify}-{i}"))  # interleaved miss
+
+        prefixes, bodies = {}, {}
+
+        def alloc(idx, pfx, body_len):
+            prefixes[idx] = pfx
+            buf = bytearray(body_len)
+            bodies[idx] = buf
+            return memoryview(buf)
+
+        sts = c.batch_get_scatter(keys, prefix_len=32, alloc=alloc)
+        assert len(sts) == len(keys)
+        for idx in range(len(keys)):
+            if idx in blobs:
+                blob = blobs[idx]
+                assert sts[idx] == p.Status.OK, f"idx {idx} (len {len(blob)}) missing"
+                assert prefixes[idx] == blob[:32], f"idx {idx}: prefix bytes wrong"
+                assert bytes(bodies[idx]) == blob[32:], f"idx {idx}: body bytes wrong"
+            else:
+                assert sts[idx] == p.Status.NOT_FOUND
+                assert idx not in prefixes, f"alloc invoked for miss idx {idx}"
+        # Stream sync: the same (single) conn must serve the next verb cleanly.
+        n, _ = c.batch_exists(keys[:2])
+        assert n == 1  # keys[0] present, keys[1] is the interleaved miss
+        vals, sts2 = c.batch_get_bytes([keys[0]])
+        assert sts2[0] == p.Status.OK and vals[0] == blobs[0]
+    finally:
+        c.close()
 
 
 def test_pool_survives_verb_after_status_error(client):
