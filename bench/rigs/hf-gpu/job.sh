@@ -140,6 +140,12 @@ fi
 log "git_sha stamp: $GIT_SHA"
 
 # ---- 1. knob coherence: LENGTHS drives max-model-len AND the arena ----------
+# FP8_PREFLIGHT probes the daemon's counters; BASELINE_ONLY runs with no
+# daemon at all. Together they used to silently drop the preflight and run a
+# baseline — a paid job doing something other than what was asked. Refuse.
+if [[ -n "$FP8_PREFLIGHT" && "$BASELINE_ONLY" == "1" ]]; then
+  die "FP8_PREFLIGHT and BASELINE_ONLY=1 are mutually exclusive: the baseline control runs no daemon/connector, so there is nothing for the probe to witness — submit them as two separate jobs"
+fi
 SUM_TOKENS=0
 MAX_LEN=0
 IFS=',' read -ra _LENS <<< "$LENGTHS"
@@ -410,7 +416,7 @@ stop_vllm() {
 # PASS additionally requires the READ path: a second identical prompt must
 # grow kvb_hits_total. This is a probe job — it exits before any measurement
 # (probe blobs would sit unbudgeted in the arena of a real run).
-if [[ -n "$FP8_PREFLIGHT" && "$BASELINE_ONLY" != "1" ]]; then
+if [[ -n "$FP8_PREFLIGHT" ]]; then   # BASELINE_ONLY conflict already refused in §1
   DTYPES="$FP8_PREFLIGHT"
   [[ "$DTYPES" == "1" ]] && DTYPES="fp8"
   read -r BF16_BLOB FP8_BLOB <<< "$(python3 - "$MODEL" <<'PY'

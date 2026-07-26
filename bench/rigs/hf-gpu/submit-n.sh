@@ -10,7 +10,8 @@
 #
 # All submit.sh knobs (MODEL, LENGTHS, REPS, GIT_REF, BASELINE_ONLY, ...) pass
 # through the environment unchanged. One confirmation covers the whole batch;
-# each underlying submit.sh call then runs with ASSUME_YES=1.
+# each underlying submit.sh call then runs with KVB_SUBMIT_N_CONFIRMED=1 (set
+# per invocation right here, never exported — submit.sh explains the name).
 #
 # Companion fetch loop — after the jobs finish, pull each job's CHART2JSONL
 # lines into per-run results files:
@@ -43,7 +44,15 @@ if [[ "${1:-}" == "fetch" ]]; then
     # Same extraction as submit.sh advertises: the sed requires a '{' after
     # the marker (drops hint lines); job.sh already renames selftest stub
     # records to SELFTESTJSONL so they can never land here.
-    "$HF_BIN" jobs logs "$id" | sed -n 's/^.*CHART2JSONL \({.*\)$/\1/p' > "$out"
+    # A failed `hf logs` (expired job, network blip) must not abort the loop
+    # under set -e/pipefail — warn, mark the batch incomplete, fetch the rest.
+    if ! "$HF_BIN" jobs logs "$id" | sed -n 's/^.*CHART2JSONL \({.*\)$/\1/p' > "$out"; then
+      echo "  WARN: 'hf jobs logs $id' failed — run $i not fetched" \
+           "($HF_BIN jobs inspect $id); continuing with the remaining jobs" >&2
+      rm -f "$out"
+      empty=1
+      continue
+    fi
     n="$(wc -l < "$out" | tr -d ' ')"
     echo "run $i: job $id -> $out ($n records)"
     if [[ "$n" == "0" ]]; then
@@ -80,7 +89,7 @@ read -r -p "Submit all $N and start billing? [y/N] " ans
 ids=()
 for i in $(seq 1 "$N"); do
   echo "== submitting run $i/$N (${TAG}-run${i}) =="
-  out="$(JOB_NAME="${TAG}-run${i}" ASSUME_YES=1 "$HERE/submit.sh")"
+  out="$(JOB_NAME="${TAG}-run${i}" KVB_SUBMIT_N_CONFIRMED=1 "$HERE/submit.sh")"
   printf '%s\n' "$out"
   id="$(printf '%s\n' "$out" | sed -n 's/^submitted: //p' | tail -n1)"
   [[ -n "$id" ]] || { echo "FATAL: could not parse job id from submit.sh output" >&2; exit 1; }
