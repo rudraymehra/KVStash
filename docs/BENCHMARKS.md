@@ -162,9 +162,10 @@ emulated link) stays OPEN until the AWS rig runs.
 Same harness, same gates, KV-lighter model (56 KiB/token GQA-4) at its
 NATIVE 32k context — no rope scaling, no config overrides. Raw JSONL:
 `bench/results/rig-e/chart2-ttft-qwen32k{,-baseline}.jsonl`; chart:
-`chart2-qwen32k.png`. Every warm rep passed the exact-count gate
-(1024/1024 and 2000/2000 blocks) and every record is path-stamped
-`chunked-slab`.
+`chart2-qwen32k.png`. Every warm rep passed the exact-count gate — 1024
+blocks per rep @16k, 1999–2000 per rep @32k (per-prompt calibration lands
+within a token, so reps differ by one block; the gate is exact against each
+rep's own measured count) — and every record is path-stamped `chunked-slab`.
 
 | prefix | recompute (no connector) | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
 |---|---|---|---|---|---|
@@ -195,8 +196,9 @@ single-hit-rate number here should be read as a deployment recommendation.
 The `bench/e2e/economics.py` model dollarizes the crossover ($/GB moved vs
 $/GPU-sec saved per hit, same-AZ vs cross-AZ) and now derives its measured
 sections from these tables' committed medians (`bench/results/rig-e/`):
-4.49/4.27/10.29 GPU-s saved per hit (Llama@16k, Qwen@16k, Qwen@32k; quote
-the floored figures), the measured ~46% sync-store break-even, and the
+**4.4/4.2/10.2 GPU-s saved per hit** (Llama@16k, Qwen@16k, Qwen@32k —
+floored from the raw 4.49/4.27/10.29, never rounded up; the floored column
+is the quotable one), the measured ~46% sync-store break-even, and the
 PROJECTED few-percent write-behind break-even as an explicitly separate
 mode.
 

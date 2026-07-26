@@ -28,6 +28,16 @@ iperf3 on the same pair, then the store measured over the same link:
 `bench/kvbench` (GET-only, batch 32, closed-loop, warmed, best stream count,
 median of 3). Numbers and stream curves: [bench/BENCHMARKS.md](../bench/BENCHMARKS.md).
 
+**Committed artifacts, stated exactly.** What is reproducible from this repo
+today is the 50 GbE Chart-1 session: `bench/results/rig-t/*.jsonl` renders
+via `bench/report/plot.py chart1` to 6.22–6.23 GB/s at 100% of that pair's
+measured 6.225 GB/s iperf3 ceiling, verify ON. The **12.67 GB/s / ~102%
+100 GbE figure is currently table-only** (bench/BENCHMARKS.md records the
+session and its stream curve, but its per-run JSONL is not committed), and
+the 6.37 GB/s transport-gate 50 GbE figure is table-only the same way. Until
+that JSONL lands, the 100 GbE number's independent check is re-running the
+published rig commands, not rendering a committed artifact.
+
 **Definitions.** "GB/s" is decimal, payload-only goodput (headers and
 protocol framing excluded). "% of ceiling" divides by the measured iperf3
 number on the same pair minutes earlier, never a datasheet figure.
@@ -42,8 +52,11 @@ never quoted as this claim.
 **This claim is false if** re-running the pair (same instance types, same
 placement, iperf3 first) shows kvblockd GET goodput below ~95% of that
 pair's iperf3 ceiling with verify ON at the published stream counts, or if
-the committed JSONL in `bench/results/rig-t/` does not reproduce the chart
-via `bench/report/plot.py chart1`.
+the committed 50 GbE JSONL in `bench/results/rig-t/` stops reproducing
+6.22–6.23 GB/s ≈ 100% of its recorded ceiling via
+`bench/report/plot.py chart1`. Note the asymmetry honestly: the 100 GbE
+half of this claim has no committed JSONL yet, so only the re-run — not an
+artifact render — can currently falsify or confirm it.
 
 ---
 
@@ -112,8 +125,10 @@ Llama-3.1-8B. That is the same physics every vendor's 100k-context headline
 runs on — stated with the formula, not hidden behind it.
 
 **Disclosed.** Loopback and single-run, exactly as claim 2. Every warm rep
-passed the exact-count hit gate (1024/1024 and 2000/2000 blocks) and every
-record is path-stamped `chunked-slab`.
+passed the exact-count hit gate — 1024 blocks per rep @16k and 1999–2000
+per rep @32k (per-prompt calibration lands within a token, so reps differ
+by one block; the gate is exact against each rep's own measured count, never
+a nominal target) — and every record is path-stamped `chunked-slab`.
 
 **This claim is false if** any condition in claim 2's falsification line
 holds for these files, or if the model config used differs from the stock HF
