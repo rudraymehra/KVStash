@@ -37,6 +37,12 @@
 #                                 populate->restart->measure flow, driven by
 #                                 bench/rigs/hf-gpu/run_ttft.py itself — the
 #                                 free gate before any paid GPU submission
+#   bench/e2e/cpu/local-docker.sh equivalence     # output-equivalence suite
+#                                 (bench/e2e/equivalence.py): greedy-decode a
+#                                 prompt set on a fresh engine, RESTART, replay
+#                                 the exact prompts warm from kvblockd — every
+#                                 token sequence must match, incl. prompts at
+#                                 block-boundary lengths (kB-1 / kB / kB+1)
 #   KVB_E2E_KEEP=1 ... to keep the container around for debugging.
 #
 # Requires: Docker with >= 3.5 GiB VM memory, Go toolchain, network (first run
@@ -125,13 +131,13 @@ python3 -c "import json; [json.load(open(f)) for f in (\"/work/kv_transfer_nativ
 # ---- 3. python stack (image already has the CPU vllm + torch) ---------------
 echo "[local-docker] installing python packages (mode $MODE)"
 case "$MODE" in
-  native|ttft-rehearsal)
+  native|ttft-rehearsal|equivalence)
     docker exec "$CTR" bash -c 'pip install -q /repo/python/kvblockd /repo/python/vllm_kvblockd' ;;
   lmcache-probe)
     # lmcache has no aarch64 wheel: sdist build (NO_GPU_EXT skips CUDA ext).
     docker exec "$CTR" bash -c "NO_GPU_EXT=1 pip install -q 'lmcache==$LMCACHE_VERSION' \
       && pip install -q /repo/python/kvblockd /repo/python/lmcache_kvblockd" ;;
-  *) echo "usage: $0 [native|lmcache-probe|ttft-rehearsal]" >&2; exit 2 ;;
+  *) echo "usage: $0 [native|lmcache-probe|ttft-rehearsal|equivalence]" >&2; exit 2 ;;
 esac
 docker exec "$CTR" bash -c 'python3 -c "import vllm; assert vllm.__version__ == \"'"$VLLM_VERSION"'\", vllm.__version__; print(\"vllm\", vllm.__version__, \"OK\")"'
 
@@ -234,6 +240,39 @@ if [[ "$MODE" == "ttft-rehearsal" ]]; then
     --stamp gpu=cpu-rehearsal-not-a-benchmark --stamp rig=local-docker \
     --stamp connector=vllm_kvblockd-native --stamp tc_link=loopback"
   echo "[local-docker] PASS (ttft-rehearsal): populate->restart->measure held on the native connector"
+  exit 0
+fi
+
+if [[ "$MODE" == "equivalence" ]]; then
+  # ---- output-equivalence, end to end and FREE (bench/e2e/equivalence.py) ---
+  # record (fresh engine, greedy, per-prompt store receipt) -> engine RESTART
+  # -> compare (exact prompts, warm from kvblockd, per-prompt block-exact hit
+  # attribution, token-sequence equality gated at 100%). vLLM-on-CPU uses
+  # 128-token KV blocks, so the boundary trios sit at 255/256/257 and
+  # 383/384/385 tokens (the connector stores only the complete blocks of the
+  # first n-1 tokens — these straddle the store/recompute edge); 320,512 are
+  # the plain mid-block cells. Greedy decode: temperature=0, seed pinned by
+  # the driver, --max-num-seqs 1 in serve() — determinism is the premise, so
+  # any token mismatch is a store-path finding, not sampling noise.
+  docker exec "$CTR" bash -c 'cd /repo && python3 bench/e2e/equivalence.py --selftest'
+  echo "[local-docker] equivalence phase 1: record (fresh engine, connector on)"
+  serve /work/kv_transfer_native.json /work/vllm-equiv1.log --no-enable-prefix-caching
+  docker exec "$CTR" bash -c "cd /repo && python3 bench/e2e/equivalence.py --phase record \
+    --vllm http://127.0.0.1:18000 --metrics http://127.0.0.1:9442 \
+    --model \"$MODEL\" --n 20 --gen-tokens 16 --seed 0 \
+    --block-size 128 --boundary-multiples 2,3 --lengths 320,512 \
+    --state /work/equiv-state.json --put-wait-s 60"
+  echo "[local-docker] equivalence restart: fresh engine, kvblockd keeps the blocks"
+  stop_vllm
+  serve /work/kv_transfer_native.json /work/vllm-equiv2.log --no-enable-prefix-caching
+  echo "[local-docker] equivalence phase 2: compare (warm replay must be token-identical)"
+  docker exec "$CTR" bash -c "cd /repo && python3 bench/e2e/equivalence.py --phase compare \
+    --vllm http://127.0.0.1:18000 --metrics http://127.0.0.1:9442 \
+    --model \"$MODEL\" --min-match 100 \
+    --state /work/equiv-state.json --out /work/equivalence.jsonl \
+    --stamp rig=local-docker --stamp connector=vllm_kvblockd-native \
+    --stamp tc_link=loopback"
+  echo "[local-docker] PASS (equivalence): warm kvblockd reload is token-identical to recompute"
   exit 0
 fi
 
