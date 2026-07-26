@@ -37,6 +37,14 @@ shards, flags the unfilled block ids, and degrades to recompute) — and then
 the dial breaker answers everything instantly for _REDIAL_BACKOFF_S. The
 engine never fails and never waits unboundedly; chaos-tested in
 tests/test_chaos.py (kill -9 / SIGSTOP mid-run, daemon down at boot).
+
+KNOWN COST, by design: a slow-but-ACCEPTING daemon never errors, so it never
+arms the dial breaker — EVERY load against it pays up to the full
+kvblockd_load_deadline_s before degrading to recompute, load after load,
+until an operator intervenes. The guarantee is bounded-per-load, not
+bounded-per-outage: distinguishing "slow store, still worth asking" from
+"slow store, stop asking" needs a latency-based breaker policy this wave
+deliberately does not have.
 """
 
 from __future__ import annotations
@@ -795,7 +803,11 @@ class KvblockdConnector(_Base):
                 return
             dev = self._layer_kv[names[0]].device
             if not self._slab_path_ok(dev):
-                return  # CPU backend: the slab never pays here
+                # CPU backend: the slab never pays here — and the paged
+                # tensors' device never changes mid-run, so LATCH instead of
+                # re-walking the layer map on every single capture.
+                self._prewarm_done = True
+                return
             self._prewarm_done = True  # one attempt per connector lifetime
             want = min(self._staging_bytes, self._cfg.prewarm_bytes)
             if want <= 0:

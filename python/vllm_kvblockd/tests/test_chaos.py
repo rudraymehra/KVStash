@@ -206,5 +206,18 @@ def test_daemon_down_at_boot_serves_pure_recompute():
     assert conn.get_block_ids_with_load_errors() == {0, 1}
     for name, t in kv.items():
         conn.save_kv_layer(name, t, None)
+    # Re-bind a STORE-range meta: promised_load_step cleared the connector
+    # metadata, and wait_for_save with none bound is a silent no-op — this
+    # leg was vacuous (the store path never ran). Bind a step that stores
+    # both blocks so staging + the background put failure actually execute.
+    meta = conn.build_connector_meta(
+        StubSchedulerOutput([StubNewReq(req, [0, 1])],
+                            {req.request_id: len(req.prompt_token_ids)})
+    )
+    assert meta.requests and meta.requests[0].store_end_block > \
+        meta.requests[0].store_start_block  # the step really promises a store
+    conn.bind_connector_metadata(meta)
     conn.wait_for_save()  # store path: enqueue + background failure, no raise
+    assert conn._store_thread is not None  # the drain really woke up
+    conn.clear_connector_metadata()
     conn.shutdown()
