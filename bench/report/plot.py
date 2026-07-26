@@ -157,13 +157,16 @@ def chart1(recs, out):
 
 def _conditions(recs):
     """Conditions box read FROM the JSONL (never hardcoded — review rule).
-    Rigs stamp gpu/model/vllm/connector (or lmcache)/tc_link into each record."""
+    Rigs stamp gpu/model/vllm/connector (or lmcache)/kv_cache_dtype/tc_link
+    into each record."""
     cond = {}
     for r in recs:
-        for k in ("gpu", "model", "vllm", "connector", "lmcache", "tc_link"):
+        for k in ("gpu", "model", "vllm", "connector", "lmcache",
+                  "kv_cache_dtype", "tc_link"):
             if r.get(k):
                 cond.setdefault(k, r[k])
-    box = ", ".join(f"{cond[k]}" for k in ("gpu", "model", "vllm", "connector", "lmcache")
+    box = ", ".join(f"{cond[k]}" for k in ("gpu", "model", "vllm", "connector",
+                                           "lmcache", "kv_cache_dtype")
                     if k in cond)
     return box, cond.get("tc_link", "link undisclosed")
 
@@ -176,6 +179,18 @@ def chart2_ttft(recs, out):
     # (methodology rule 7: submit-n.sh, one file per engine boot) collapse to
     # their median with min/max whiskers, and the per-cell run count is
     # annotated so a single-run chart can never read as a medianed one.
+    #
+    # DISCLOSURE RULE (hard, fp8 spec): an fp8 warm arm may never be charted
+    # against a bf16 cold arm — job.sh stamps kv_cache_dtype into every record
+    # (records predating the stamp are the auto-bf16 era), so a mixed-dtype
+    # input is detectable here and the render REFUSES rather than disclosing
+    # in a footnote.
+    dtypes = {r.get("kv_cache_dtype", "auto-bf16") for r in recs
+              if r.get("arm") in ("cold", "warm", "baseline")}
+    if len(dtypes) > 1:
+        sys.exit(f"refusing to render: input records mix engine KV dtypes {sorted(dtypes)} "
+                 "— both arms of any charted pair must run the same kv-cache dtype "
+                 "(fp8 disclosure rule; split the inputs per dtype)")
     cells = {}
     for r in recs:
         x = r.get("target_prefix_tokens") or r.get("prefix_tokens")

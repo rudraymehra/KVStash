@@ -65,6 +65,20 @@ KV_BYTES_PER_TOKEN="${KV_BYTES_PER_TOKEN:-131072}"  # bf16 KV/token upper bound 
                                               # Llama-3.1-8B measured 128KiB/token; Qwen2.5-7B is 56KiB.
                                               # The native connector's blob = the raw paged block + 32B
                                               # prefix, so the same per-token bound holds.
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"          # optional --kv-cache-dtype for vLLM (fp8 / fp8_e4m3 /
+                                              # fp8_e5m2; empty = vLLM's auto -> bf16 KV here).
+                                              # DISCLOSURE RULE (hard): an fp8 warm arm may never be
+                                              # charted against a bf16 cold arm — one env var feeds
+                                              # BOTH phases of a run, every JSONL record is stamped
+                                              # kv_cache_dtype=..., and plot.py refuses to render a
+                                              # chart that mixes dtypes. When set, the operator must
+                                              # pass a matching KV_BYTES_PER_TOKEN (fp8 halves it) —
+                                              # WARN below if it still looks like the bf16 default.
+FP8_PREFLIGHT="${FP8_PREFLIGHT:-}"            # comma list of kv-cache dtypes to PROBE ("1" = fp8):
+                                              # per dtype, boot the engine with the flag, one ~1k-token
+                                              # prefill, verdict from kvblockd's OWN counters
+                                              # (FP8PROBE dtype=... verdict=... lines), then EXIT.
+                                              # A probe job, never a measured run.
 KVBD_ARENA_BYTES="${KVBD_ARENA_BYTES:-}"      # empty -> derived from LENGTHS x pairs x KV_BYTES_PER_TOKEN
 KVBD_STREAMS="${KVBD_STREAMS:-4}"
 KVBD_VERIFY="${KVBD_VERIFY:-1}"               # 1 (default) = xxh3-verify every loaded block.
@@ -144,6 +158,13 @@ if [[ -z "$MAX_MODEL_LEN" ]]; then
   log "derived MAX_MODEL_LEN=$MAX_MODEL_LEN (max length $MAX_LEN + $GEN_TOKENS gen + 384 headroom)"
 elif (( MAX_MODEL_LEN < NEED_LEN )); then
   die "MAX_MODEL_LEN=$MAX_MODEL_LEN cannot fit the sweep: need >= $NEED_LEN (max LENGTHS $MAX_LEN + GEN_TOKENS $GEN_TOKENS + 384 headroom). Shrink LENGTHS or raise MAX_MODEL_LEN — run 3's 32000-vs-20480 mismatch must not recur silently."
+fi
+
+# fp8 halves the KV bytes/token; an unchanged bf16 default silently doubles
+# the derived arena (harmless) and falsifies any per-byte arithmetic quoted
+# off this run. Loud WARN, not a die: the operator may have sized explicitly.
+if [[ "$KV_CACHE_DTYPE" == fp8* && "$KV_BYTES_PER_TOKEN" == "131072" ]]; then
+  log "WARN: KV_CACHE_DTYPE=$KV_CACHE_DTYPE but KV_BYTES_PER_TOKEN is still the bf16 default (131072). fp8 KV is half that — pass the fp8 figure (65536 for the Llama-8B class, 28672 for Qwen2.5-7B) or the arena/fit math and any per-byte numbers quoted from this run are ~2x off."
 fi
 
 PAIRS=$((REPS + WARMUP))
@@ -297,8 +318,12 @@ start_vllm() {  # $1 = log file, $2 = health timeout seconds
   # phases (hf_overrides=), so a chart can never hide it.
   HF_OVR_ARGS=()
   if [[ -n "${HF_OVERRIDES:-}" ]]; then HF_OVR_ARGS=(--hf-overrides "$HF_OVERRIDES"); fi
+  # ${KV_CACHE_DTYPE:+...}: the flag only exists when the knob is set; both
+  # engine boots of a run read the same env var, so the two arms of a charted
+  # pair can never disagree on KV dtype (the stamp makes it checkable).
   PYTHONHASHSEED=0 \
   vllm serve "$MODEL" --port "$VLLM_PORT" --dtype bfloat16 \
+    ${KV_CACHE_DTYPE:+--kv-cache-dtype "$KV_CACHE_DTYPE"} \
     --max-model-len "$MAX_MODEL_LEN" --max-num-seqs 1 \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --no-enable-prefix-caching \
@@ -321,6 +346,9 @@ start_vllm() {  # $1 = log file, $2 = health timeout seconds
       "$VLLM_LOG" | tail -40 >&2 || true
     log "last 250 lines of $VLLM_LOG:"
     tail -250 "$VLLM_LOG" >&2
+    # PROBE_MODE=1 (FP8 preflight): a refused boot is a PROBE VERDICT, not a
+    # job failure — soft-fail so the caller can classify it.
+    if [[ "${PROBE_MODE:-0}" == "1" ]]; then return 1; fi
     exit 1
   fi
   # FAST-FAIL GATE. The native path has no LMCache-style "healthy but
@@ -340,6 +368,7 @@ start_vllm() {  # $1 = log file, $2 = health timeout seconds
     # here would contaminate the pure-recompute control with store costs.
     if grep -q "Creating v1 connector" "$VLLM_LOG"; then
       log "FATAL: baseline engine constructed a KV connector — the control is contaminated"
+      if [[ "${PROBE_MODE:-0}" == "1" ]]; then return 1; fi
       exit 1
     fi
     log "baseline engine confirmed connector-free"
@@ -349,6 +378,7 @@ start_vllm() {  # $1 = log file, $2 = health timeout seconds
     log "FATAL: vLLM is healthy but the connector factory never constructed KvblockdConnector — the kv-transfer config was dropped or ignored and the engine is serving with no KV connector"
     log "connector/config lines from $VLLM_LOG:"
     grep -inE "kv_transfer|kv_connector|KVConnector|connector" "$VLLM_LOG" | tail -30 >&2 || true
+    if [[ "${PROBE_MODE:-0}" == "1" ]]; then return 1; fi
     exit 1
   fi
   log "native connector confirmed: $(grep -m1 'Creating v1 connector with name: KvblockdConnector' "$VLLM_LOG")"
@@ -367,6 +397,134 @@ stop_vllm() {
   VLLM_PID=""
 }
 
+# ---- 8a. FP8 PREFLIGHT: probe --kv-cache-dtype support, verdicts, then EXIT --
+# Whether fp8 KV actually reaches kvblockd cannot be inferred from a healthy
+# boot: the engine may accept the flag and the connector may still serialize
+# bf16 (SILENT-FALLBACK), refuse the torch dtype at save time
+# (CONNECTOR-DTYPE-UNMAPPED: BlobError "unsupported dtype", connector.py's
+# pinned DTYPE_CODES table), or store nothing. The only trustworthy witness is
+# kvblockd's own counters: bytes-in per committed block == the blob size, and
+# the analytic blob is computed from the model's HF config, never hardcoded
+# (blob = 2(K+V) x layers x kv_heads x head_dim x dtype_bytes x 16-token block
+# + the connector's 32B prefix; Qwen2.5-7B: bf16 917,536 B, fp8 458,784 B).
+# PASS additionally requires the READ path: a second identical prompt must
+# grow kvb_hits_total. This is a probe job — it exits before any measurement
+# (probe blobs would sit unbudgeted in the arena of a real run).
+if [[ -n "$FP8_PREFLIGHT" && "$BASELINE_ONLY" != "1" ]]; then
+  DTYPES="$FP8_PREFLIGHT"
+  [[ "$DTYPES" == "1" ]] && DTYPES="fp8"
+  read -r BF16_BLOB FP8_BLOB <<< "$(python3 - "$MODEL" <<'PY'
+import sys
+
+from transformers import AutoConfig
+
+cfg = AutoConfig.from_pretrained(sys.argv[1])
+layers = cfg.num_hidden_layers
+kvh = getattr(cfg, "num_key_value_heads", None) or cfg.num_attention_heads
+hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+per_block = 2 * layers * kvh * hd * 16   # K+V elements in one 16-token block
+print(per_block * 2 + 32, per_block * 1 + 32)  # bf16 blob, fp8 blob (+32B prefix)
+PY
+)"
+  [[ "$BF16_BLOB" =~ ^[0-9]+$ && "$FP8_BLOB" =~ ^[0-9]+$ ]] \
+    || die "FP8 preflight: could not compute analytic blob sizes from the HF config"
+  log "FP8 preflight: dtypes [$DTYPES]; analytic blob bytes bf16=$BF16_BLOB fp8=$FP8_BLOB (16-token block + 32B prefix, from the HF config)"
+
+  probe_counters() {  # echoes "put_bytes blocks hits" (same fields run_ttft gates on)
+    curl -fsS "http://$KVBD_METRICS/metrics" | awk '
+      /^kvb_bytes_total\{[^}]*dir="in"/ {pb += $NF}
+      /^kvb_blocks/                     {bl += $NF}
+      /^kvb_hits_total/                 {h  += $NF}
+      END {printf "%.0f %.0f %.0f\n", pb + 0, bl + 0, h + 0}'
+  }
+  blob_within_2pct() {  # $1=measured $2=expected
+    awk -v b="$1" -v e="$2" 'BEGIN {d = b - e; if (d < 0) d = -d; exit !(d <= e * 0.02)}'
+  }
+
+  PROBE_FAIL=0
+  _SAVED_KV_DTYPE="$KV_CACHE_DTYPE"
+  PROBE_MODE=1
+  IFS=',' read -ra _PROBE_DTS <<< "$DTYPES"
+  for d in "${_PROBE_DTS[@]}"; do
+    d="${d//[[:space:]]/}"
+    [[ -n "$d" ]] || continue
+    verdict="" blob=0
+    KV_CACHE_DTYPE="$d"
+    plog="$WORK/vllm-probe-${d//[^A-Za-z0-9]/_}.log"
+    if ! start_vllm "$plog" 2400; then
+      if grep -qi "unsupported dtype" "$plog"; then
+        verdict=CONNECTOR-DTYPE-UNMAPPED
+      else
+        verdict=ENGINE-REFUSED
+      fi
+    else
+      # ~1k-token prefill via curl. The nonce carries the dtype: a prompt
+      # reused across dtype probes would EXISTS-hit the other dtype's blob
+      # and muddy both verdicts.
+      python3 - "$MODEL" "$d" > "$WORK/fp8probe-req.json" <<'PY'
+import json
+import sys
+import time
+
+prompt = (f"kvstash-fp8probe {sys.argv[2]} {int(time.time())} :: "
+          + "The quick brown fox jumps over the lazy dog. " * 110)
+print(json.dumps({"model": sys.argv[1], "prompt": prompt, "max_tokens": 1,
+                  "temperature": 0.0}))
+PY
+      read -r pb0 bl0 h0 <<< "$(probe_counters)"
+      curl -fsS -m 300 -H 'Content-Type: application/json' \
+        -d @"$WORK/fp8probe-req.json" -o /dev/null \
+        "http://127.0.0.1:$VLLM_PORT/v1/completions" \
+        || log "FP8 probe: prefill request failed (dtype=$d) — verdict from the counters"
+      pb1=$pb0 bl1=$bl0 h1=$h0
+      for _ in $(seq 1 60); do
+        read -r pb1 bl1 h1 <<< "$(probe_counters)"
+        (( pb1 > pb0 && bl1 > bl0 )) && break
+        sleep 1
+      done
+      if (( pb1 <= pb0 || bl1 <= bl0 )); then
+        if grep -qi "unsupported dtype" "$plog"; then
+          verdict=CONNECTOR-DTYPE-UNMAPPED   # engine booted; connector refused at save
+        else
+          verdict=NO-BYTES
+        fi
+      else
+        blob=$(( (pb1 - pb0) / (bl1 - bl0) ))
+        if blob_within_2pct "$blob" "$BF16_BLOB"; then
+          verdict=SILENT-FALLBACK            # flag accepted, bytes still bf16-sized
+        elif blob_within_2pct "$blob" "$FP8_BLOB"; then
+          # write path is fp8-sized; PASS still needs the read path — the
+          # SECOND identical prompt must grow kvblockd's hit counter.
+          curl -fsS -m 300 -H 'Content-Type: application/json' \
+            -d @"$WORK/fp8probe-req.json" -o /dev/null \
+            "http://127.0.0.1:$VLLM_PORT/v1/completions" || true
+          h2=$h1
+          for _ in $(seq 1 30); do
+            read -r _ _ h2 <<< "$(probe_counters)"
+            (( h2 > h1 )) && break
+            sleep 1
+          done
+          if (( h2 > h1 )); then
+            verdict=PASS
+          else
+            verdict=FP8-STORED-NO-HITS       # stored fp8-sized blobs, reload never hit
+          fi
+        else
+          verdict=UNEXPECTED-BLOB-SIZE       # neither analytic size: investigate before use
+        fi
+      fi
+    fi
+    stop_vllm
+    log "FP8 probe detail: dtype=$d blob_bytes=$blob expected_bf16=$BF16_BLOB expected_fp8=$FP8_BLOB engine_log=$plog"
+    echo "FP8PROBE dtype=$d verdict=$verdict"
+    [[ "$verdict" == "PASS" ]] || PROBE_FAIL=4
+  done
+  KV_CACHE_DTYPE="$_SAVED_KV_DTYPE"
+  PROBE_MODE=0
+  log "FP8 preflight complete (exit $PROBE_FAIL; 0 = every probed dtype PASSed). Probe job only — no measured run. For the real sweep submit with KV_CACHE_DTYPE=<passing dtype> and a matching KV_BYTES_PER_TOKEN; the disclosure rule keeps both arms of any charted pair on that same dtype."
+  exit $PROBE_FAIL
+fi
+
 # ---- 8b. BASELINE mode: one boot, cold-only control, then straight to results
 if [[ "$BASELINE_ONLY" == "1" ]]; then
   start_vllm "$WORK/vllm-baseline.log" 2400
@@ -380,6 +538,7 @@ if [[ "$BASELINE_ONLY" == "1" ]]; then
     --stamp gpu="$GPU_NAME (hf-jobs ${FLAVOR:-flavor-unset})" \
     --stamp vllm="$VLLM_VER" --stamp connector="none (baseline control)" \
     --stamp tc_link="$TC_LINK" --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
+    --stamp kv_cache_dtype="${KV_CACHE_DTYPE:-auto-bf16}" \
     ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \
     --stamp git_sha="$GIT_SHA" || rc=$?
   log "JSONL at $OUT_JSONL ($(wc -l < "$OUT_JSONL" 2>/dev/null || echo 0) records)"
@@ -432,6 +591,7 @@ python3 "$HERE/run_ttft.py" --phase measure \
   --stamp vllm="$VLLM_VER" \
   --stamp connector="$CONNECTOR_STAMP" \
   --stamp tc_link="$TC_LINK" --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
+  --stamp kv_cache_dtype="${KV_CACHE_DTYPE:-auto-bf16}" \
   ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \
   --stamp git_sha="$GIT_SHA" || rc=$?
 

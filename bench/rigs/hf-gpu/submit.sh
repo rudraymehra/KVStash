@@ -12,7 +12,11 @@
 # (1 = pure-recompute control run: no connector, no daemon, cold-only — the
 # third chart series), JOB_NAME (job name shown by `hf jobs`, default
 # chart2-ttft), ASSUME_YES (1 = skip the billing confirmation — ONLY for
-# submit-n.sh, which confirms the whole batch once before setting it).
+# submit-n.sh, which confirms the whole batch once before setting it),
+# KV_CACHE_DTYPE (vLLM --kv-cache-dtype; same dtype feeds BOTH arms of a run
+# and stamps every record — the fp8 disclosure rule), FP8_PREFLIGHT (comma
+# dtype list or 1: probe-only job, FP8PROBE verdict lines, exits before any
+# measured run).
 #
 # The job container clones the PUBLIC repo tarball at GIT_REF — local
 # uncommitted changes are NOT visible to the job; push first.
@@ -81,7 +85,7 @@ CMD=("$HF_BIN" jobs run
   -e GEN_TOKENS="$GEN_TOKENS"
   -e FLAVOR="$FLAVOR")
 # optional knobs: forward only when the caller set them (job.sh has the defaults/derivations)
-for v in MAX_MODEL_LEN GPU_MEM_UTIL WARMUP KVBD_ARENA_BYTES CONNECTOR_STAGING_GB KV_BYTES_PER_TOKEN RESULTS_REPO BASELINE_ONLY HF_OVERRIDES; do
+for v in MAX_MODEL_LEN GPU_MEM_UTIL WARMUP KVBD_ARENA_BYTES CONNECTOR_STAGING_GB KV_BYTES_PER_TOKEN RESULTS_REPO BASELINE_ONLY HF_OVERRIDES KV_CACHE_DTYPE FP8_PREFLIGHT; do
   if [[ -n "${!v:-}" ]]; then CMD+=(-e "$v=${!v}"); fi
 done
 CMD+=("$IMAGE" /bin/bash -c "$BOOTSTRAP")
