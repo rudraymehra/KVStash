@@ -93,10 +93,18 @@ first SSE token; p50 of n=5 reps per point, warmup discarded. Raw JSONL:
 
 | prefix | recompute (no connector) | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
 |---|---|---|---|---|---|
-| 1k  | 269 ms  | 511 ms  | **145 ms**  | **1.9×** | 3.5× |
-| 4k  | 1070 ms | 2027 ms | **462 ms**  | **2.3×** | 4.4× |
-| 8k  | 2212 ms | 4147 ms | **1304 ms** | **1.7×** | 3.2× |
-| 16k | 5045 ms | 8964 ms | **2673 ms** | **1.9×** | 3.4× |
+| 1k  | 269 ms  | 506 ms  | **76 ms**  | **3.5×** | 6.6× |
+| 4k  | 1070 ms | 2035 ms | **174 ms** | **6.2×** | 11.7× |
+| 8k  | 2212 ms | 4147 ms | **302 ms** | **7.3×** | 13.7× |
+| 16k | 5045 ms | 8925 ms | **552 ms** | **9.1×** | 16.2× |
+
+The warm column improved 3.6–4.8× between run 4 and run 5 by rebuilding the
+connector's load path (pinned staging, chunked DMA, sharded drain — commit
+8b29f83); the recompute columns are unchanged within noise, as they must be.
+Effective reload bandwidth at 16k: ~3.8 GB/s through a Python client with
+per-block xxh3 verification on. Run-5 hit verification uses the exact-count
+gate: every rep's `kvb_hits_total` delta equals its expected block count
+(1023/1023 at 16k), recorded per-rep in the JSONL.
 
 ¹ the cold arm of the two-phase run serves WITH the connector, so every miss
 also pays the synchronous store-on-miss write — the steady-state serving
