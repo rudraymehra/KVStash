@@ -157,13 +157,16 @@ def chart1(recs, out):
 
 def _conditions(recs):
     """Conditions box read FROM the JSONL (never hardcoded — review rule).
-    Rigs stamp gpu/model/vllm/connector (or lmcache)/tc_link into each record."""
+    Rigs stamp gpu/model/vllm/connector (or lmcache)/kv_cache_dtype/tc_link
+    into each record."""
     cond = {}
     for r in recs:
-        for k in ("gpu", "model", "vllm", "connector", "lmcache", "tc_link"):
+        for k in ("gpu", "model", "vllm", "connector", "lmcache",
+                  "kv_cache_dtype", "tc_link"):
             if r.get(k):
                 cond.setdefault(k, r[k])
-    box = ", ".join(f"{cond[k]}" for k in ("gpu", "model", "vllm", "connector", "lmcache")
+    box = ", ".join(f"{cond[k]}" for k in ("gpu", "model", "vllm", "connector",
+                                           "lmcache", "kv_cache_dtype")
                     if k in cond)
     return box, cond.get("tc_link", "link undisclosed")
 
@@ -172,7 +175,22 @@ def chart2_ttft(recs, out):
     # TTFT vs prefix length: warm (kvblockd reload) vs cold (recompute WITH
     # the connector, paying store-on-miss — the steady-state serving shape)
     # vs baseline (recompute with NO connector — the purist control).
-    # One record per (length, arm); duplicates (re-runs) collapse by median.
+    # One record per (length, arm) PER RUN; records from independent runs
+    # (methodology rule 7: submit-n.sh, one file per engine boot) collapse to
+    # their median with min/max whiskers, and the per-cell run count is
+    # annotated so a single-run chart can never read as a medianed one.
+    #
+    # DISCLOSURE RULE (hard, fp8 spec): an fp8 warm arm may never be charted
+    # against a bf16 cold arm — job.sh stamps kv_cache_dtype into every record
+    # (records predating the stamp are the auto-bf16 era), so a mixed-dtype
+    # input is detectable here and the render REFUSES rather than disclosing
+    # in a footnote.
+    dtypes = {r.get("kv_cache_dtype", "auto-bf16") for r in recs
+              if r.get("arm") in ("cold", "warm", "baseline")}
+    if len(dtypes) > 1:
+        sys.exit(f"refusing to render: input records mix engine KV dtypes {sorted(dtypes)} "
+                 "— both arms of any charted pair must run the same kv-cache dtype "
+                 "(fp8 disclosure rule; split the inputs per dtype)")
     cells = {}
     for r in recs:
         x = r.get("target_prefix_tokens") or r.get("prefix_tokens")
@@ -180,23 +198,46 @@ def chart2_ttft(recs, out):
             continue
         cells.setdefault((r["arm"], r.get("series", r["arm"]), x), []).append(r)
 
-    series, unverified, nreps = {}, [], []
+    series, unverified, nreps, nruns = {}, [], [], []
     for (arm, label, x), rs in sorted(cells.items()):
-        p50 = _median([r.get("ttft_p50_ms", r.get("ttft_ms", 0)) for r in rs])
-        p95 = _median([r.get("ttft_p95_ms", 0) for r in rs])
-        series.setdefault((arm, label), []).append((x, p50, p95))
+        p50s = [r.get("ttft_p50_ms", r.get("ttft_ms", 0)) for r in rs]
+        cell = {"x": x, "p50": _median(p50s),
+                "p50_min": min(p50s), "p50_max": max(p50s),
+                "p95": _median([r.get("ttft_p95_ms", 0) for r in rs]),
+                "runs": len(rs)}
+        series.setdefault((arm, label), []).append(cell)
         nreps.extend(r.get("reps", 0) for r in rs)
+        nruns.append(len(rs))
         if arm == "warm" and any(r.get("warm_hits_verified") is False for r in rs):
             unverified.append(x)
+        # Stdout mirror of every charted cell: the published medians are
+        # checkable against the committed JSONL without opening the PNG.
+        print(f"[chart2 cell] arm={arm} x={x} p50={cell['p50']:.1f}ms "
+              f"p95={cell['p95']:.1f}ms runs={cell['runs']} "
+              f"min={cell['p50_min']:.1f} max={cell['p50_max']:.1f}")
 
     fig, ax = plt.subplots(figsize=(9, 6))
     by_arm = {}
+    uniform_runs = len(set(nruns)) == 1
     for (arm, label), pts in sorted(series.items()):
-        pts.sort()
-        xs = [p[0] for p in pts]
-        p50s = [p[1] for p in pts]
-        p95s = [p[2] for p in pts]
+        pts.sort(key=lambda c: c["x"])
+        xs = [c["x"] for c in pts]
+        p50s = [c["p50"] for c in pts]
+        p95s = [c["p95"] for c in pts]
         line, = ax.plot(xs, p50s, marker="o", label=f"{label} p50")
+        if any(c["runs"] > 1 for c in pts):
+            # min/max whiskers ACROSS runs (not reps — per-rep spread lives in
+            # ttft_all_ms inside each record).
+            ax.errorbar(xs, p50s,
+                        yerr=[[c["p50"] - c["p50_min"] for c in pts],
+                              [c["p50_max"] - c["p50"] for c in pts]],
+                        fmt="none", ecolor=line.get_color(), elinewidth=1,
+                        capsize=4)
+        if not uniform_runs:
+            for c in pts:  # per-cell run count when coverage differs
+                ax.annotate(f"{c['runs']}r", (c["x"], c["p50"]),
+                            textcoords="offset points", xytext=(6, 4),
+                            fontsize=6, color="grey")
         ax.plot(xs, p95s, marker="x", linestyle="--", color=line.get_color(),
                 label=f"{label} p95")
         by_arm[arm] = dict(zip(xs, p50s))
@@ -220,7 +261,7 @@ def chart2_ttft(recs, out):
                         color="crimson" if x in unverified else "black")
 
     ax.set_xscale("log", base=2)
-    xs_all = sorted({x for pts in series.values() for x, _, _ in pts})
+    xs_all = sorted({c["x"] for pts in series.values() for c in pts})
     ax.set_xticks(xs_all)
     ax.set_xticklabels([f"{round(x / 1000)}k" if x >= 1000 else str(x) for x in xs_all])
     ax.minorticks_off()
@@ -230,9 +271,19 @@ def chart2_ttft(recs, out):
 
     box, link = _conditions(recs)
     lo, hi = (min(nreps), max(nreps)) if nreps else (0, 0)
-    runs = f"n={lo}" if lo == hi else f"n={lo}–{hi}"
+    reps_lbl = f"{lo}" if lo == hi else f"{lo}–{hi}"
+    rlo, rhi = (min(nruns), max(nruns)) if nruns else (0, 0)
+    # The run count is stated per point ("n=3 runs x 5 reps"); the worst-
+    # covered cell is quoted, never the best (mirrors chart1's rule). Below 3
+    # runs the label says so — the single-run disclosure can't fall off the
+    # chart by accident.
+    runs_lbl = (f"n={rlo} run{'s' if rlo != 1 else ''}" if rlo == rhi
+                else f"n={rlo}–{rhi} runs (per-cell count shown)")
+    below_lbl = " — below the median-of-3 rule" if rlo < 3 else ""
+    whisker_lbl = ", min/max whiskers across runs" if rhi > 1 else ""
     ax.set_title("TTFT: reload KV from kvblockd vs recompute — same box, same model\n"
-                 f"median/p95 of {runs} reps per point, warmup discarded\n"
+                 f"{runs_lbl} x {reps_lbl} reps per point{below_lbl} (median/p95, "
+                 f"warmup discarded{whisker_lbl})\n"
                  f"{box or 'conditions from JSONL'}; {link} — disclosed", fontsize=9)
     if unverified:
         ax.text(0.02, 0.02, "warm hit UNVERIFIED at: "

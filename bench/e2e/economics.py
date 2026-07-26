@@ -12,7 +12,11 @@ Sources (verified 2026-07):
   GPU $/hr:          runpod.io/pricing  (A100 $1.39, H100 $2.89/hr)
   AWS transfer:      aws.amazon.com/ec2/pricing/on-demand
                      same-AZ private IP $0/GB; cross-AZ $0.01/GB each way; public/EIP $0.01/GB
+  measured TTFT:     bench/results/rig-e/ committed JSONL (Chart-2; conditions
+                     and falsification lines in docs/CLAIMS.md #2-3)
 """
+
+import math
 
 # Byte SIZES are shown in binary MiB (the convention for KV cache sizes).
 # BANDWIDTH and TRANSFER $ use DECIMAL GB — networks (iperf3, spike.go's
@@ -70,6 +74,30 @@ DELIVERABLE_GBPS = 6.37
 HIT_RATES = [0.40, 0.54, 0.62, 0.90]  # 54-62 = Alibaba Bailian band; 90 = marketing (labeled)
 REUSED_TOKENS = 80_000         # a long agentic prefix (the workload we target)
 
+# ---- MEASURED Chart-2 TTFT medians (rig-e, A10G, loopback) ------------------
+# p50 ms from the COMMITTED results files — sections 6-7 derive from these,
+# never from re-typed summaries:
+#   bench/results/rig-e/chart2-ttft-run5.jsonl        (Llama warm/cold)
+#   bench/results/rig-e/chart2-ttft-baseline.jsonl    (Llama pure recompute)
+#   bench/results/rig-e/chart2-ttft-qwen32k.jsonl     (Qwen warm/cold)
+#   bench/results/rig-e/chart2-ttft-qwen32k-baseline.jsonl
+# "pure"  = recompute on an engine with NO connector configured.
+# "cold"  = recompute on the connector-on engine — every miss also pays the
+#           current SYNCHRONOUS store-on-miss write (steady-state serving).
+# "warm"  = reload from kvblockd into a freshly restarted engine, per-rep
+#           block-exact hit verification (docs/CLAIMS.md #5).
+MEASURED_TTFT_MS = [
+    # (cell,                     pure_ms, cold_conn_ms, warm_ms)
+    ("Llama-3.1-8B @16k prefix", 5045.4, 8925.0, 552.3),
+    ("Qwen2.5-7B  @16k prefix",  4588.4, 7271.4, 321.4),
+    ("Qwen2.5-7B  @32k prefix", 10922.6, 15997.8, 636.2),
+]
+# PROJECTED (not measured): once stores are write-behind, a miss no longer
+# waits for the store write; the residual per-miss overhead is the external
+# lookup + enqueue. 200ms is a deliberately fat allowance for that path —
+# replace with the measured figure when the write-behind connector lands.
+WRITE_BEHIND_RESIDUAL_MS = 200.0
+
 
 def hr(title):
     print("\n" + "=" * 72 + "\n" + title + "\n" + "=" * 72)
@@ -97,7 +125,7 @@ def main():
 
     hr(f"3. Per-hit cost: recompute vs fetch  (reusing {REUSED_TOKENS:,} tokens)")
     print(f"  recompute $/hit = tokens/R * $/GPU-sec   (GPU_USD_PER_SEC=${GPU_USD_PER_SEC:.6f})")
-    print(f"  fetch $/hit     = bytes * $/GB (transfer)  [wait hidden by layer-wise overlap]\n")
+    print("  fetch $/hit     = bytes * $/GB (transfer)  [wait hidden by layer-wise overlap]\n")
     print(f"  {'model':32s} {'recompute$':>11s} {'sameAZ$':>9s} {'crossAZ$':>9s}")
     for m in MODELS:
         recompute = REUSED_TOKENS / m.prefill_tok_s * GPU_USD_PER_SEC
@@ -124,6 +152,38 @@ def main():
         cross_az = m.bytes_per_token() * REUSED_TOKENS / GBd * XFER_CROSS_AZ
         verdict = "cross-AZ still cheaper than recompute" if cross_az < recompute else "cross-AZ COSTS MORE than recompute"
         print(f"  {m.name:32s} recompute ${recompute:.5f} vs cross-AZ ${cross_az:.5f}  -> {verdict}")
+
+    hr("6. MEASURED GPU-seconds saved per hit  (Chart-2 medians, rig-e A10G)")
+    print("  saved/hit = pure_recompute_TTFT - warm_reload_TTFT  (same box, same model;")
+    print("  loopback link and single-run status disclosed in docs/CLAIMS.md #2-3)\n")
+    print(f"  {'cell':28s} {'pure ms':>9s} {'warm ms':>9s} {'saved GPU-s':>12s} {'quote':>7s} {'$ / hit (A100)':>15s}")
+    for cell, pure, cold_conn, warm in MEASURED_TTFT_MS:
+        saved_s = (pure - warm) / 1e3
+        quote = math.floor(saved_s * 10) / 10  # floor, never round up: conservative
+        usd = saved_s * GPU_USD_PER_SEC
+        print(f"  {cell:28s} {pure:>9.0f} {warm:>9.0f} {saved_s:>12.2f} {quote:>6.1f}s {usd:>15.5f}")
+    print("\n  Quote the floored column. These are per-HIT savings at 100% prefix reuse of")
+    print("  that length; multiply by your hit rate. Measured on loopback: a real NIC adds")
+    print("  wire time (~0.7s for 16k Llama at 25 GbE) — subtract it before quoting offsite.")
+
+    hr("7. Deployment break-even hit rate: sync store-on-miss (MEASURED) vs write-behind (PROJECTED)")
+    print("  With the current SYNCHRONOUS store-on-miss path, a miss costs MORE than pure")
+    print("  recompute (it also waits for the store write). Mean TTFT improves only above")
+    print("    h* = (cold_conn - pure) / (cold_conn - warm)     [h*warm + (1-h)*cold_conn = pure]")
+    print("  Write-behind stores collapse the miss penalty to a residual lookup+enqueue eps:")
+    print("    h* = eps / (pure + eps - warm)                    [PROJECTED, eps = "
+          f"{WRITE_BEHIND_RESIDUAL_MS:.0f}ms allowance]\n")
+    print(f"  {'cell':28s} {'sync h* (measured)':>19s} {'write-behind h* (projected)':>28s}")
+    for cell, pure, cold_conn, warm in MEASURED_TTFT_MS:
+        h_sync = (cold_conn - pure) / (cold_conn - warm)
+        eps = WRITE_BEHIND_RESIDUAL_MS
+        h_wb = eps / (pure + eps - warm)
+        print(f"  {cell:28s} {h_sync * 100:>18.0f}% {h_wb * 100:>27.1f}%")
+    print("\n  Reading: TODAY, below ~46% hits (Llama @16k; the full Llama sweep spans")
+    print("  46-55% across 1k-16k — docs/BENCHMARKS.md), installing the connector makes")
+    print("  mean TTFT WORSE — do not deploy it for such a workload. Write-behind moves")
+    print("  the break-even to a few percent; that column stays PROJECTED until the")
+    print("  write-behind connector ships and the residual is measured, not allowed-for.")
 
     hr("VERDICT")
     # Real two-part gate (no longer a foregone conclusion): the deliverable
