@@ -46,7 +46,13 @@ from kvblockd import protocol as kp
 from kvblockd.client import Client
 from kvblockd.errors import ConnectionLost
 
-from .config import AdapterConfig, block_chain_keys, chain_seed, require_pinned_hashseed
+from .config import (
+    BLOB_VERSION,
+    AdapterConfig,
+    block_chain_keys,
+    chain_seed,
+    require_pinned_hashseed,
+)
 
 logger = logging.getLogger("vllm_kvblockd")
 
@@ -98,7 +104,8 @@ def _torch():  # lazy so the CI import check can load us without torch
 # buffer. Config changes already diverge the fingerprint (hence the key); this
 # catches the residue (e.g. an attention-backend layout flip within a config).
 BLOB_MAGIC = b"KVN1"
-BLOB_VERSION = 1
+# BLOB_VERSION lives in config.py (folded into the fingerprint there) and is
+# re-exported here for the codec's callers/tests.
 BLOB_PREFIX_LEN = 32
 _BLOB = struct.Struct("<4sBBHHII14x")  # magic ver dtype n_layers tokens bytes/layer total
 assert _BLOB.size == BLOB_PREFIX_LEN
@@ -322,6 +329,7 @@ class KvblockdConnector(_Base):
         self._slab = None                 # 1-D pinned uint8 torch tensor
         self._slab_np = None              # numpy view of the slab (memoryview source)
         self._slab_disabled = False       # first-pin failure -> permanent per-block fallback
+        self._prewarm_done = False        # one eager-pin attempt at first CUDA capture
         # GPU scratch for the chunked scatter: _SCRATCH_RING × [chunk,
         # n_layers, bytes_per_layer] uint8, cached per (device, layout).
         self._gpu_scratch = None
@@ -720,6 +728,38 @@ class KvblockdConnector(_Base):
                 self._layer_kv[name] = kv
         except Exception as e:  # noqa: BLE001 — never-raise boundary: failed capture degrades to load/store no-ops, never into the engine
             self._log.maybe("layers", "capturing paged KV tensors failed", e)
+        self._maybe_prewarm()
+
+    def _maybe_prewarm(self) -> None:
+        """One eager pinned-slab allocation at the FIRST CUDA layout capture
+        (not the first load): cudaHostAlloc of a multi-GiB slab takes hundreds
+        of ms, and paying it lazily buries the stall inside the first measured
+        load. Sized min(staging cap, kvblockd_prewarm_bytes). Failure falls
+        back to the EXISTING lazy path untouched (_slab_disabled stays False —
+        _slab_reserve owns that latch), never fatal. The measured duration is
+        published at WARNING (INFO is dropped in engine-core) so the bench can
+        attribute the one-time cost."""
+        if self._prewarm_done or self._slab is not None or self._slab_disabled:
+            return
+        try:
+            names = sorted(self._layer_kv)
+            if not names:
+                return
+            dev = self._layer_kv[names[0]].device
+            if not self._slab_path_ok(dev):
+                return  # CPU backend: the slab never pays here
+            self._prewarm_done = True  # one attempt per connector lifetime
+            want = min(self._staging_bytes, self._cfg.prewarm_bytes)
+            if want <= 0:
+                return
+            t0 = time.monotonic()
+            slab = self._alloc_pinned(want)
+            slab_np = slab.numpy()
+            self._slab, self._slab_np = slab, slab_np
+            logger.warning("kvblockd pinned prewarm: %d bytes in %.0f ms",
+                           want, (time.monotonic() - t0) * 1e3)
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: a failed prewarm keeps the lazy slab path
+            self._log.maybe("slab", "pinned prewarm failed — lazy slab path keeps serving", e)
 
     def _layout(self):
         """(sorted layer names, dtype_name, bytes_per_layer_block) of the LIVE

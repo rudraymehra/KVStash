@@ -551,8 +551,13 @@ def run_measure(args, stamp: dict) -> int:
               "kvb_hit_delta_total": sum(p["kvb_hit_delta"] for p in used),
               "hit_gate_block_size": args.block_size,
               # Per-rep attribution (warmup pairs included, flagged): the
-              # aggregate can hide which rep fell short and why.
+              # aggregate can hide which rep fell short and why. TTFTs ride
+              # along for EVERY pair — the warmup rows included — so the
+              # discarded first pair (pinned prewarm, allocator warm-up,
+              # first-touch page faults) is disclosed, not vanished (rule 12).
               "pairs": [{"rep": p["rep"], "warmup": p["warmup"],
+                         "warm_ttft_ms": round(p["warm_ttft_ms"], 3),
+                         "cold_ttft_ms": round(p["cold_ttft_ms"], 3),
                          "hit_delta": p["kvb_hit_delta"],
                          "expected_hit_blocks": p["expected_hit_blocks"],
                          "verified": p["warm_verified"],
@@ -939,6 +944,12 @@ def selftest() -> int:
             "rc==0": rc == 0,
             "4 records (2 lengths x 2 arms)": len(good) == 4 and len(warm_recs) == 2
                                               and len(cold_recs) == 2,
+            # Warmup-pair TTFT disclosure: every pairs row — the discarded
+            # warmup row INCLUDED — must carry both timings.
+            "pairs carry warm/cold TTFT incl. warmup rows": all(
+                p.get("warm_ttft_ms", 0) > 0 and p.get("cold_ttft_ms", 0) > 0
+                for r in warm_recs for p in r["pairs"]
+            ) and all(any(p["warmup"] for p in r["pairs"]) for r in warm_recs),
             "warm verified with hit deltas": all(r["warm_hits_verified"] for r in warm_recs)
                                              and all(r["kvb_hit_delta_total"] > 0 for r in warm_recs),
             "isolation stamped": all(r.get("warm_isolation") == "vllm-restart" for r in good),

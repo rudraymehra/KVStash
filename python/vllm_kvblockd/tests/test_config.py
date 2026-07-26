@@ -238,6 +238,72 @@ def test_tier_fields_resolve_auto_dtype_and_fold_groups():
     assert tier_wire_key(a, b"k" * 36) != tier_wire_key(b, b"k" * 36)
 
 
+def _vc(cache_dtype="auto", model_dtype="torch.bfloat16", tokenizer=None,
+        tokenizer_revision=None, model="facebook/opt-125m"):
+    """Stub VllmConfig with the knobs the fingerprint-completion tests turn."""
+
+    class KTC:
+        kv_connector_extra_config: ClassVar[dict] = {"kvblockd_token": "t"}
+
+        def get_from_extra_config(self, key, default):
+            return self.kv_connector_extra_config.get(key, default)
+
+    mattrs = {"model": model, "dtype": model_dtype}
+    if tokenizer is not None:
+        mattrs["tokenizer"] = tokenizer
+    if tokenizer_revision is not None:
+        mattrs["tokenizer_revision"] = tokenizer_revision
+
+    class VC:
+        kv_transfer_config = KTC()
+        cache_config = type("C", (), {"block_size": 16, "cache_dtype": cache_dtype})()
+        model_config = type("M", (), mattrs)()
+        parallel_config = type("P", (), {"world_size": 1})()
+
+    return VC()
+
+
+def test_fingerprint_folds_resolved_kv_cache_dtype():
+    """DR-3 regression: a bf16-KV and an fp8-KV engine over the same model
+    dtype minted IDENTICAL keys. The RESOLVED kv-cache dtype now forks the
+    keyspace, and 'auto' resolves to the model dtype — an instruction, not an
+    identity (mirrors tier_fingerprint_fields)."""
+    auto = AdapterConfig.from_vllm_config(_vc(cache_dtype="auto"))
+    fp8 = AdapterConfig.from_vllm_config(_vc(cache_dtype="fp8_e4m3"))
+    assert auto.kv_cache_dtype == "bfloat16"  # resolved, torch. prefix stripped
+    assert fp8.kv_cache_dtype == "fp8_e4m3"
+    assert auto.fingerprint != fp8.fingerprint
+    # ...and auto == the dtype it resolves to: one identity, not two.
+    explicit = AdapterConfig.from_vllm_config(_vc(cache_dtype="bfloat16"))
+    assert auto.fingerprint == explicit.fingerprint
+
+
+def test_fingerprint_folds_tokenizer_identity():
+    """Same model weights behind a different tokenizer (or revision) produce
+    different token-id streams for the same text — sharing keys across them
+    serves the right ids for the wrong words."""
+    base = AdapterConfig.from_vllm_config(_vc())
+    other_tok = AdapterConfig.from_vllm_config(_vc(tokenizer="org/other-tokenizer"))
+    other_rev = AdapterConfig.from_vllm_config(_vc(tokenizer_revision="beefcafe"))
+    assert base.tokenizer == "facebook/opt-125m"  # falls back to the model path
+    assert other_tok.tokenizer == "org/other-tokenizer"
+    assert len({base.fingerprint, other_tok.fingerprint, other_rev.fingerprint}) == 3
+
+
+def test_fingerprint_folds_blob_version(monkeypatch):
+    """The connector's blob layout version is part of the config identity: a
+    format bump must fork the keyspace (clean misses), not hand old-format
+    blobs to a new-format decoder. One canonical constant, config-owned."""
+    import vllm_kvblockd.config as cfg_mod
+    from vllm_kvblockd import connector as conn_mod
+
+    assert conn_mod.BLOB_VERSION == cfg_mod.BLOB_VERSION  # single source
+    before = AdapterConfig.from_vllm_config(_vc()).fingerprint
+    monkeypatch.setattr(cfg_mod, "BLOB_VERSION", cfg_mod.BLOB_VERSION + 1)
+    after = AdapterConfig.from_vllm_config(_vc()).fingerprint
+    assert before != after
+
+
 def test_hashseed_check_rejects_unpinned(monkeypatch):
     monkeypatch.delenv("KVBLOCKD_SKIP_HASHSEED_CHECK", raising=False)
     monkeypatch.setenv("PYTHONHASHSEED", "random")
