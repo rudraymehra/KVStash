@@ -9,10 +9,15 @@ shape run_ttft.py emits (one record per (arm, length) with ttft_p50_ms /
 ttft_p95_ms over that run's reps).
 
 Output: one summary JSONL line per cell — keyed (model, arm, series,
-target_prefix_tokens) so a Llama file and a Qwen file can never median into
-one cell — with median/min/max/spread% ACROSS runs for p50 and p95, the
-per-run values themselves, and the warm arm's verification status. A human
-table goes to stderr; stdout stays machine-readable.
+target_prefix_tokens, kv_cache_dtype) so a Llama file and a Qwen file can
+never median into one cell — with median/min/max/spread% ACROSS runs for p50
+and p95, the per-run values themselves, and the warm arm's verification
+status. Records predating the dtype stamp default to "auto-bf16" (the
+pre-stamp era ran vLLM's auto dtype). Mixing dtypes WITHIN one (model, arm,
+series, target) group is refused outright — the same fp8 disclosure rule
+plot.py enforces: an fp8 run may never median into a bf16 cell, split the
+inputs per dtype. A human table goes to stderr; stdout stays
+machine-readable.
 
 Exit nonzero if any cell's p50 spread exceeds --tolerance (default 10%).
 
@@ -48,7 +53,11 @@ def _median(xs):
 
 
 def load_cells(paths):
-    """{(model, arm, series, target): [(record, source_basename), ...]}."""
+    """{(model, arm, series, target, kv_cache_dtype): [(record, source), ...]}.
+
+    Refuses (hard exit) when one (model, arm, series, target) group spans
+    more than one kv_cache_dtype — the fp8 disclosure rule, same as plot.py:
+    an fp8 run must never median into a bf16 cell."""
     cells = {}
     for path in paths:
         with open(path) as f:
@@ -63,17 +72,33 @@ def load_cells(paths):
                 if not x or r.get("arm") not in ("cold", "warm", "baseline"):
                     continue
                 key = (r.get("model", "?"), r["arm"],
-                       r.get("series", r["arm"]), x)
+                       r.get("series", r["arm"]), x,
+                       r.get("kv_cache_dtype", "auto-bf16"))
                 cells.setdefault(key, []).append((r, os.path.basename(path)))
+    groups = {}
+    for key in cells:
+        groups.setdefault(key[:4], set()).add(key[4])
+    mixed = {g: sorted(d) for g, d in groups.items() if len(d) > 1}
+    if mixed:
+        for (model, arm, series, x), dts in sorted(mixed.items()):
+            print(f"  mixed dtypes: {model} {arm}/{series} @{x}: {dts}",
+                  file=sys.stderr)
+        sys.exit("refusing to aggregate: input records mix engine KV dtypes "
+                 "within the same (model, arm, series, target) cell — every "
+                 "run medianed into a cell must share one kv-cache dtype "
+                 "(fp8 disclosure rule, as plot.py; split the inputs per dtype)")
     return cells
 
 
 def spread_stats(values):
+    """(json_dict, raw_spread_pct). The JSONL carries the rounded spread for
+    humans; the tolerance gate compares the RAW value — a 10.004% spread must
+    fail a 10% gate, not round down to 10.00 and pass."""
     med = _median(values)
     lo, hi = min(values), max(values)
     spread = ((hi - lo) / med * 100.0) if med > 0 else 0.0
     return {"median_ms": med, "min_ms": lo, "max_ms": hi,
-            "spread_pct": round(spread, 2), "per_run_ms": values}
+            "spread_pct": round(spread, 2), "per_run_ms": values}, spread
 
 
 def main():
@@ -97,18 +122,20 @@ def main():
     print(f"{'model':40s} {'arm':9s} {'tokens':>7s} {'runs':>4s} "
           f"{'p50 med ms':>11s} {'min':>9s} {'max':>9s} {'spread%':>8s}",
           file=sys.stderr)
-    for (model, arm, series, x), rs in sorted(cells.items()):
+    for (model, arm, series, x, dtype), rs in sorted(cells.items()):
         p50s = [r.get("ttft_p50_ms", r.get("ttft_ms", 0.0)) for r, _ in rs]
         p95s = [r.get("ttft_p95_ms", 0.0) for r, _ in rs]
-        p50 = spread_stats(p50s)
+        p50, p50_spread_raw = spread_stats(p50s)
+        p95, _ = spread_stats(p95s)
         rec = {
             "kind": "ttft-aggregate",
             "model": model, "arm": arm, "series": series,
             "target_prefix_tokens": x,
+            "kv_cache_dtype": dtype,
             "runs": len(rs),
             "reps_per_run": [r.get("reps", 0) for r, _ in rs],
             "ttft_p50_ms": p50,
-            "ttft_p95_ms": spread_stats(p95s),
+            "ttft_p95_ms": p95,
             "sources": [src for _, src in rs],
         }
         if arm == "warm":
@@ -119,9 +146,12 @@ def main():
         print(line)
         out_lines.append(line)
         flag = ""
-        if p50["spread_pct"] > args.tolerance:
-            over.append((model, arm, x, p50["spread_pct"]))
+        # Gate on the RAW spread, never the display-rounded one.
+        if p50_spread_raw > args.tolerance:
+            over.append((model, arm, x, p50_spread_raw))
             flag = "  << OVER TOLERANCE"
+        if arm == "warm" and not rec["warm_hits_verified_all_runs"]:
+            flag += "  !! warm_hits_verified_all_runs=false"
         print(f"{model:40s} {arm:9s} {x:>7d} {len(rs):>4d} "
               f"{p50['median_ms']:>11.1f} {p50['min_ms']:>9.1f} "
               f"{p50['max_ms']:>9.1f} {p50['spread_pct']:>8.2f}{flag}",
