@@ -112,26 +112,30 @@ the table is labeled single-run rather than silently treated as final.
      table below (its "single-run disclosures apply as above" line). -->
 
 **n=3 independent runs** (each its own engine boots; median across runs, per-run
-values and min/max in the aggregate JSONL; worst p50 spread 5.3%). The cold
-arm runs the connector's **write-behind** store path (0.2.x): misses stage a
-copy in-band and the TCP put happens off the critical path.
+values and min/max in the aggregate JSONL; worst p50 spread 2.8%). The cold
+arm runs the connector's **gathered-slots** store path (0.3.x): misses stage
+through batched GPU gathers + async DMA into pinned slots, and the TCP put
+happens off the critical path — the store path each run took is stamped in
+its own receipts (`connector store path: gathered-slots`).
 
 | prefix | recompute (no connector)² | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
 |---|---|---|---|---|---|
-| 1k  | 269 ms  | 407 ms  | **80 ms**  | **3.4×** | 5.1× |
-| 4k  | 1070 ms | 1614 ms | **181 ms** | **5.9×** | 8.9× |
-| 8k  | 2212 ms | 3341 ms | **325 ms** | **6.8×** | 10.3× |
-| 16k | 5045 ms | 7305 ms | **599 ms** | **8.4×** | 12.2× |
+| 1k  | 269 ms  | 286 ms  | **78 ms**  | **3.4×** | 3.7× |
+| 4k  | 1070 ms | 1124 ms | **178 ms** | **6.0×** | 6.3× |
+| 8k  | 2212 ms | 2318 ms | **304 ms** | **7.3×** | 7.6× |
+| 16k | 5045 ms | 5260 ms | **576 ms** | **8.8×** | 9.1× |
 
 ² baseline is n=1 (its measured rep spread is <1%; an n=3 baseline rides the
-next paid session). Movements vs the earlier single-run table, stated
-plainly: the cold arm dropped ~18% (write-behind landed — store-on-miss
-overhead is now 1.45–1.51× vs 1.77–1.90×, with the residual attributed to
-per-layer host staging copies, the next pre-registered lever), and the warm
-arm is ~5–8% slower than the pre-wave single run (588–619 vs 552 at 16k —
-the wave added per-recv deadline enforcement and a store drain thread;
-profiling this regression is on the ledger, and the overlap pipeline wave
-targets a floor well below either number).
+next paid session). Movements vs the previous n=3 table, stated plainly:
+the cold arm dropped a further ~30% — **store-on-miss overhead is now
+1.04–1.06× vs pure recompute** (was 1.45–1.51×), i.e. filling the cache
+costs ~4–6% of a request, receipt-attributed to the gathered-slots staging
+path that replaced ~2×L×blocks blocking host copies with batched gathers
+and async pinned DMA. The "vs serving" column shrank as a RESULT (the
+serving baseline got faster); vs-pure is the stable comparison. The warm
+arm recovered ~4% of the earlier wave's regression (599 → 576 at 16k,
+spread 1.7%) after the per-recv deadline re-arm was hoisted off the hot
+loop; the pipelined-load wave targets a floor well below it.
 
 The warm column improved 3.6–4.8× between run 4 and run 5 by rebuilding the
 connector's load path (pinned staging, chunked DMA, sharded drain — commit
