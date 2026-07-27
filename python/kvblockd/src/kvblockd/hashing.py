@@ -12,13 +12,20 @@ startup_determinism_check() catches a hostile PYTHONHASHSEED loudly at boot.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
 
 from blake3 import blake3
 
+logger = logging.getLogger("kvblockd.hashing")
+
 _DOMAIN = b"kvblockd-cek-v1\x00"
+# The fleet convention. Any pinned seed passes the LOCAL check below, but two
+# workers pinning DIFFERENT seeds are each deterministic and never share a
+# byte of cache — the exact fleet-split this check exists to catch.
+_CANONICAL_SEED = "0"
 
 
 def wire_key(fields) -> bytes:
@@ -54,6 +61,16 @@ def startup_determinism_check() -> None:
             "nondeterministic across processes and cache would never be shared. "
             "Fix: export PYTHONHASHSEED=0 (identically on every vLLM worker)."
         )
+    if seed != _CANONICAL_SEED:
+        # A non-canonical pin passes every LOCAL check yet silently splits a
+        # fleet: worker A on seed 0 and worker B on seed 1 are both
+        # deterministic, both green on this probe, and share ZERO cache
+        # (hit rate ~0 across instances). Loudly disclose the value so a
+        # mixed fleet is diagnosable from any one worker's log.
+        logger.warning(
+            "PYTHONHASHSEED=%r is pinned but NON-CANONICAL: every worker in the "
+            "fleet must pin the IDENTICAL value or instances silently never share "
+            "cache. Convention: PYTHONHASHSEED=%s everywhere.", seed, _CANONICAL_SEED)
     probe = "import os; print(hash(('kvblockd-determinism-probe', 1, 2, 3)))"
     env = dict(os.environ)
     # check=True matters: a crashing probe leaves both stdouts empty and the

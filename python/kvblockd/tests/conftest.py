@@ -5,6 +5,7 @@ toolchain is absent (wheel-only CI legs)."""
 from __future__ import annotations
 
 import http.client
+import os
 import shutil
 import socket
 import subprocess
@@ -41,14 +42,21 @@ def _wait_healthz(host: str, port: int, timeout: float = 15.0):
 
 @pytest.fixture(scope="session")
 def daemon():
-    if shutil.which("go") is None:
-        pytest.skip("go toolchain not available")
     tmp = Path(tempfile.mkdtemp(prefix="kvb-daemon-"))
-    binpath = tmp / "kvblockd"
-    subprocess.run(
-        ["go", "build", "-o", str(binpath), "./cmd/kvblockd"],
-        cwd=_REPO, check=True,
-    )
+    prebuilt = os.environ.get("KVBLOCKD_TEST_BIN")
+    if prebuilt:
+        # Pre-built by the harness (same contract as the vllm_kvblockd
+        # conftest): keeps the fixture fast and decouples the client suite
+        # from a Go tree that may be mid-edit.
+        binpath = Path(prebuilt)
+    else:
+        if shutil.which("go") is None:
+            pytest.skip("go toolchain not available")
+        binpath = tmp / "kvblockd"
+        subprocess.run(
+            ["go", "build", "-o", str(binpath), "./cmd/kvblockd"],
+            cwd=_REPO, check=True,
+        )
     data_port, metrics_port = _free_port(), _free_port()
     (tmp / "ns.yaml").write_text(
         "namespaces:\n  - { name: t, id: 7, token: sekret }\n"

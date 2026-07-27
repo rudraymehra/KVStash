@@ -14,6 +14,7 @@ import concurrent.futures
 import logging
 import socket
 import struct
+import threading
 import time
 
 import xxhash
@@ -34,6 +35,43 @@ _MAX_GET_FANOUT = 4
 # Vectored send: header + body in one syscall with no payload copy. Absent
 # only on platforms without sendmsg (Windows); the join fallback stays.
 _HAS_SENDMSG = hasattr(socket.socket, "sendmsg")
+# Rate limit for the degrade-to-miss disclosure lines (one per key per window).
+_WARN_INTERVAL_S = 10.0
+
+
+class ClientCounters:
+    """Misses-by-cause telemetry for the degrade-to-miss machinery. The
+    client's designed failure mode is a miss, so these counters are the only
+    way an operator can tell 'cold cache' from 'store is dying' without log
+    archaeology — the LMCache/vLLM connectors scrape them into their stats.
+
+    evictions        pooled connections discarded after a non-StatusError
+    deadline_misses  keys downgraded to misses by an expired per-call deadline
+    corrupt_blocks   xxh3 digest mismatches (detected corruption; conn evicted)
+    degraded_keys    keys downgraded to misses by a shard-level failure
+    """
+
+    __slots__ = ("_lock", "corrupt_blocks", "deadline_misses", "degraded_keys", "evictions")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.evictions = 0
+        self.deadline_misses = 0
+        self.corrupt_blocks = 0
+        self.degraded_keys = 0
+
+    def bump(self, name: str, n: int = 1) -> None:
+        with self._lock:
+            setattr(self, name, getattr(self, name) + n)
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "evictions": self.evictions,
+                "deadline_misses": self.deadline_misses,
+                "corrupt_blocks": self.corrupt_blocks,
+                "degraded_keys": self.degraded_keys,
+            }
 
 
 class Limits:
@@ -50,11 +88,13 @@ class Limits:
 class _Conn:
     """One socket. Not thread-safe: the Pool guarantees single ownership."""
 
-    def __init__(self, sock: socket.socket, limits: Limits, namespace_id: int, verify: bool):
+    def __init__(self, sock: socket.socket, limits: Limits, namespace_id: int, verify: bool,
+                 counters: ClientCounters | None = None):
         self._sock = sock
         self.limits = limits
         self.namespace_id = namespace_id
         self._verify = verify
+        self._counters = counters  # shared Client-level telemetry (None in bare tests)
         self._hdr = bytearray(p.HEADER_SIZE)
         self._scratch = bytearray(_MAX_SCRATCH)
         self._pfxbuf = bytearray(64)  # reused per-block prefix staging (grown on demand)
@@ -195,22 +235,44 @@ class _Conn:
             remaining -= chunk
 
     # --- verbs ---
-    def batch_exists(self, keys: list[bytes]):
+    def batch_exists(self, keys: list[bytes], deadline: float | None = None):
+        """deadline (optional, time.monotonic()-based): hard wall-clock
+        ceiling for the WHOLE exchange, threaded into every send/recv exactly
+        like batch_get_scatter's — the scheduler-side lookup runs on the
+        engine's critical path, so a hung-but-accepting daemon must cost a
+        bounded blip, never a per-recv op_timeout. Past the deadline this
+        raises ConnectionLost (mid-exchange abandonment desyncs the stream,
+        so eviction is the only safe degrade)."""
         want_bitmap = bool(self.limits.features & p.FEAT_EXISTS_BITMAP)
-        self._send_frame(p.Header(p.Op.BATCH_EXISTS, ns=self.namespace_id, request_id=1),
-                         [p.pack_keylist(keys)])
-        h = self._next_header()
-        body = self._read_body(h.payload_len)
+        self._deadline = deadline  # armed for _send_frame and every _recv_into
+        try:
+            self._send_frame(p.Header(p.Op.BATCH_EXISTS, ns=self.namespace_id, request_id=1),
+                             [p.pack_keylist(keys)])
+            h = self._next_header()
+            body = self._read_body(h.payload_len)
+        finally:
+            self._deadline = None
+            if deadline is not None:
+                try:
+                    self._sock.settimeout(self._op_timeout)
+                except OSError:
+                    pass  # dead socket: the conn is being evicted regardless
         status, count = p.parse_preamble(body)
         if not p.status_ok(status):
             raise p.StatusError(p.Op.BATCH_EXISTS, status)
-        n_consec, _ = struct.unpack_from("<II", body, p.PREAMBLE_SIZE)
-        per_key = None
-        if want_bitmap:
-            # Not a packed bitmap: one status byte per key (padded to 8), the
-            # AppendExistsResp layout — OK/OK_EXISTS ⇒ present.
-            off = p.PREAMBLE_SIZE + 8
-            per_key = [p.status_ok(body[off + i]) for i in range(count)]
+        try:
+            n_consec, _ = struct.unpack_from("<II", body, p.PREAMBLE_SIZE)
+            per_key = None
+            if want_bitmap:
+                # Not a packed bitmap: one status byte per key (padded to 8), the
+                # AppendExistsResp layout — OK/OK_EXISTS ⇒ present.
+                off = p.PREAMBLE_SIZE + 8
+                per_key = [p.status_ok(body[off + i]) for i in range(count)]
+        except (struct.error, IndexError) as e:
+            # Taxonomy boundary: a body shorter than its declared layout must
+            # surface as a client error (`except KvblockdError` catches it),
+            # never a raw struct/Index error — and it desyncs, so FrameError.
+            raise p.FrameError(f"malformed BATCH_EXISTS body: {e}") from e
         return n_consec, per_key
 
     def batch_get_scatter(self, keys: list[bytes], prefix_len: int, alloc, idx_base: int = 0,
@@ -365,6 +427,13 @@ class _Conn:
 
     def _check_digest(self, digest, want, idx):
         if digest is not None and digest.intdigest() != want:
+            # Detected corruption must not vanish into a silent miss: log at
+            # ERROR (unconditional — this is rare and always actionable) and
+            # count it before the eviction turns it into misses downstream.
+            logger.error("kvblockd block %d: xxh3 mismatch (corrupt payload) — "
+                         "evicting the connection", idx)
+            if self._counters is not None:
+                self._counters.bump("corrupt_blocks")
             raise ConnectionLost(f"block {idx}: xxh3 mismatch (corrupt payload)")
 
     def batch_get_bytes(self, keys: list[bytes]):
@@ -434,9 +503,12 @@ class _Conn:
         st, count = p.parse_preamble(body)
         if not p.status_ok(st):
             raise p.StatusError(op, st)
-        # to_status (not Status()) — a forward-compat server may emit a per-key
-        # code this client predates; decode tolerantly, never crash the stream.
-        return [p.to_status(body[p.PREAMBLE_SIZE + i]) for i in range(count)]
+        try:
+            # to_status (not Status()) — a forward-compat server may emit a per-key
+            # code this client predates; decode tolerantly, never crash the stream.
+            return [p.to_status(body[p.PREAMBLE_SIZE + i]) for i in range(count)]
+        except IndexError as e:  # body shorter than its declared count: desync
+            raise p.FrameError(f"malformed op {int(op):#x} body: {e}") from e
 
     def delete(self, keys, force=False):
         return self._key_status_verb(p.Op.DELETE, keys, flags=(p.F_FORCE if force else 0))
@@ -493,11 +565,16 @@ def _connect(host, port, connect_timeout, so_rcvbuf=None) -> tuple[socket.socket
 
 
 def _dial_one(addr, namespace, token, features, connect_timeout, op_timeout, verify,
-              so_rcvbuf=None) -> _Conn:
+              so_rcvbuf=None, counters: ClientCounters | None = None) -> _Conn:
     host, port = addr
     sock, granted_rcvbuf = _connect(host, port, connect_timeout, so_rcvbuf)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.settimeout(op_timeout)
+    # The whole PRIMING exchange (HELLO send + response) stays on the DIAL
+    # budget: a hung-but-ACCEPTING daemon (SIGSTOP, blackholed after accept)
+    # must cost connect_timeout, not op_timeout — dialing runs on caller
+    # threads (the connector's scheduler path among them), and op_timeout
+    # (10s default) there is exactly the stall connect_timeout exists to
+    # bound. The socket moves to op_timeout only once HELLO has parsed.
     hdr = p.Header(p.Op.HELLO, request_id=1)
     body = p.pack_hello_req(features, 0, 0, token.encode(), namespace.encode(), b"kvblockd-py")
     hdr.payload_len = len(body)
@@ -506,16 +583,30 @@ def _dial_one(addr, namespace, token, features, connect_timeout, op_timeout, ver
     except OSError as e:
         sock.close()
         raise ConnectionLost(f"hello send: {e}") from e
-    conn = _Conn(sock, None, 0, verify)  # limits filled below
+    conn = _Conn(sock, None, 0, verify, counters)  # limits filled below
     try:
         h = conn._next_header()
-        resp = p.HelloResp.parse(conn._read_body(h.payload_len))
+        try:
+            resp = p.HelloResp.parse(conn._read_body(h.payload_len))
+        except struct.error as e:  # short HELLO body: taxonomy boundary (28)
+            raise p.FrameError(f"malformed HELLO response body: {e}") from e
     except BaseException:
         conn.close()  # HELLO rejection (StatusError/Fatal/Frame) must not leak the fd
         raise
     conn.limits = Limits(resp)
     conn.namespace_id = resp.namespace_id
     conn.granted_rcvbuf = granted_rcvbuf
+    # HELLO parsed: the dial budget ends here. Hand the socket its steady-
+    # state per-recv budget AND refresh the _Conn snapshot (its __init__
+    # read gettimeout() == connect_timeout; the deadline machinery restores
+    # to _op_timeout after every clamped call, so both must move together —
+    # or every recv for the conn's life stays silently on the dial budget).
+    try:
+        sock.settimeout(op_timeout)
+    except OSError as e:  # dead fd already: surface as the usual eviction class
+        conn.close()
+        raise ConnectionLost(f"settimeout after hello: {e}") from e
+    conn._op_timeout = op_timeout
     logger.debug("kvblockd conn to %s:%s — SO_RCVBUF asked %s, kernel reports %d",
                  host, port, "autotune (not set)" if so_rcvbuf is None else so_rcvbuf,
                  granted_rcvbuf)
@@ -541,10 +632,15 @@ class Client:
             host, _, port = addr.partition(":")
             addr = (host, int(port))
         feats = p.FEAT_EXISTS_BITMAP  # in-order (no OOO); bitmap for per-key EXISTS
+        # Misses-by-cause telemetry (shared by every conn + the pool): the
+        # designed failure mode is a miss, so this is the primary signal.
+        self.counters = ClientCounters()
+        # One rate-limit clock per disclosure key (degrade/deadline lines).
+        self._warn_last: dict[str, float] = {}
 
         def factory():
             return _dial_one(addr, namespace, token, feats, connect_timeout, op_timeout,
-                             verify, so_rcvbuf)
+                             verify, so_rcvbuf, self.counters)
 
         self._streams = max(int(streams), 1)
         if get_fanout is None:
@@ -558,7 +654,8 @@ class Client:
                     f"get_fanout {gf} > streams {self._streams}: shards would "
                     "serialize on connection checkout — raise streams instead")
             self._get_fanout = gf
-        self._pool = Pool(factory, streams)
+        self._pool = Pool(factory, streams,
+                          on_evict=lambda: self.counters.bump("evictions"))
         # Prime one conn so limits are known and auth failures surface at construct.
         c = self._pool.checkout()
         self.limits = c.limits
@@ -583,15 +680,27 @@ class Client:
         self._executor.shutdown(wait=False)
         self._pool.close()
 
-    def _run(self, fn):
-        return self._pool.run(fn)
+    def _run(self, fn, checkout_timeout: float | None = None):
+        return self._pool.run(fn, checkout_timeout)
+
+    def _warn_rl(self, key: str, msg: str) -> None:
+        """Rate-limited WARNING (one line per key per interval): the degrade
+        paths fire per-shard under load, and a warn storm is its own outage."""
+        now = time.monotonic()
+        if now - self._warn_last.get(key, 0.0) >= _WARN_INTERVAL_S:
+            self._warn_last[key] = now
+            logger.warning("%s", msg)
 
     def _split(self, keys):
         cap = self.limits.max_batch_keys or len(keys)
         for i in range(0, len(keys), cap):
             yield keys[i:i + cap]
 
-    def batch_exists(self, keys):
+    def batch_exists(self, keys, deadline: float | None = None):
+        """deadline (optional, monotonic): wall-clock ceiling across EVERY
+        tile — checkout wait, sends, and recvs included — for callers whose
+        budget is smaller than op_timeout (the scheduler-side lookup). Past
+        it this raises ConnectionLost; the conn mid-exchange is evicted."""
         if not keys:
             return 0, []
         # Split above the negotiated cap; consecutive-prefix stops at the first
@@ -599,7 +708,12 @@ class Client:
         total_consec, per = 0, []
         broken = False
         for tile in self._split(keys):
-            nc, pk = self._run(lambda c: c.batch_exists(tile))  # noqa: B023 — lambda is invoked synchronously inside this iteration (Pool.run calls fn(conn) immediately); it never outlives the loop
+            co = None
+            if deadline is not None:
+                co = deadline - time.monotonic()
+                if co <= 0:
+                    raise ConnectionLost("EXISTS deadline exceeded before checkout")
+            nc, pk = self._run(lambda c: c.batch_exists(tile, deadline), co)  # noqa: B023 — lambda is invoked synchronously inside this iteration (Pool.run calls fn(conn) immediately); it never outlives the loop
             if pk is not None:
                 per.extend(pk)
             if not broken:
@@ -689,16 +803,29 @@ class Client:
         out = []
         base = idx_base
         for tile in self._split(keys):
-            if deadline is not None and time.monotonic() > deadline:
-                out.extend([p.Status.NOT_FOUND] * (len(keys) - len(out)))
-                return out
+            co = None
+            if deadline is not None:
+                co = deadline - time.monotonic()
+                if co <= 0:
+                    remaining = len(keys) - len(out)
+                    self.counters.bump("deadline_misses", remaining)
+                    self._warn_rl("deadline",
+                                  f"kvblockd GET deadline expired — {remaining} remaining "
+                                  "key(s) degraded to misses (recompute)")
+                    out.extend([p.Status.NOT_FOUND] * remaining)
+                    return out
             b = base
             try:
                 out.extend(self._run(
                     lambda c, t=tile, bb=b: c.batch_get_scatter(t, prefix_len, alloc, bb,
-                                                                deadline)))
-            except (ConnectionLost, FatalProtocol, OSError):
-                out.extend([p.Status.NOT_FOUND] * (len(keys) - len(out)))
+                                                                deadline), co))
+            except (ConnectionLost, FatalProtocol, OSError) as e:
+                remaining = len(keys) - len(out)
+                self.counters.bump("degraded_keys", remaining)
+                self._warn_rl("degrade",
+                              f"kvblockd GET shard failed ({len(keys)} key(s), {remaining} "
+                              f"degraded to misses): {e!r}")
+                out.extend([p.Status.NOT_FOUND] * remaining)
                 return out
             base += len(tile)
         return out

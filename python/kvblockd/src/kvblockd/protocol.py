@@ -11,6 +11,11 @@ from __future__ import annotations
 import struct
 from enum import IntEnum
 
+# Re-exported for compatibility: the error taxonomy lives in errors.py (one
+# root, KvblockdError, so `except KvblockdError` catches them), but wire-law
+# callers have always imported these two from the protocol module.
+from kvblockd.errors import FrameError, StatusError
+
 # --- CRC32C (Castagnoli, reflected, poly 0x1EDC6F41 → reflected 0x82F63B78) ---
 # One CRC per 64-byte frame; a pure-Python table is plenty and dependency-free.
 _CRC32C_POLY = 0x82F63B78
@@ -186,10 +191,6 @@ class Header:
         return h
 
 
-class FrameError(Exception):
-    """Malformed frame on the wire (bad magic/version/CRC or truncation)."""
-
-
 # --- body codecs ---
 def pack_preamble(status: int, count: int) -> bytes:
     return _PREAMBLE.pack(status & 0xFF, count)
@@ -292,13 +293,3 @@ class HelloResp:
         off = PREAMBLE_SIZE + _HELLO_RESP.size
         r.server_name = body[off:off + name_len].decode("utf-8", "replace")
         return r
-
-
-class StatusError(Exception):
-    """A non-OK verb status. The connection stays in sync (the caller may
-    re-pool it) — distinct from FrameError, which desyncs the stream."""
-
-    def __init__(self, op: int, status: int):
-        self.op = op
-        self.status = status
-        super().__init__(f"op {int(op):#x}: status {Status(status).name if status in Status._value2member_map_ else hex(status)}")
