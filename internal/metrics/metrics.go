@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -42,6 +43,17 @@ type Set struct {
 	misses    *prometheus.CounterVec
 	bytes     *prometheus.CounterVec
 	getBusy   *prometheus.CounterVec
+
+	// Failure-side instruments: degrade LOUDLY. authFails/aborts are the
+	// Recorder's failure surface (token brute-force and protocol-fatal
+	// teardowns once left zero server-side trace); serveFailed flips when
+	// the ops accept loop dies (the last successful scrape carries the
+	// hint); statsDecodeErrs separates "store idle" from "decoder broken
+	// since last deploy" when every tier gauge blanks at once.
+	authFails       prometheus.Counter
+	aborts          *prometheus.CounterVec
+	serveFailed     prometheus.Gauge
+	statsDecodeErrs prometheus.Counter
 }
 
 // New builds the registry. stats, when non-nil, is the store's Stats()
@@ -74,15 +86,32 @@ func New(stats func() []byte) *Set {
 			Name: "kvb_get_busy_total",
 			Help: "BATCH_GET per-key ERR_BUSY descriptors (NVMe reader saturation; retryable).",
 		}, []string{"ns"}),
+		authFails: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kvb_auth_failures_total",
+			Help: "Rejected HELLO authentications (coarse: no remote/token labels).",
+		}),
+		aborts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "kvb_conn_aborts_total",
+			Help: "Protocol-fatal connection aborts by status (fatal header CRC, credit violation, version reject).",
+		}, []string{"status"}),
+		serveFailed: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kvb_ops_serve_failed",
+			Help: "1 when the ops HTTP accept loop died with an error (the endpoint is gone; this is the last scrape's hint).",
+		}),
+		statsDecodeErrs: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kvb_stats_decode_errors_total",
+			Help: "Store Stats() documents the scrape collector could not decode (schema drift blanks every tier gauge; idle stores do not).",
+		}),
 	}
-	s.reg.MustRegister(s.opSeconds, s.hits, s.misses, s.bytes, s.getBusy)
+	s.reg.MustRegister(s.opSeconds, s.hits, s.misses, s.bytes, s.getBusy,
+		s.authFails, s.aborts, s.serveFailed, s.statsDecodeErrs)
 	s.reg.MustRegister(collectors.NewGoCollector()) // GC pause/heap — the launch-day GC defense reads these
 	// process_cpu_seconds_total / process_resident_memory_bytes — the ONLY
 	// cross-host way a benchmark client (on node A) reads the daemon's CPU
 	// (node B). client_golang emits these on both Linux and darwin.
 	s.reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	if stats != nil {
-		s.reg.MustRegister(&storeCollector{stats: stats})
+		s.reg.MustRegister(&storeCollector{stats: stats, decodeErrs: s.statsDecodeErrs})
 	}
 	return s
 }
@@ -148,6 +177,17 @@ func (s *Set) PutCommitted(ns uint32, n int) {
 	s.bytes.WithLabelValues("in", nsLabel(ns)).Add(float64(n))
 }
 
+// AuthFail records one rejected HELLO authentication. remote is deliberately
+// NOT a label (unbounded cardinality); the server's rate-limited log line
+// carries it.
+func (s *Set) AuthFail(string) { s.authFails.Inc() }
+
+// Abort records one protocol-fatal connection abort. Status strings are a
+// small closed set — bounded label cardinality by construction.
+func (s *Set) Abort(status protocol.Status) {
+	s.aborts.WithLabelValues(status.String()).Inc()
+}
+
 func nsLabel(ns uint32) string { return strconv.FormatUint(uint64(ns), 10) }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +206,8 @@ var (
 	// counter is scrape-time const, fed from the Stats JSON like the gauges.
 	descEvictions = prometheus.NewDesc("kvb_evictions_total",
 		"Blocks evicted under memory pressure.", []string{"tier"}, nil)
+	descGhostBytes = prometheus.NewDesc("kvb_eviction_ghost_bytes",
+		"Eviction-policy ghost/fingerprint memory summed across tenants — DRAM held OUTSIDE the arena budget (decays; see the S3-FIFO ghost ring).", nil, nil)
 	descLiveAllocs = prometheus.NewDesc("kvb_live_allocs",
 		"Live arena extents (the allocator node-pool watermark numerator).", []string{"tier"}, nil)
 	descMaxAllocs = prometheus.NewDesc("kvb_max_allocs",
@@ -228,9 +270,13 @@ var (
 
 // storeCollector decodes the store's Stats() JSON at scrape time. A document
 // that fails to decode yields no samples (never a scrape error — the wire
-// STATS verb is the debugging fallback).
+// STATS verb is the debugging fallback) but never SILENTLY: decodeErrs
+// counts it and a rate-limited log line carries the error, so an operator
+// can tell schema drift from an idle store.
 type storeCollector struct {
-	stats func() []byte
+	stats      func() []byte
+	decodeErrs prometheus.Counter
+	warnSec    atomic.Int64 // one decode-failure log line per second
 }
 
 func (c *storeCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -239,6 +285,7 @@ func (c *storeCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descArenaBytes
 	ch <- descPinned
 	ch <- descEvictions
+	ch <- descGhostBytes
 	ch <- descLiveAllocs
 	ch <- descMaxAllocs
 	ch <- descNvmeSegments
@@ -275,6 +322,7 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 		LargestFreeBytes float64            `json:"largest_free_region_bytes"`
 		PinnedBytes      map[string]float64 `json:"pinned_bytes"`
 		EvictionsTotal   float64            `json:"evictions_total"`
+		GhostBytes       float64            `json:"eviction_ghost_bytes"`
 		LiveAllocs       float64            `json:"live_allocs"`
 		MaxAllocs        float64            `json:"max_allocs"`
 		// Present only on a tiered store (nil otherwise — a DRAM-only
@@ -312,6 +360,10 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 		} `json:"s3"`
 	}
 	if err := json.Unmarshal(c.stats(), &doc); err != nil {
+		c.decodeErrs.Inc()
+		if sec := time.Now().Unix(); c.warnSec.Swap(sec) != sec {
+			slog.Warn("metrics: store stats document failed to decode — tier gauges blank this scrape", "err", err)
+		}
 		return
 	}
 	tier := doc.Store
@@ -329,6 +381,7 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(descPinned, prometheus.GaugeValue, b, ns)
 	}
 	ch <- prometheus.MustNewConstMetric(descEvictions, prometheus.CounterValue, doc.EvictionsTotal, tier)
+	ch <- prometheus.MustNewConstMetric(descGhostBytes, prometheus.GaugeValue, doc.GhostBytes)
 	if doc.MaxAllocs > 0 {
 		ch <- prometheus.MustNewConstMetric(descLiveAllocs, prometheus.GaugeValue, doc.LiveAllocs, tier)
 		ch <- prometheus.MustNewConstMetric(descMaxAllocs, prometheus.GaugeValue, doc.MaxAllocs, tier)
@@ -403,7 +456,12 @@ func (s *Set) Serve(ctx context.Context, addr string) (bound string, wait func()
 	go func() {
 		defer close(done)
 		if serr := srv.Serve(ln); serr != nil && !errors.Is(serr, http.ErrServerClosed) {
-			_ = serr // the ops port dying must never take the data plane with it
+			// The ops port dying must never take the data plane with it —
+			// but never SILENTLY: /metrics and /healthz vanishing looks
+			// identical to the daemon being down. Log it and flip the gauge
+			// so the LAST successful scrape carries the hint.
+			slog.Error("metrics: ops endpoint accept loop died", "addr", addr, "err", serr)
+			s.serveFailed.Set(1)
 		}
 	}()
 	go func() { //nolint:gosec // G118: shutdown must outlive the cancelled ctx; the fresh timeout context is the point
@@ -457,7 +515,7 @@ func (v *tenantView) Collect(ch chan<- prometheus.Metric) {
 		name string
 	}
 	var rows []row
-	v.reg.Each(func(ns *tenant.Namespace) { rows = append(rows, row{ns.ID, ns.Name}) })
+	v.reg.Each(func(ns tenant.NamespaceView) { rows = append(rows, row{ns.ID, ns.Name}) })
 	tiers := []tenant.Tier{tenant.TierDRAM, tenant.TierNVMe, tenant.TierS3}
 	for _, ns := range rows {
 		for _, t := range tiers {

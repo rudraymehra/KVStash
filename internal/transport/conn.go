@@ -172,6 +172,12 @@ func (c *Conn) WriteFrames(hdr protocol.Header, bufs net.Buffers, release func()
 // Receivers MUST NOT rely on the report arriving — and neither do we: if the
 // write queue is full, we just close. The report body carries no release.
 func (c *Conn) Abort(status protocol.Status) {
+	// Failure-side telemetry FIRST: an abort that closes the connection
+	// must never be invisible to the scrape (aborts were once counted by
+	// nothing at all).
+	if c.cfg.AbortHook != nil {
+		c.cfg.AbortHook(status)
+	}
 	body := protocol.AppendErrorResp(make([]byte, 0, protocol.PreambleSize), status)
 	hdr := protocol.Header{
 		Opcode:     protocol.OpNop,

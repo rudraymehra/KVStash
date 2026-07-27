@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -473,5 +474,89 @@ func BenchmarkBatchGet_32x1MB(b *testing.B) {
 				})
 			})
 		}
+	}
+}
+
+// failureRecorder counts the Recorder's failure surface.
+type failureRecorder struct {
+	authFails atomic.Int64
+	aborts    atomic.Int64
+}
+
+func (f *failureRecorder) Op(protocol.Opcode, float64)             {}
+func (f *failureRecorder) GetResult(uint32, string, int, int, int) {}
+func (f *failureRecorder) GetBusy(uint32, int)                     {}
+func (f *failureRecorder) PutCommitted(uint32, int)                {}
+func (f *failureRecorder) AuthFail(string)                         { f.authFails.Add(1) }
+func (f *failureRecorder) Abort(protocol.Status)                   { f.aborts.Add(1) }
+
+// TestAuthRejectLeavesServerSideTrace: a rotated/mistyped token (or a
+// brute-force) must be visible server-side — the client's ERR_AUTH_FAILED
+// alone was the only evidence before.
+func TestAuthRejectLeavesServerSideTrace(t *testing.T) {
+	cfg := config.Default()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.StreamTimeoutMS = 5000
+	ns := server.NewNamespaces("tenant-a", 7, testToken)
+	srv := server.New(cfg, ramstub.New(), ns)
+	rec := &failureRecorder{}
+	srv.SetRecorder(rec)
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer dcancel()
+		srv.Drain(dctx)
+	}()
+
+	if _, err := client.Dial(context.Background(), addr, client.Options{
+		Streams: 1, Namespace: "tenant-a", Token: "wrong-token",
+	}); err == nil {
+		t.Fatal("dial with a wrong token succeeded")
+	}
+	if got := rec.authFails.Load(); got != 1 {
+		t.Fatalf("AuthFail recorded %d times, want 1", got)
+	}
+}
+
+// TestMalformedHelloCountsAbort: a valid header carrying an unparseable
+// HELLO body tears the connection down with ERR_MALFORMED — like every
+// other HELLO reject it must land in the Recorder's abort counter, or a
+// peer spraying malformed HELLOs churns connections with zero server-side
+// trace.
+func TestMalformedHelloCountsAbort(t *testing.T) {
+	cfg := config.Default()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.StreamTimeoutMS = 5000
+	ns := server.NewNamespaces("tenant-a", 7, testToken)
+	srv := server.New(cfg, ramstub.New(), ns)
+	rec := &failureRecorder{}
+	srv.SetRecorder(rec)
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer dcancel()
+		srv.Drain(dctx)
+	}()
+
+	nc := rawConn(t, addr)
+	defer nc.Close()
+	writeRaw(t, nc, protocol.OpHello, 0, [32]byte{}, 1, []byte{0xde, 0xad}) // too short for any HELLO body
+	if st := readStatus(t, nc); st != protocol.StatusErrMalformed {
+		t.Fatalf("malformed hello answered %s, want ERR_MALFORMED", st)
+	}
+	if got := rec.aborts.Load(); got != 1 {
+		t.Fatalf("Abort recorded %d times for a malformed HELLO, want 1", got)
 	}
 }

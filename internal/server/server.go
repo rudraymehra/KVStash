@@ -9,6 +9,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"github.com/kvstash/kvblockd/internal/config"
 	"github.com/kvstash/kvblockd/internal/protocol"
@@ -84,6 +85,13 @@ type Recorder interface {
 	GetBusy(ns uint32, n int)
 	// PutCommitted is one committed block's payload bytes in.
 	PutCommitted(ns uint32, n int)
+	// AuthFail is one rejected HELLO authentication. remote is for the
+	// caller's own logging discretion — implementations keep the counter
+	// COARSE (no per-remote/per-token labels; cardinality discipline).
+	AuthFail(remote string)
+	// Abort is one protocol-fatal connection abort (fatal header CRC,
+	// credit violation, version reject) by status.
+	Abort(status protocol.Status)
 }
 
 // Server accepts and serves KVB1 connections.
@@ -101,6 +109,11 @@ type Server struct {
 	conns    map[*transport.Conn]struct{}
 
 	acceptDone chan struct{} // closed when acceptLoop has fully exited
+
+	// authWarnSec rate-limits the auth-reject warning to one line per
+	// second: token brute-force must leave a server-side trace without
+	// handing the attacker a log-flooding lever.
+	authWarnSec atomic.Int64
 }
 
 // New builds a server. cfg supplies the negotiated limits and timeouts; ns is
@@ -111,15 +124,24 @@ func New(cfg config.Config, store Store, ns *Namespaces) *Server {
 	lcfg.RcvBuf = cfg.SockRcvBuf
 	lcfg.WriteChunkBytes = cfg.WriteChunkBytes
 	lcfg.MaxConns = cfg.MaxConns
-	return &Server{
+	s := &Server{
 		cfg:        cfg,
 		store:      store,
 		ns:         ns,
-		lcfg:       lcfg,
 		logger:     slog.Default(),
 		conns:      make(map[*transport.Conn]struct{}),
 		acceptDone: make(chan struct{}),
 	}
+	// Failure-side telemetry: every transport-level protocol-fatal abort
+	// (fatal CRC, credit ViolationFatal) reaches the Recorder. The closure
+	// reads s.rec at abort time — SetRecorder runs before Start.
+	lcfg.AbortHook = func(st protocol.Status) {
+		if r := s.rec; r != nil {
+			r.Abort(st)
+		}
+	}
+	s.lcfg = lcfg
+	return s
 }
 
 // SetRecorder installs the metrics recorder. Call before Start; the sessions

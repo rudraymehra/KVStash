@@ -74,6 +74,12 @@ type Config struct {
 	// the cap is closed at accept, before any of its loops start; the slot
 	// frees when a live connection fully finishes (Done).
 	MaxConns int
+
+	// AbortHook, when non-nil, observes every protocol-fatal Abort (fatal
+	// header CRC, credit ViolationFatal, server-initiated) by status — the
+	// failure-side telemetry seam. Must be cheap and non-blocking; it runs
+	// on the aborting goroutine.
+	AbortHook func(status protocol.Status)
 }
 
 // minStallTimeout floors WriteStallTimeout so a misassembled Config can never

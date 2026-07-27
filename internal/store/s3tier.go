@@ -289,11 +289,15 @@ func (t *Tiered) s3FlipRetired(vol *nvme.Volume, id uint32) (stranded int) {
 // A failed restore changes nothing — the entries stay s3-only and keep
 // serving through readS3, loss-free.
 
-// s3RestoreBelt bounds one whole-segment restore end to end. The backend's
-// own OpTimeout is the real governor (the s3spill restorer allows 4× its
-// per-op deadline for whole objects); this belt only exists so a hung
+// s3RestoreBelt bounds one whole-segment restore WAIT end to end. The
+// backend's own OpTimeout is the real governor (the s3spill restorer allows
+// 4× its per-op deadline for whole objects); this belt only exists so a hung
 // third-party backend cannot wedge the restore goroutine — and with it the
-// per-segment latch — forever. A cut download fails loss-free.
+// per-segment latch — forever. A cut belt abandons the WAIT, not the work:
+// the backend's shared download runs detached and may still be streaming —
+// or adopting — after this pass counted a failure (see restoreOne for why
+// that is safe). Either way no bytes are lost: the entries stay s3-only and
+// keep serving through readS3 until a flip lands.
 const s3RestoreBelt = 60 * time.Second
 
 // restoreOne runs one queued restore on the restorer goroutine. The
@@ -302,6 +306,19 @@ const s3RestoreBelt = 60 * time.Second
 // reclaimSegment cannot retire it mid-flip — every holder TRY-acquires and
 // skips on busy, so the latch linearizes the segment's owners without ever
 // blocking (no lock-order edge exists; it is not a mutex anyone waits on).
+//
+// The latch bounds the ORCHESTRATOR's owners, not the backend: a belt-cut
+// RestoreSegment returns with its detached download/sink still running past
+// the latch release below. That is safe by construction, not by the latch —
+// AdoptSegment enforces its own serialization (closed re-check and an atomic
+// segs[id] publish under the volume lock; losers discard), the backend's
+// per-segment singleflight coalesces a retried restore onto the SAME running
+// download, gcPass/reclaim re-check liveness and spilled state under the
+// latch before acting, and a late adopt that does land merely re-creates the
+// aborted-retire shape handled below (live segment, s3-only stragglers — the
+// next cold hit flips them home without a download). At shutdown the
+// restorer's Close (cmd/kvblockd's cleanup stack) drains detached downloads,
+// whose adopts a closed volume refuses.
 func (t *Tiered) restoreOne(ctx context.Context, req restoreReq) {
 	if t.p.Restore == nil {
 		return

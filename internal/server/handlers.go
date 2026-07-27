@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"strconv"
+	"time"
 
 	"github.com/kvstash/kvblockd/internal/protocol"
 	"github.com/kvstash/kvblockd/internal/transport"
@@ -40,7 +41,13 @@ func (s *session) handleHello(c *transport.Conn, h protocol.Header, body []byte)
 	s.consume(c, h, body)
 	if err != nil {
 		// Valid header, unparseable body → ERR_MALFORMED (not FATAL_PROTOCOL,
-		// which is a header CRC/magic/version violation, §9).
+		// which is a header CRC/magic/version violation, §9). Counted like
+		// the version reject below: this reject also tears the connection
+		// down, and a peer spraying malformed HELLOs must leave a trace in
+		// kvb_conn_aborts_total, not fail invisibly.
+		if r := s.srv.rec; r != nil {
+			r.Abort(protocol.StatusErrMalformed)
+		}
 		s.fatalHello(c, h, protocol.StatusErrMalformed)
 		return
 	}
@@ -50,6 +57,9 @@ func (s *session) handleHello(c *transport.Conn, h protocol.Header, body []byte)
 		// Checked before auth: a version mismatch is answerable without
 		// touching the token, and an inverted range (min > max) can never
 		// contain v1, so it lands here too.
+		if r := s.srv.rec; r != nil {
+			r.Abort(protocol.StatusErrUnsupported)
+		}
 		s.fatalHello(c, h, protocol.StatusErrUnsupported)
 		return
 	}
@@ -57,6 +67,16 @@ func (s *session) handleHello(c *transport.Conn, h protocol.Header, body []byte)
 	if !ok {
 		// Bad token / unknown namespace collapse to ERR_AUTH_FAILED
 		// deliberately (no namespace-enumeration oracle; see namespaces.go).
+		// Server-side, the reject is COUNTED and (rate-limited) LOGGED with
+		// the peer address — a rotated/mistyped connector token or a token
+		// brute-force must leave a trace beyond the client's own error.
+		remote := c.RemoteAddr().String()
+		if r := s.srv.rec; r != nil {
+			r.AuthFail(remote)
+		}
+		if sec := time.Now().Unix(); s.srv.authWarnSec.Swap(sec) != sec {
+			s.srv.logger.Warn("hello auth rejected", "remote", remote, "namespace", req.Namespace)
+		}
 		s.fatalHello(c, h, protocol.StatusErrAuthFailed)
 		return
 	}

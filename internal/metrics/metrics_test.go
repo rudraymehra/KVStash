@@ -18,7 +18,8 @@ func fakeStats() []byte {
 		`"arena_bytes":67108864,"arena_free_bytes":63963136,` +
 		`"largest_free_region_bytes":63963136,"hugepages":false,` +
 		`"pinned_bytes":{"7":1048576},` +
-		`"evictions_total":12,"live_allocs":3,"max_allocs":131072}`)
+		`"evictions_total":12,"eviction_ghost_bytes":524288,` +
+		`"live_allocs":3,"max_allocs":131072}`)
 }
 
 func TestEndpointAndReadiness(t *testing.T) {
@@ -55,6 +56,7 @@ func TestEndpointAndReadiness(t *testing.T) {
 		`kvb_bytes_total{dir="out",ns="7"} 7.340032e+06`, // 5 MiB dram + 2 MiB nvme
 		`kvb_bytes_total{dir="in",ns="7"} 1.048576e+06`,
 		`kvb_evictions_total{tier="dram"} 12`,
+		`kvb_eviction_ghost_bytes 524288`, // policy memory outside the arena budget — must reach the scrape
 		`kvb_live_allocs{tier="dram"} 3`,
 		`kvb_max_allocs{tier="dram"} 131072`,
 		`kvb_blocks{tier="dram"} 3`,
@@ -204,10 +206,61 @@ func TestLabelCardinalityBounded(t *testing.T) {
 
 // TestStatsDecodeFailureIsSilent: a broken stats document yields no samples,
 // never a scrape error.
-func TestStatsDecodeFailureIsSilent(t *testing.T) {
+// TestStatsDecodeFailureNeverFailsScrapeButCounts: the never-fail-the-scrape
+// stance stands, but "degrade silently" and "degrade loudly" are different
+// things — schema drift blanking every tier gauge must be distinguishable
+// from an idle store.
+func TestStatsDecodeFailureNeverFailsScrapeButCounts(t *testing.T) {
 	set := New(func() []byte { return []byte("not json") })
 	if _, err := set.reg.Gather(); err != nil {
 		t.Fatalf("gather with a broken stats doc: %v", err)
+	}
+	// One gather runs collectors concurrently, so the counter's own sample
+	// may predate the storeCollector's increment — read it on the next.
+	mfs, err := set.reg.Gather()
+	if err != nil {
+		t.Fatalf("second gather: %v", err)
+	}
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "kvb_stats_decode_errors_total" {
+			found = true
+			if v := mf.GetMetric()[0].GetCounter().GetValue(); v < 1 {
+				t.Fatalf("decode errors counted %v, want >= 1", v)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("kvb_stats_decode_errors_total missing from the scrape")
+	}
+}
+
+// TestFailureSideCounters: the Recorder's failure surface reaches the
+// registry with bounded labels.
+func TestFailureSideCounters(t *testing.T) {
+	set := New(fakeStats)
+	set.AuthFail("192.0.2.9:5555")
+	set.AuthFail("192.0.2.9:5556")
+	set.Abort(protocol.StatusFatalProtocol)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, wait, err := set.Serve(ctx, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); wait() }()
+	body := httpBody(t, addr)
+	for _, want := range []string{
+		`kvb_auth_failures_total 2`,
+		`kvb_conn_aborts_total{status="FATAL_PROTOCOL"} 1`,
+		`kvb_ops_serve_failed 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("scrape missing %q", want)
+		}
+	}
+	if strings.Contains(body, "192.0.2.9") {
+		t.Fatal("remote address leaked into a metric label (cardinality)")
 	}
 }
 
