@@ -236,3 +236,52 @@ func TestAdmitMinHitsExplicitZeroSurvivesLoad(t *testing.T) {
 		t.Fatalf("absent nvme_admit_min_hits defaulted to %d, want 1", c2.NvmeAdmitMinHits)
 	}
 }
+
+// TestValidateIsDNSFree: address validation is pure syntax — a hostname
+// that does not resolve must still validate (ResolveTCPAddr here once made
+// a node rebooting before DNS was up crash-loop on "config invalid" for an
+// address that binds fine moments later).
+func TestValidateIsDNSFree(t *testing.T) {
+	c := Default()
+	c.MetricsAddr = "metrics.kvb-no-such-host.invalid:9442" // .invalid never resolves (RFC 2606)
+	if err := c.Validate(); err != nil {
+		t.Fatalf("hostname address failed pure-syntax validation: %v", err)
+	}
+}
+
+// TestValidateWireCeilings: the §4 floors have matching ceilings — "a wrong
+// config is an error the operator sees" cuts both directions.
+func TestValidateWireCeilings(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		expect string
+	}{
+		{"frame above ceiling", func(c *Config) { c.MaxFrameLen = 1<<30 + 1 }, "max_frame_len"},
+		{"frame at MaxUint32", func(c *Config) { c.MaxFrameLen = ^uint32(0) }, "max_frame_len"},
+		{"batch keys above ceiling", func(c *Config) { c.MaxBatchKeys = 65537 }, "max_batch_keys"},
+		{"credit above ceiling", func(c *Config) { c.InitialCredit = 1<<30 + 1 }, "initial_credit"},
+		{"non-numeric port", func(c *Config) { c.ListenAddr = "127.0.0.1:http" }, "listen_addr"},
+		{"port out of range", func(c *Config) { c.AdminAddr = "127.0.0.1:70000" }, "admin_addr"},
+	}
+	for _, tc := range cases {
+		c := Default()
+		tc.mutate(&c)
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("%s: accepted", tc.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.expect) {
+			t.Errorf("%s: error %q does not name %q", tc.name, err, tc.expect)
+		}
+	}
+	// At-the-ceiling values remain legal.
+	c := Default()
+	c.MaxFrameLen = 1 << 30
+	c.InitialCredit = 1 << 30
+	c.MaxBatchKeys = 65536
+	if err := c.Validate(); err != nil {
+		t.Fatalf("ceiling values rejected: %v", err)
+	}
+}

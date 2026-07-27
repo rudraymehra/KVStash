@@ -182,3 +182,14 @@ const (
 	MaxLeaseMS             = 60_000 // LEASE grants clamp here
 	DefaultStreamTimeoutMS = 30_000 // PUT_STREAM inactivity reaper; floor 5s
 )
+
+// Ceilings config validation enforces beside the §4 floors — "a wrong
+// config is an error the operator sees" cuts both directions. Without
+// them, max_frame_len accepted anything up to ~4 GiB (× max_conns of
+// per-connection frame buffering = an operator-armed OOM), and a
+// max_batch_keys past ~2^26 re-opens DecodeKeyList's 32-bit int wrap.
+const (
+	CapMaxFrameLen   = 1 << 30 // 1 GiB — comfortably above the 256 MiB default and the coalescing knee
+	CapMaxBatchKeys  = 65536
+	CapInitialCredit = 1 << 30 // matches the frame cap; credit above one max frame buys nothing
+)

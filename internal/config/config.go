@@ -302,8 +302,31 @@ func Load(path string, ov Overrides) (Config, error) {
 	return c, nil
 }
 
-// Validate checks the configuration against the PROTOCOL.md floors and basic
-// sanity. It mutates nothing: a wrong config is an error, not a clamp.
+// validateListenAddr is pure SYNTAX: host:port shape plus a numeric port
+// range. Deliberately no resolution — net.ResolveTCPAddr here made config
+// validation depend on a LIVE resolver: a node rebooting before DNS was up
+// crash-looped on "config invalid" for an address that would bind fine
+// moments later. Hostnames stay legal; resolution belongs at bind time,
+// where the retry/backoff policy lives.
+func validateListenAddr(addr string) error {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("port %q: must be numeric", port)
+	}
+	if n < 0 || n > 65535 {
+		return fmt.Errorf("port %d: out of range [0, 65535]", n)
+	}
+	return nil
+}
+
+// Validate checks the configuration against the PROTOCOL.md floors and
+// ceilings and basic sanity. It mutates nothing: a wrong config is an
+// error, not a clamp — and that cuts both directions (floors keep the
+// protocol honest, ceilings keep a fat-fingered limit from arming an OOM).
 func (c Config) Validate() error {
 	var errs []error
 	check := func(cond bool, format string, args ...any) {
@@ -322,7 +345,7 @@ func (c Config) Validate() error {
 		if a.addr == "" {
 			continue
 		}
-		if _, err := net.ResolveTCPAddr("tcp", a.addr); err != nil {
+		if err := validateListenAddr(a.addr); err != nil {
 			errs = append(errs, fmt.Errorf("%s %q: %w", a.name, a.addr, err))
 		}
 	}
@@ -330,12 +353,19 @@ func (c Config) Validate() error {
 	check(c.MaxConns >= 1, "max_conns %d: must be >= 1", c.MaxConns)
 	check(c.MaxBatchKeys >= protocol.FloorMaxBatchKeys,
 		"max_batch_keys %d: below the §4 floor %d", c.MaxBatchKeys, protocol.FloorMaxBatchKeys)
+	check(c.MaxBatchKeys <= protocol.CapMaxBatchKeys,
+		"max_batch_keys %d: above the ceiling %d", c.MaxBatchKeys, protocol.CapMaxBatchKeys)
 	check(c.MaxFrameLen >= protocol.FloorMaxFrameLen,
 		"max_frame_len %d: below the §4 floor %d", c.MaxFrameLen, protocol.FloorMaxFrameLen)
+	check(c.MaxFrameLen <= protocol.CapMaxFrameLen,
+		"max_frame_len %d: above the ceiling %d (max_conns × frames this large is an operator-armed OOM)",
+		c.MaxFrameLen, protocol.CapMaxFrameLen)
 	check(c.MaxBlobLen >= protocol.FloorMaxBlobLen,
 		"max_blob_len %d: below the §4 floor %d", c.MaxBlobLen, protocol.FloorMaxBlobLen)
 	check(c.InitialCredit >= protocol.FloorInitialCredit,
 		"initial_credit %d: below the §4 floor %d", c.InitialCredit, protocol.FloorInitialCredit)
+	check(c.InitialCredit <= protocol.CapInitialCredit,
+		"initial_credit %d: above the ceiling %d", c.InitialCredit, protocol.CapInitialCredit)
 	check(c.MaxBlobLen <= c.MaxFrameLen,
 		"max_blob_len %d exceeds max_frame_len %d", c.MaxBlobLen, c.MaxFrameLen)
 	check(c.StreamTimeoutMS >= 5000,
