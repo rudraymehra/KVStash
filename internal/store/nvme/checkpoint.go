@@ -8,7 +8,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 )
+
+// ckptIODelayForTest injects latency (nanoseconds) into the checkpoint's
+// file I/O — the deterministic handle for tests proving the writer
+// goroutine never carries that I/O. Zero in production.
+var ckptIODelayForTest atomic.Int64
 
 // Checkpoint format ckpt-<seq>.kvbi (buffered I/O — a different file class
 // from segments; written tmp → fsync → rename → fsync(dir)):
@@ -53,7 +60,15 @@ func ckptPath(dir string, seq uint64) string {
 // crash after an aborted retire silently loses the whole segment (a
 // reproduced data-loss bug). If that cap would cover nothing, skip this
 // checkpoint round entirely — footer scans stay authoritative.
+//
+// writeCheckpoint samples v.now() on the CALLING goroutine (Params.Now has
+// no thread-safety contract — modeltest's fake clock is single-threaded);
+// the async cadence path passes its own writer-goroutine sample instead.
 func (v *Volume) writeCheckpoint() error {
+	return v.writeCheckpointAt(v.now())
+}
+
+func (v *Volume) writeCheckpointAt(nowNanos int64) error {
 	v.ckptWriteMu.Lock()
 	defer v.ckptWriteMu.Unlock()
 	v.mu.RLock()
@@ -101,7 +116,10 @@ func (v *Volume) writeCheckpoint() error {
 	seq := v.ckptSeq + 1
 	v.mu.RUnlock()
 
-	if err := writeCkptFile(v.p.Dir, seq, v.now(), maxSealed, entries); err != nil {
+	if d := ckptIODelayForTest.Load(); d > 0 {
+		time.Sleep(time.Duration(d))
+	}
+	if err := writeCkptFile(v.p.Dir, seq, nowNanos, maxSealed, entries); err != nil {
 		return err
 	}
 	v.mu.Lock()

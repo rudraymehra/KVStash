@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -367,5 +368,120 @@ func TestVolumeDualResidencyLatestWins(t *testing.T) {
 	}
 	if got[0].Loc.SegmentID != loc2.SegmentID {
 		t.Fatalf("recovery kept segID %d, want the later %d", got[0].Loc.SegmentID, loc2.SegmentID)
+	}
+}
+
+// TestAppendCloseNeverAbandonsCallbacks: every Append that returned true
+// must get its OnWritten fired by the time Close returns — an accepted
+// request slipping past failQueuedAppends leaks the demoter's arena
+// reader-ref forever. The lock now enforces the ordering the prose contract
+// ("the tiered store stops its loops first") used to merely describe.
+//
+// Two phases: a DETERMINISTIC one (appendDelayForTest parks one Append
+// inside its check→send window while Close runs to completion — without
+// appendMu that Append sends into the already-drained queue and returns
+// true with a callback nobody will ever fire), then the original stress
+// loop as a belt over schedules the hook does not model.
+func TestAppendCloseNeverAbandonsCallbacks(t *testing.T) {
+	{
+		v, _, _ := openTestVolume(t, t.TempDir())
+		appendDelayForTest.Store(int64(100 * time.Millisecond))
+		var accepted, answered atomic.Int64
+		done := make(chan struct{})
+		p := testPayload(0, 512)
+		go func() {
+			defer close(done)
+			ok := v.Append(AppendReq{
+				NS: 1, Key: testKey(1), XXH3: xxh3.Hash(p), Data: p,
+				OnWritten: func(Loc, bool) { answered.Add(1) },
+			})
+			if ok {
+				accepted.Add(1)
+			}
+		}()
+		time.Sleep(20 * time.Millisecond) // the appender is parked inside the window
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+		<-done
+		appendDelayForTest.Store(0)
+		if a, ans := accepted.Load(), answered.Load(); ans != a {
+			t.Fatalf("deterministic window: %d accepted but %d callbacks — Close ran through Append's check/send gap", a, ans)
+		}
+	}
+	for iter := 0; iter < 40; iter++ {
+		v, _, _ := openTestVolume(t, t.TempDir())
+		var accepted, answered atomic.Int64
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				p := testPayload(g, 512)
+				for i := 0; ; i++ {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					ok := v.Append(AppendReq{
+						NS: 1, Key: testKey(g*1_000_000 + i), XXH3: xxh3.Hash(p), Data: p,
+						OnWritten: func(Loc, bool) { answered.Add(1) },
+					})
+					if ok {
+						accepted.Add(1)
+					}
+				}
+			}(g)
+		}
+		time.Sleep(2 * time.Millisecond)
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+		close(stop)
+		wg.Wait()
+		if a, ans := accepted.Load(), answered.Load(); ans != a {
+			t.Fatalf("iter %d: %d accepted appends but %d callbacks — %d arena refs leaked past Close",
+				iter, a, ans, a-ans)
+		}
+	}
+}
+
+// TestCheckpointDoesNotStallAppends: the checkpoint's O(total blocks) file
+// I/O must run OFF the writer goroutine — inline it stalls every append
+// (and drops demotions once the 128-deep queue fills) for the checkpoint's
+// full duration on every cadence tick.
+func TestCheckpointDoesNotStallAppends(t *testing.T) {
+	ckptIODelayForTest.Store(int64(600 * time.Millisecond))
+	defer ckptIODelayForTest.Store(0)
+
+	v, _, _ := openTestVolume(t, t.TempDir()) // CkptEverySegs: 2
+	defer func() { _ = v.Close() }()
+
+	worst := time.Duration(0)
+	for i := 0; i < 12; i++ { // ~3 records/segment → ≥4 seals → ≥1 checkpoint due
+		start := time.Now()
+		appendWait(t, v, i, 64<<10)
+		if el := time.Since(start); el > worst {
+			worst = el
+		}
+	}
+	if worst > 300*time.Millisecond {
+		t.Fatalf("append stalled %v behind checkpoint I/O — the checkpoint is running on the writer goroutine", worst)
+	}
+	waitForCkpt(t, v)
+}
+
+// waitForCkpt blocks until at least one checkpoint completed — the cadence
+// checkpoint's file I/O is asynchronous, so fixtures must wait, not probe.
+func waitForCkpt(t *testing.T, v *Volume) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for v.ckpts.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no checkpoint ever completed")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }

@@ -119,9 +119,13 @@ func (v *Volume) HasSegment(id uint32) bool {
 // with the object already gone — the restored blocks were lost on every
 // tier.
 //
-// The caller serializes adopts per segment id (the tiered store's
-// spillInflight latch) and only adopts ids this volume once minted, so an
-// adopted id can never collide with the active segment's.
+// Adopt serialization is enforced HERE, not by the caller: the tiered
+// store's spillInflight latch can be released while a belt-cut restore's
+// detached download is still running, so a concurrent or late adopt of the
+// same id is legal. The closed check plus the segs[id] re-check under v.mu
+// make the publish atomic (losers close and remove their file), and the
+// id >= nextID guard admits only ids this volume once minted — an adopted
+// id can never collide with the active segment's.
 func (v *Volume) AdoptSegment(id uint32, r io.Reader) error {
 	if v.closed.Load() {
 		return fmt.Errorf("nvme: adopt segment %d: volume closed", id)

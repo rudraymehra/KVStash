@@ -326,10 +326,16 @@ func (v *Volume) clearReadOnly() {
 	v.mu.Unlock()
 }
 
-// maybeCheckpoint writes a checkpoint of every sealed segment's entries
-// after CkptEverySegs seals. Runs on the writer goroutine; failure is
-// logged and retried at the next seal (checkpoints are an optimization —
-// recovery falls back to footer scans).
+// maybeCheckpoint triggers a checkpoint of every sealed segment's entries
+// after CkptEverySegs seals. Called on the writer goroutine, but the
+// O(total blocks) serialize + write + fsync + rename + dir-fsync runs on a
+// dedicated goroutine: inline it once stalled ALL appends for hundreds of
+// ms per checkpoint on large volumes, dropping demotions on every cadence
+// tick. One checkpoint in flight at a time; a round skipped because one is
+// still writing (or that fails) retries at the next seal — checkpoints are
+// an optimization, recovery falls back to footer scans. Sealed entries are
+// immutable, so the snapshot is safe off-thread; Close waits on ckptWG so
+// a checkpoint never races the next process generation on this dir.
 func (v *Volume) maybeCheckpoint() {
 	v.mu.RLock()
 	due := v.p.CkptEverySegs > 0 && v.sealsSinceCkpt >= v.p.CkptEverySegs
@@ -337,14 +343,23 @@ func (v *Volume) maybeCheckpoint() {
 	if !due {
 		return
 	}
-	start := time.Now()
-	if err := v.writeCheckpoint(); err != nil {
-		v.log.Warn("nvme: checkpoint write failed (will retry next seal)", "err", err)
-		return
+	if !v.ckptInFlight.CompareAndSwap(false, true) {
+		return // one still writing — retry at the next seal
 	}
-	v.mu.Lock()
-	v.sealsSinceCkpt = 0
-	v.mu.Unlock()
-	v.ckpts.Add(1)
-	v.log.Info("nvme: checkpoint written", "dir", v.p.Dir, "took", time.Since(start))
+	ts := v.now() // sampled HERE: Params.Now is not thread-safe by contract
+	v.ckptWG.Add(1)
+	go func() {
+		defer v.ckptWG.Done()
+		defer v.ckptInFlight.Store(false)
+		start := time.Now()
+		if err := v.writeCheckpointAt(ts); err != nil {
+			v.log.Warn("nvme: checkpoint write failed (will retry next seal)", "err", err)
+			return
+		}
+		v.mu.Lock()
+		v.sealsSinceCkpt = 0
+		v.mu.Unlock()
+		v.ckpts.Add(1)
+		v.log.Info("nvme: checkpoint written", "dir", v.p.Dir, "took", time.Since(start))
+	}()
 }

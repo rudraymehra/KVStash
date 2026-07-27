@@ -1,9 +1,8 @@
 package nvme
 
 import (
-	"context"
-
 	"bytes"
+	"context"
 	"os"
 	"testing"
 )
@@ -256,9 +255,7 @@ func TestCheckpointInterplay(t *testing.T) {
 	for i := 0; i < n; i++ {
 		_, sums[i] = appendWait(t, v, i, 60<<10)
 	}
-	if v.ckpts.Load() == 0 {
-		t.Fatal("fixture wrote no checkpoint")
-	}
+	waitForCkpt(t, v)
 	if err := v.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -315,9 +312,7 @@ func TestCheckpointCorruptFallsBack(t *testing.T) {
 	for i := 0; i < n; i++ {
 		_, sums[i] = appendWait(t, v, i, 60<<10)
 	}
-	if v.ckpts.Load() == 0 {
-		t.Fatal("fixture wrote no checkpoint")
-	}
+	waitForCkpt(t, v)
 	if err := v.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -360,9 +355,7 @@ func TestCheckpointReferencingReclaimedSegment(t *testing.T) {
 	for i := 0; i < n; i++ {
 		appendWait(t, v, i, 60<<10)
 	}
-	if v.ckpts.Load() == 0 {
-		t.Fatal("fixture wrote no checkpoint")
-	}
+	waitForCkpt(t, v)
 	id, entries, ok := v.OldestSealed(0)
 	if !ok {
 		t.Fatal("nothing sealed")

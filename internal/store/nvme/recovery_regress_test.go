@@ -29,9 +29,7 @@ func TestCheckpointRoundTripAcrossRestarts(t *testing.T) {
 	for i := 0; i < n; i++ {
 		_, sums[i] = appendWait(t, v1, i, 60<<10)
 	}
-	if v1.ckpts.Load() == 0 {
-		t.Fatal("fixture wrote no checkpoint")
-	}
+	waitForCkpt(t, v1)
 	if err := v1.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -46,9 +44,7 @@ func TestCheckpointRoundTripAcrossRestarts(t *testing.T) {
 	for i := 100; i < 100+9; i++ { // ≥3 more seals → ≥1 new checkpoint
 		appendWait(t, v2, i, 60<<10)
 	}
-	if v2.ckpts.Load() == 0 {
-		t.Fatal("generation 2 wrote no checkpoint")
-	}
+	waitForCkpt(t, v2)
 	if err := v2.Close(); err != nil {
 		t.Fatal(err)
 	}

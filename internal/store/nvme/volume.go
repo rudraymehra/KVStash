@@ -104,8 +104,22 @@ type Volume struct {
 	nextID   uint32
 	readOnly bool
 
+	// appendMu is read-held across Append's closed-check+send and write-held
+	// across Close's flag-flip+writer-drain, so an accepted request can never
+	// slip into the queue AFTER failQueuedAppends ran — the TOCTOU that would
+	// leak the demoter's arena reader-ref forever. Enforced here, not by the
+	// prose "the tiered store stops its loops first". Uncontended in steady
+	// state.
+	appendMu sync.RWMutex
+
 	sealsSinceCkpt int
 	ckptSeq        uint64
+	// ckptInFlight + ckptWG: the cadence checkpoint's file I/O runs on its
+	// own goroutine (never the writer's — an O(total blocks) write+fsync
+	// there stalls every append and drops demotions); the flag skips a new
+	// round while one is still writing, the WaitGroup lets Close wait it out.
+	ckptInFlight atomic.Bool
+	ckptWG       sync.WaitGroup
 	// ckptWriteMu serializes whole checkpoint writes: the sequence number and
 	// the tmp file path both derive from ckptSeq, so the writer goroutine's
 	// cadence checkpoint and AdoptSegment's post-adopt checkpoint must never
@@ -196,12 +210,26 @@ func OpenVolume(p VolumeParams) (*Volume, *RecoveryReport, []RecoveredEntry, err
 	return v, report, entries, nil
 }
 
+// appendDelayForTest injects latency (nanoseconds) between Append's closed
+// check and its queue send — zero in production. It holds the check→send
+// window open so the close-race regression test FAILS deterministically
+// without appendMu instead of only under a lucky scheduler (the
+// ckptIODelayForTest pattern).
+var appendDelayForTest atomic.Int64
+
 // Append hands one record to the writer. Non-blocking: false means the
 // queue is full or the volume is read-only/closed — the caller re-admits
-// the victim and drops the demotion (fire-and-forget posture).
+// the victim and drops the demotion (fire-and-forget posture). The
+// read-lock spans check+send: an accepted request is guaranteed a callback
+// (writer, drain, or failQueuedAppends — never abandoned).
 func (v *Volume) Append(r AppendReq) bool {
+	v.appendMu.RLock()
+	defer v.appendMu.RUnlock()
 	if v.closed.Load() {
 		return false
+	}
+	if d := appendDelayForTest.Load(); d > 0 {
+		time.Sleep(time.Duration(d))
 	}
 	v.mu.RLock()
 	ro := v.readOnly
@@ -316,12 +344,16 @@ func (v *Volume) StatsInto(m map[string]int64) {
 // re-admission path runs, no arena ref leaks), stops the readers, and
 // closes every segment. The tiered store stops its loops before calling.
 func (v *Volume) Close() error {
+	v.appendMu.Lock()
 	if !v.closed.CompareAndSwap(false, true) {
+		v.appendMu.Unlock()
 		return nil
 	}
 	close(v.writerStop)
 	<-v.writerDone
 	v.failQueuedAppends()
+	v.appendMu.Unlock()
+	v.ckptWG.Wait()
 	close(v.readStop)
 	v.readerWG.Wait()
 	v.closeSegments()
@@ -348,13 +380,17 @@ func (v *Volume) failQueuedAppends() {
 // then closes the fds. The next OpenVolume on the same dir exercises real
 // recovery. Callers (modeltest) ensure no reads are in flight.
 func (v *Volume) CrashForTest() {
+	v.appendMu.Lock()
 	if !v.closed.CompareAndSwap(false, true) {
+		v.appendMu.Unlock()
 		return
 	}
 	v.crashed.Store(true)
 	close(v.writerStop)
 	<-v.writerDone
 	v.failQueuedAppends() // parent-side bookkeeping survives a crash; only the DISK state is abandoned
+	v.appendMu.Unlock()
+	v.ckptWG.Wait()
 	close(v.readStop)
 	v.readerWG.Wait()
 	v.mu.Lock()
