@@ -79,6 +79,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zeebo/xxh3"
@@ -96,10 +98,24 @@ type S3Compat struct {
 	store        Store
 	ns           *Namespaces
 	maxBlobLen   uint32
+	maxConns     int
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 	logger       *slog.Logger
+	rec          Recorder // nil = no metrics (same seam as the wire server)
+
+	// putGate bounds concurrent PutObject payload buffers: each handler
+	// pins up to max_blob_len for a body read the ReadTimeout lets take
+	// tens of seconds — ungated, N slow authenticated PUTs pin N ×
+	// max_blob_len (the class of hole the data plane's caps closed).
+	putGate    chan struct{}
+	putGateLog atomic.Bool // one-shot saturation warning (the capLog pattern)
 }
+
+// s3compatMaxConcurrentPuts sizes putGate: 8 × the 32 MiB default
+// max_blob_len = 256 MiB worst-case pinned, and the refusal is S3's
+// retryable SlowDown.
+const s3compatMaxConcurrentPuts = 8
 
 // NewS3Compat builds the handler against the SAME store and tenant table the
 // wire server dispatches to. cfg supplies max_blob_len — the identical
@@ -120,11 +136,19 @@ func NewS3Compat(cfg config.Config, store Store, ns *Namespaces) *S3Compat {
 		store:        store,
 		ns:           ns,
 		maxBlobLen:   cfg.MaxBlobLen,
+		maxConns:     cfg.MaxConns,
 		readTimeout:  time.Duration(st) * time.Millisecond,
 		writeTimeout: transport.StallTimeout(st),
 		logger:       slog.Default(),
+		putGate:      make(chan struct{}, s3compatMaxConcurrentPuts),
 	}
 }
+
+// SetRecorder installs the metrics recorder (call before Serve). Without it,
+// obj-client traffic is invisible to the kvb_* capacity and per-namespace
+// ingest series — every plane that accepts the same traffic feeds the same
+// meters.
+func (h *S3Compat) SetRecorder(r Recorder) { h.rec = r }
 
 // Serve binds addr and serves until ctx is cancelled (mirrors metrics.Serve).
 // wait blocks until the server has fully stopped and reports whether shutdown
@@ -136,6 +160,12 @@ func (h *S3Compat) Serve(ctx context.Context, addr string) (bound string, wait f
 	if err != nil {
 		return "", nil, err
 	}
+	bound = ln.Addr().String()
+	// Enforce the SAME connection cap the data plane documents as "the
+	// cheap DoS floor": net/http spawns one goroutine per connection
+	// unbounded, and every slow (even pre-auth, header-holding) connection
+	// is a goroutine plus buffers otherwise.
+	ln = newLimitListener(ln, h.maxConns)
 	// The deadlines mirror the data plane's transport.Config intent
 	// (transport/listener.go): ReadTimeout plays BodyReadTimeout — the
 	// slow-loris guard that keeps a 2-byte dribble from pinning the
@@ -175,7 +205,57 @@ func (h *S3Compat) Serve(ctx context.Context, addr string) (bound string, wait f
 		<-shutdownDone // orders the `clean` write before the read below
 		return clean
 	}
-	return ln.Addr().String(), wait, nil
+	return bound, wait, nil
+}
+
+// limitListener bounds concurrently live accepted connections —
+// x/net/netutil.LimitListener semantics inlined (blocking Accept, slot
+// released on conn Close) to keep the static-build dependency surface flat.
+type limitListener struct {
+	net.Listener
+	sem       chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newLimitListener(ln net.Listener, n int) net.Listener {
+	if n <= 0 {
+		return ln // 0 = unlimited, mirroring transport.Config.MaxConns
+	}
+	return &limitListener{Listener: ln, sem: make(chan struct{}, n), done: make(chan struct{})}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	select {
+	case l.sem <- struct{}{}:
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+	c, err := l.Listener.Accept()
+	if err != nil {
+		<-l.sem
+		return nil, err
+	}
+	return &limitConn{Conn: c, release: sync.OnceFunc(func() { <-l.sem })}, nil
+}
+
+func (l *limitListener) Close() error {
+	err := l.Listener.Close()
+	l.closeOnce.Do(func() { close(l.done) })
+	return err
+}
+
+// limitConn releases its accept slot exactly once on Close (net/http can
+// close a hijacked or timed-out conn more than once).
+type limitConn struct {
+	net.Conn
+	release func()
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.release()
+	return err
 }
 
 // ServeHTTP routes one request: capability guards → path split → tenant auth
@@ -256,6 +336,21 @@ func (h *S3Compat) putObject(w http.ResponseWriter, r *http.Request, ns uint32, 
 			fmt.Sprintf("object is %d bytes; max_blob_len is %d", r.ContentLength, h.maxBlobLen))
 		return
 	}
+	// The payload buffer is gated: each slot pins up to max_blob_len for a
+	// body read the ReadTimeout allows to take tens of seconds. Saturation
+	// answers SlowDown (S3's retryable backoff code), logged once.
+	select {
+	case h.putGate <- struct{}{}:
+		defer func() { <-h.putGate }()
+	default:
+		if h.putGateLog.CompareAndSwap(false, true) {
+			h.logger.Warn("s3compat: concurrent PutObject buffer gate saturated — answering SlowDown (logged once)",
+				"slots", s3compatMaxConcurrentPuts, "max_blob_len", h.maxBlobLen)
+		}
+		h.writeError(w, r, http.StatusServiceUnavailable, "SlowDown",
+			"concurrent PutObject buffers exhausted; retry")
+		return
+	}
 	// Backstop tripwire: the checks above are the real refusals (declared
 	// oversize never allocates, undeclared length never reads). MaxBytesReader
 	// guarantees that if a future path ever reaches ReadFull without a
@@ -280,6 +375,9 @@ func (h *S3Compat) putObject(w http.ResponseWriter, r *http.Request, ns uint32, 
 	case protocol.StatusOK, protocol.StatusOKExists:
 		// OK_EXISTS is the write-once idempotent hit (same key, same digest):
 		// a success on the wire (§3.4) and a success here.
+		if h.rec != nil {
+			h.rec.PutCommitted(ns, len(buf))
+		}
 		w.Header().Set("ETag", etagOf(sum))
 		w.WriteHeader(http.StatusOK)
 	case protocol.StatusErrImmutableConflict:
@@ -292,6 +390,9 @@ func (h *S3Compat) putObject(w http.ResponseWriter, r *http.Request, ns uint32, 
 		// S3's retryable slow-down code; SDKs back off and retry on 503.
 		h.writeError(w, r, http.StatusServiceUnavailable, "SlowDown", "transient backpressure; retry")
 	default:
+		// Never let an internal refusal vanish into client-side XML only —
+		// on-call reads server logs, not the peer's SDK traces.
+		h.logger.Warn("s3compat: store refused a PutObject", "ns", ns, "status", st.String())
 		h.writeError(w, r, http.StatusInternalServerError, "InternalError",
 			"store refused the write: "+st.String())
 	}
@@ -301,13 +402,22 @@ func (h *S3Compat) putObject(w http.ResponseWriter, r *http.Request, ns uint32, 
 // pair share lookup, headers, and Range arithmetic; HEAD just never writes
 // the body (S3 HEAD honors Range in its headers, and so does this).
 func (h *S3Compat) getObject(w http.ResponseWriter, r *http.Request, ns uint32, key [32]byte, head bool) {
-	data, sum, st := h.getCopy(r.Context(), ns, key)
+	data, sum, tier, st := h.getCopy(r.Context(), ns, key)
 	switch st {
 	case protocol.StatusOK:
+		if h.rec != nil {
+			h.rec.GetResult(ns, tier, 1, 0, len(data))
+		}
 	case protocol.StatusErrBusy:
+		if h.rec != nil {
+			h.rec.GetBusy(ns, 1)
+		}
 		h.writeError(w, r, http.StatusServiceUnavailable, "SlowDown", "device readers saturated; retry")
 		return
 	default:
+		if h.rec != nil {
+			h.rec.GetResult(ns, tier, 0, 1, 0)
+		}
 		// Absent here INCLUDES present-in-another-namespace: isolation is
 		// NOT_FOUND semantics, never a FORBIDDEN that leaks existence.
 		h.writeError(w, r, http.StatusNotFound, "NoSuchKey",
@@ -349,7 +459,9 @@ func (h *S3Compat) getObject(w http.ResponseWriter, r *http.Request, ns uint32, 
 // ALWAYS returns a heap copy, releasing any arena reference before returning:
 // an HTTP writer can stall for seconds, and holding a block reference across
 // that would fight DELETE/eviction for the extent's lifetime.
-func (h *S3Compat) getCopy(ctx context.Context, ns uint32, key [32]byte) (data []byte, sum uint64, st protocol.Status) {
+// tier reports which tier served the hit ("dram" when the store cannot say
+// — the Recorder label stays consistent with the wire plane's).
+func (h *S3Compat) getCopy(ctx context.Context, ns uint32, key [32]byte) (data []byte, sum uint64, tier string, st protocol.Status) {
 	copyOut := func(view []byte, release func()) []byte {
 		out := make([]byte, len(view))
 		copy(out, view)
@@ -360,23 +472,23 @@ func (h *S3Compat) getCopy(ctx context.Context, ns uint32, key [32]byte) (data [
 	}
 	switch s := h.store.(type) {
 	case tierRefGetter:
-		view, x, rel, _, tst := s.GetRefTier(ctx, ns, key)
+		view, x, rel, tr, tst := s.GetRefTier(ctx, ns, key)
 		if tst != protocol.StatusOK {
-			return nil, 0, tst
+			return nil, 0, "dram", tst
 		}
-		return copyOut(view, rel), x, protocol.StatusOK
+		return copyOut(view, rel), x, tr, protocol.StatusOK
 	case refGetter:
 		view, x, rel, ok := s.GetRef(ns, key)
 		if !ok {
-			return nil, 0, protocol.StatusNotFound
+			return nil, 0, "dram", protocol.StatusNotFound
 		}
-		return copyOut(view, rel), x, protocol.StatusOK
+		return copyOut(view, rel), x, "dram", protocol.StatusOK
 	default:
 		d, x, ok := h.store.Get(ns, key)
 		if !ok {
-			return nil, 0, protocol.StatusNotFound
+			return nil, 0, "dram", protocol.StatusNotFound
 		}
-		return d, x, protocol.StatusOK
+		return d, x, "dram", protocol.StatusOK
 	}
 }
 

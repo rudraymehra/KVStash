@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -494,4 +495,144 @@ func TestS3CompatSlowBodyBounded(t *testing.T) {
 	if !wait() {
 		t.Fatal("shutdown was not clean — the stalled handler is still pinned")
 	}
+}
+
+// countingRecorder is a Recorder double for the compat plane's metrics seam.
+type countingRecorder struct {
+	mu           sync.Mutex
+	putBytes     int
+	puts         int
+	hits, misses int
+	bytesOut     int
+	busy         int
+}
+
+func (c *countingRecorder) Op(protocol.Opcode, float64) {}
+func (c *countingRecorder) AuthFail(string)             {}
+func (c *countingRecorder) Abort(protocol.Status)       {}
+func (c *countingRecorder) GetResult(_ uint32, _ string, hits, misses, bytesOut int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.hits += hits
+	c.misses += misses
+	c.bytesOut += bytesOut
+}
+
+func (c *countingRecorder) GetBusy(_ uint32, n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.busy += n
+}
+
+func (c *countingRecorder) PutCommitted(_ uint32, n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.puts++
+	c.putBytes += n
+}
+
+// TestS3CompatFeedsRecorder: obj-client traffic must land in the SAME
+// metrics seam the wire plane feeds — bytes moved over the compat port were
+// invisible to kvb_* capacity and per-namespace ingest series.
+func TestS3CompatFeedsRecorder(t *testing.T) {
+	rec := &countingRecorder{}
+	h := server.NewS3Compat(config.Default(), ramstub.New(), s3TwoTenants(t))
+	h.SetRecorder(rec)
+	ts := httptest.NewServer(h)
+	t.Cleanup(ts.Close)
+
+	payload := s3payload(4096)
+	wantStatus(t, s3do(t, ts, http.MethodPut, "/bucket-a/"+s3key(1), bearer(s3TokenA), payload, nil), http.StatusOK)
+	wantStatus(t, s3do(t, ts, http.MethodGet, "/bucket-a/"+s3key(1), bearer(s3TokenA), nil, nil), http.StatusOK)
+	wantStatus(t, s3do(t, ts, http.MethodGet, "/bucket-a/"+s3key(2), bearer(s3TokenA), nil, nil), http.StatusNotFound)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.puts != 1 || rec.putBytes != len(payload) {
+		t.Fatalf("PutCommitted: %d calls / %d bytes, want 1 / %d", rec.puts, rec.putBytes, len(payload))
+	}
+	if rec.hits != 1 || rec.bytesOut != len(payload) {
+		t.Fatalf("GetResult hits: %d / %d bytes out, want 1 / %d", rec.hits, rec.bytesOut, len(payload))
+	}
+	if rec.misses != 1 {
+		t.Fatalf("GetResult misses: %d, want 1", rec.misses)
+	}
+}
+
+// TestS3CompatConnCapEnforced: the compat listener enforces max_conns — the
+// data plane's "cheap DoS floor" — instead of one unbounded goroutine per
+// held-open connection.
+func TestS3CompatConnCapEnforced(t *testing.T) {
+	cfg := config.Default()
+	cfg.MaxConns = 1
+	h := server.NewS3Compat(cfg, ramstub.New(), s3TwoTenants(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bound, wait, err := h.Serve(ctx, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); wait() }()
+
+	// Connection 1 holds the only slot (no request — a header-holding peer).
+	hog, err := net.Dial("tcp", bound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hog.Close()
+
+	// Connection 2 must NOT be served while the slot is held.
+	fast := &http.Client{Timeout: 400 * time.Millisecond}
+	if resp, err := fast.Get("http://" + bound + "/"); err == nil { //nolint:noctx // test-local
+		_ = resp.Body.Close()
+		t.Fatal("second connection served with max_conns=1 and the slot held — no connection cap")
+	}
+
+	// Releasing the slot un-wedges the plane.
+	_ = hog.Close()
+	slow := &http.Client{Timeout: 5 * time.Second}
+	resp, err := slow.Get("http://" + bound + "/")
+	if err != nil {
+		t.Fatalf("request after slot release: %v", err)
+	}
+	_ = resp.Body.Close()
+}
+
+// TestS3CompatPutBufferGate: N slow authenticated PUTs must not pin more
+// than the gate's worth of max_blob_len buffers — the overflow PUT answers
+// SlowDown (retryable) instead of allocating.
+func TestS3CompatPutBufferGate(t *testing.T) {
+	h := server.NewS3Compat(config.Default(), ramstub.New(), s3TwoTenants(t))
+	ts := httptest.NewServer(h)
+	t.Cleanup(ts.Close)
+
+	// Hold gate slots with slow PUTs: headers + partial body, then stall.
+	const gateSlots = 8 // s3compatMaxConcurrentPuts
+	conns := make([]net.Conn, 0, gateSlots)
+	t.Cleanup(func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	addr := strings.TrimPrefix(ts.URL, "http://")
+	for i := 0; i < gateSlots; i++ {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, c)
+		req := "PUT /bucket-a/" + s3key(byte(100+i)) + " HTTP/1.1\r\n" +
+			"Host: " + addr + "\r\n" +
+			"Authorization: " + bearer(s3TokenA) + "\r\n" +
+			"Content-Length: 1024\r\n\r\npartial"
+		if _, err := c.Write([]byte(req)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Let the handlers reach the gated body read.
+	time.Sleep(200 * time.Millisecond)
+
+	r := s3do(t, ts, http.MethodPut, "/bucket-a/"+s3key(200), bearer(s3TokenA), s3payload(1024), nil)
+	body := wantStatus(t, r, http.StatusServiceUnavailable)
+	wantErrCode(t, body, "SlowDown")
 }
