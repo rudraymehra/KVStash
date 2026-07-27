@@ -288,3 +288,76 @@ def test_pool_survives_verb_after_status_error(client):
     assert client.delete([k], force=False)[0] == p.Status.ERR_LEASED
     # If the slot leaked, this would hang; a working pool answers promptly.
     assert client.stats().startswith(b"{") or b"dram" in client.stats()
+
+
+# ------------------------- GET fan-out knob (get_fanout) -------------------
+
+
+def _count_shards(c, n_keys):
+    """Drive one batch_get_scatter and count how many shard drains ran."""
+    ks = [_key(f"fan-knob-{n_keys}-{i}") for i in range(n_keys)]
+    for i, k in enumerate(ks):
+        c.put(k, bytes([i]) * 128)
+    calls = []
+    lock = threading.Lock()
+    orig = c._scatter_shard
+
+    def spy(keys, prefix_len, alloc, idx_base, deadline=None):
+        with lock:
+            calls.append(idx_base)
+        return orig(keys, prefix_len, alloc, idx_base, deadline)
+
+    c._scatter_shard = spy
+    bodies = {}
+
+    def alloc(idx, prefix, body_len):
+        buf = bytearray(body_len)
+        bodies[idx] = buf
+        return memoryview(buf)
+
+    sts = c.batch_get_scatter(ks, prefix_len=0, alloc=alloc)
+    assert all(s == p.Status.OK for s in sts)
+    assert all(bytes(bodies[i]) == bytes([i]) * 128 for i in range(n_keys))
+    return len(calls)
+
+
+def test_get_fanout_default_stays_four(daemon):
+    # streams=8 alone must NOT widen the fan-out: the default stays 4 until
+    # the loopback A/B clears (the knob is opt-in for the real-NIC rig).
+    c = Client(daemon["addr"], namespace=daemon["namespace"], token=daemon["token"],
+               streams=8)
+    try:
+        assert c._get_fanout == 4
+        assert _count_shards(c, 16) == 4
+    finally:
+        c.close()
+
+
+def test_get_fanout_knob_widens_to_eight(daemon):
+    # The knob is the ONLY way past 4: with get_fanout=8 the same batch fans
+    # out across 8 shards (bytes still exact — _count_shards verifies).
+    c = Client(daemon["addr"], namespace=daemon["namespace"], token=daemon["token"],
+               streams=8, get_fanout=8)
+    try:
+        assert c._get_fanout == 8
+        assert _count_shards(c, 16) == 8
+    finally:
+        c.close()
+
+
+def test_get_fanout_must_not_exceed_pool(daemon):
+    # Each shard drains on its own pooled conn: an explicit fan-out above the
+    # pool size would serialize shards on checkout — refused at construct.
+    with pytest.raises(ValueError, match="serialize"):
+        Client(daemon["addr"], namespace=daemon["namespace"], token=daemon["token"],
+               streams=4, get_fanout=8)
+    with pytest.raises(ValueError, match=">= 1"):
+        Client(daemon["addr"], namespace=daemon["namespace"], token=daemon["token"],
+               streams=4, get_fanout=0)
+    # None (unset) still clamps silently: streams=2 gives today's min(4, 2).
+    c = Client(daemon["addr"], namespace=daemon["namespace"], token=daemon["token"],
+               streams=2)
+    try:
+        assert c._get_fanout == 2
+    finally:
+        c.close()

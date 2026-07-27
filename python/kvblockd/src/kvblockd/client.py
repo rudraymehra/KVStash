@@ -25,7 +25,12 @@ from kvblockd.pool import Pool
 logger = logging.getLogger("kvblockd.client")
 
 _MAX_SCRATCH = 1 << 20  # reused metadata-read buffer cap (mirrors Go maxReadReuse)
-_MAX_GET_FANOUT = 4     # batch_get_scatter shard ceiling (one pooled conn each)
+# Default batch_get_scatter shard ceiling (one pooled conn each). Overridable
+# per Client via get_fanout — the knob exists for real-NIC rigs where one TCP
+# flow caps at ~10 Gbps; iperf showed diminishing returns past 8 flows, so
+# callers should stop there. The DEFAULT stays 4 until the loopback A/B rules
+# out a regression from 8 recv+xxh3 threads on the syscall/membw-bound path.
+_MAX_GET_FANOUT = 4
 # Vectored send: header + body in one syscall with no payload copy. Absent
 # only on platforms without sendmsg (Windows); the join fallback stays.
 _HAS_SENDMSG = hasattr(socket.socket, "sendmsg")
@@ -520,11 +525,18 @@ def _dial_one(addr, namespace, token, features, connect_timeout, op_timeout, ver
 class Client:
     """A pool of connections to one kvblockd namespace."""
 
-    def __init__(self, addr, *, namespace, token, streams=4,
+    def __init__(self, addr, *, namespace, token, streams=4, get_fanout=None,
                  connect_timeout=5.0, op_timeout=10.0, verify=True, so_rcvbuf=None):
         """so_rcvbuf: OPT-IN SO_RCVBUF override in bytes. Leave None (the
         default) to keep kernel receive-window autotuning — setting it
-        disables autotuning and clamps at net.core.rmem_max (see _connect)."""
+        disables autotuning and clamps at net.core.rmem_max (see _connect).
+
+        get_fanout: batch_get_scatter shard ceiling. None (the default) keeps
+        today's behavior — min(4, streams), silently clamped. An EXPLICIT
+        value must satisfy 1 <= get_fanout <= streams: each shard drains on
+        its own pooled connection, so a fan-out above the pool size would
+        just serialize shards on connection checkout — refuse it loudly
+        instead of quietly measuring the pool ceiling."""
         if isinstance(addr, str):
             host, _, port = addr.partition(":")
             addr = (host, int(port))
@@ -535,6 +547,17 @@ class Client:
                              verify, so_rcvbuf)
 
         self._streams = max(int(streams), 1)
+        if get_fanout is None:
+            self._get_fanout = min(_MAX_GET_FANOUT, self._streams)
+        else:
+            gf = int(get_fanout)
+            if gf < 1:
+                raise ValueError(f"get_fanout must be >= 1, got {gf}")
+            if gf > self._streams:
+                raise ValueError(
+                    f"get_fanout {gf} > streams {self._streams}: shards would "
+                    "serialize on connection checkout — raise streams instead")
+            self._get_fanout = gf
         self._pool = Pool(factory, streams)
         # Prime one conn so limits are known and auth failures surface at construct.
         c = self._pool.checkout()
@@ -548,7 +571,7 @@ class Client:
         # prime so a failed dial never leaks threads): a per-call executor
         # paid thread spawn + teardown on every load, on the latency path.
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(_MAX_GET_FANOUT, self._streams),
+            max_workers=self._get_fanout,  # already clamped to the pool size
             thread_name_prefix="kvb-get")
 
     def close(self):
@@ -597,9 +620,10 @@ class Client:
         return bounds
 
     def batch_get_scatter(self, keys, prefix_len, alloc, deadline=None):
-        """Zero-copy batched GET, fanned out across up to 4 CONTIGUOUS key
-        shards (bounded by the pool size), one pooled connection per shard,
-        each shard internally tiled by the negotiated max_batch_keys.
+        """Zero-copy batched GET, fanned out across up to get_fanout (default
+        4) CONTIGUOUS key shards (bounded by the pool size), one pooled
+        connection per shard, each shard internally tiled by the negotiated
+        max_batch_keys.
 
         deadline (optional, time.monotonic()-based): overall wall-clock
         ceiling for the whole call. Each shard stops starting new tiles past
@@ -622,7 +646,7 @@ class Client:
         n = len(keys)
         if n == 0:
             return []
-        nshards = min(_MAX_GET_FANOUT, self._streams, n)
+        nshards = min(self._get_fanout, self._streams, n)
         if nshards <= 1:
             return self._scatter_shard(keys, prefix_len, alloc, 0, deadline)
         bounds = self._shard_bounds(n, nshards)
