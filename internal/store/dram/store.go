@@ -57,6 +57,18 @@ type Store struct {
 	evictions  atomic.Uint64  // total blocks evicted (Stats → kvb_evictions_total)
 	liveAllocs atomic.Int64   // live extents; the node-pool watermark numerator
 
+	// The negative-result cache for synchronous eviction. occGen counts every
+	// event that can change a pass's yield: occupancy improvements (extent/
+	// slot frees, unpins, lease releases) AND admissions — a zero-yield pass
+	// at generation G proves only that everything it SAW was protected, and
+	// a block published after it is evictable until a verb protects it.
+	// Starts at 1 so 0 stays the "no futile pass" sentinel; EvictNow short-
+	// circuits until the generation moves. Lease/TTL EXPIRY needs no event:
+	// the background ticker bypasses the cache and keeps probing (evictOnce's
+	// coalesce flag).
+	occGen        atomic.Uint64
+	lastFutileGen atomic.Uint64 // occGen seen by the last armed zero-yield pass; 0 = none
+
 	// Pass scratch, guarded by evictMu (an eviction pass under sustained
 	// pressure runs at BEGIN cadence — per-pass allocations would be GC
 	// pressure exactly when the tier is busiest).
@@ -87,7 +99,7 @@ func New(arena *Arena, p Params) *Store {
 	if now == nil {
 		now = func() int64 { return time.Now().UnixNano() }
 	}
-	return &Store{
+	s := &Store{
 		arena:  arena,
 		index:  NewIndex(),
 		life:   newLifecycle(p.LeaseDefaultMS, p.LeaseMaxMS, p.PinnedBytesCap, p.PinCapFor, now),
@@ -95,6 +107,8 @@ func New(arena *Arena, p Params) *Store {
 		alloc:  NewAllocatorMax(units, maxAllocs),
 		quotas: p.Quotas,
 	}
+	s.occGen.Store(1) // 0 is lastFutileGen's "no futile pass yet" sentinel
+	return s
 }
 
 // refundQuota returns a removed block's bytes to its tenant's DRAM quota —
@@ -123,6 +137,7 @@ func (s *Store) AttachPolicy(p eviction.Policy) { s.policy = p }
 // was ~181 B of index heap per block with no bound at all).
 func (s *Store) free(ref *BlockRef) {
 	s.liveAllocs.Add(-1)
+	s.occGen.Add(1) // occupancy improved (bytes or slots) — re-arm EvictNow
 	if ref.Len == 0 {
 		return
 	}
@@ -158,6 +173,12 @@ func (s *Store) CanStore(n uint32) bool {
 		s.allocMu.Lock()
 		rep := s.alloc.StorageReport()
 		s.allocMu.Unlock()
+		// EXACT, not merely a lower bound: LargestFreeRegion is the floor of
+		// the highest non-empty bin, and Alloc rounds every request UP to a
+		// bin before scanning (the port's load-bearing invariant) — so
+		// "floor ≥ units" and "Alloc(units) finds a bin" are the same
+		// predicate, node-pool exhaustion included (an empty pool zeroes the
+		// report). Probing the real Alloc here would answer identically.
 		return rep.LargestFreeRegion >= units
 	}
 	if fits() {
@@ -325,6 +346,12 @@ func (s *Store) Put(ns uint32, key [32]byte, data []byte, xxh3 uint64) protocol.
 		// the index without eviction backpressure (the confirmed DoS).
 		s.liveAllocs.Add(1)
 	}
+	// AFTER the winning publish (so a pass observing the new generation also
+	// sees the block): the admission re-arms EvictNow — a futile pass proved
+	// nothing about this evictable newcomer, and a stale cache here answered
+	// spurious ERR_QUOTA_BYTES for up to one evictor Interval under exactly
+	// the sustained pressure the cache targets.
+	s.occGen.Add(1)
 	if p := s.policy; p != nil && len(data) > 0 {
 		// After the winning publish, no locks held. Zero-length blocks are
 		// never admitted (no extent to reclaim — the count sweep reclaims
@@ -400,6 +427,7 @@ func (s *Store) TouchLease(ns uint32, key [32]byte, sub uint8, ttlMS uint32) pro
 		s.life.Lease(ref, ttlMS)
 	case protocol.LeaseRelease:
 		s.life.ReleaseLease(ref)
+		s.occGen.Add(1) // a protection lapsed by verb — re-arm EvictNow
 	default:
 		return protocol.StatusErrUnsupported
 	}
@@ -422,6 +450,7 @@ func (s *Store) PinOp(ns uint32, key [32]byte, sub uint8) protocol.Status {
 			st = s.life.Pin(ref, true)
 		case protocol.Unpin:
 			s.life.Unpin(ref)
+			s.occGen.Add(1) // a protection lapsed by verb — re-arm EvictNow
 			st = protocol.StatusOK
 		default:
 			st = protocol.StatusErrUnsupported

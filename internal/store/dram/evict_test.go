@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -370,6 +371,227 @@ func TestZeroLenFloodBounded(t *testing.T) {
 	after := statsDoc(t, s)["live_allocs"].(float64)
 	if after >= before {
 		t.Fatalf("zero-len flood not reclaimed: live_allocs %v -> %v", before, after)
+	}
+}
+
+// countingPolicy wraps a real policy and counts Victims calls — the direct
+// observable for "how many policy passes did the evictor actually run".
+type countingPolicy struct {
+	eviction.Policy
+	victims atomic.Int64
+}
+
+func (p *countingPolicy) Victims(ns uint32, need int64, now int64, dst []eviction.Candidate) []eviction.Candidate {
+	p.victims.Add(1)
+	return p.Policy.Victims(ns, need, now, dst)
+}
+
+// TestEvictNowCoalescesFutilePasses pins the negative-result cache: with the
+// arena 100% hard-pinned (the sustained-pressure worst case) the FIRST
+// failing BEGIN probe pays one full eviction pass, and every subsequent
+// probe is answered from the cache — no repeat pass, no full-index sweep,
+// no evictMu convoy — until occupancy actually changes (an unpin here),
+// which re-arms the synchronous path. Before the cache, EVERY probe paid a
+// full futile pass: BEGIN p99 collapsed exactly when the store was busiest.
+func TestEvictNowCoalescesFutilePasses(t *testing.T) {
+	cur := int64(1_000_000_000_000)
+	arena, err := dram.NewArena(4<<20, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := eviction.New("s3fifo", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := &countingPolicy{Policy: inner}
+	s := dram.New(arena, dram.Params{
+		LeaseDefaultMS: 5000, LeaseMaxMS: 60000,
+		Now: func() int64 { return cur },
+	})
+	s.AttachPolicy(pol)
+	t.Cleanup(func() { _ = s.Close() })
+	// The evictor must be RUNNING (coalescing is gated on it — the ticker is
+	// the prober the cache leans on); an inert hour-long tick keeps the test
+	// deterministic.
+	stop := s.StartEvictor(context.Background(), dram.EvictorConfig{Interval: time.Hour})
+	defer stop()
+
+	const blk = 1 << 20
+	keys := []([32]byte){evKey(1), evKey(2), evKey(3), evKey(4)}
+	for _, k := range keys {
+		evPut(t, s, 1, k, blk)
+		if st := s.PinOp(1, k, protocol.PinHard); st != protocol.StatusOK {
+			t.Fatal(st)
+		}
+	}
+
+	// Probe #1: full arena, everything hard-pinned — the pass runs (Victims
+	// consulted) and frees nothing.
+	if s.CanStore(blk) {
+		t.Fatal("CanStore true on a fully hard-pinned arena")
+	}
+	after1 := pol.victims.Load()
+	if after1 == 0 {
+		t.Fatal("first failing probe ran no eviction pass at all")
+	}
+	// Probes #2..#6: nothing changed — the cache must answer them without a
+	// single further policy pass (the old code ran one full pass EACH).
+	for i := 0; i < 5; i++ {
+		if s.CanStore(blk) {
+			t.Fatal("CanStore flipped true with nothing freed")
+		}
+	}
+	if got := pol.victims.Load(); got != after1 {
+		t.Fatalf("futile passes not coalesced: Victims calls %d -> %d across 5 unchanged probes", after1, got)
+	}
+
+	// Invalidation: an unpin moves the occupancy generation — the next probe
+	// runs a REAL pass, reclaims the block, and the BEGIN succeeds.
+	if st := s.PinOp(1, keys[0], protocol.Unpin); st != protocol.StatusOK {
+		t.Fatal(st)
+	}
+	if !s.CanStore(blk) {
+		t.Fatal("CanStore still false after an unpin freed a full block")
+	}
+	if got := pol.victims.Load(); got == after1 {
+		t.Fatal("the unpin did not re-arm the synchronous eviction path")
+	}
+
+	// Admission seam #2 (zero-length): re-fill and re-arm the cache, then
+	// prove a PUBLISH also moves the generation. A zero-length block is legal
+	// (§3.4), owns no extent, and carries only the nominal accounting slot —
+	// if even that admission re-arms the path, the invariant is "any publish
+	// invalidates a futile proof", not "any free does".
+	evPut(t, s, 1, evKey(5), blk) // re-fill the reclaimed MiB → 100% again
+	if st := s.PinOp(1, evKey(5), protocol.PinHard); st != protocol.StatusOK {
+		t.Fatal(st)
+	}
+	if s.CanStore(blk) {
+		t.Fatal("CanStore true on the re-filled fully-pinned arena")
+	}
+	armed := pol.victims.Load()
+	if s.CanStore(blk) {
+		t.Fatal("CanStore flipped true with nothing freed")
+	}
+	if got := pol.victims.Load(); got != armed {
+		t.Fatalf("futile passes not re-coalesced: Victims calls %d -> %d", armed, got)
+	}
+	var empty [32]byte
+	empty[0] = 0x77
+	if st := s.Put(1, empty, nil, xxh3.Hash(nil)); st != protocol.StatusOK {
+		t.Fatalf("zero-length put: %s", st)
+	}
+	if s.CanStore(blk) {
+		t.Fatal("CanStore true with every extent hard-pinned")
+	}
+	if got := pol.victims.Load(); got == armed {
+		t.Fatal("a zero-length admission did not re-arm the synchronous eviction path")
+	}
+}
+
+// TestAdmissionReArmsFutileCache pins admission seam #1 (extent-carrying
+// Put) with a user-visible outcome: a zero-yield pass proves only the
+// PRE-admission population protected, so a later unprotected publish must
+// invalidate the cache — a stale cache answers CanStore false (spurious
+// ERR_QUOTA_BYTES at BEGIN, for up to one evictor Interval) even though a
+// real pass would evict the newcomer and open the room.
+func TestAdmissionReArmsFutileCache(t *testing.T) {
+	cur := int64(1_000_000_000_000)
+	arena, err := dram.NewArena(4<<20, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := eviction.New("s3fifo", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := &countingPolicy{Policy: inner}
+	s := dram.New(arena, dram.Params{
+		LeaseDefaultMS: 5000, LeaseMaxMS: 60000,
+		Now: func() int64 { return cur },
+	})
+	s.AttachPolicy(pol)
+	t.Cleanup(func() { _ = s.Close() })
+	// Watermark 50: the half-pinned arena below sits exactly AT the trigger,
+	// so a failing probe runs an ARMED (recordable) pass with free room left
+	// for the admission — the shape the default 95% geometry cannot reach.
+	stop := s.StartEvictor(context.Background(), dram.EvictorConfig{
+		WatermarkPct: 50, BatchPct: 5, Interval: time.Hour,
+	})
+	defer stop()
+
+	const blk = 1 << 20
+	for _, k := range []([32]byte){evKey(1), evKey(2)} { // [0,2M) hard-pinned
+		evPut(t, s, 1, k, blk)
+		if st := s.PinOp(1, k, protocol.PinHard); st != protocol.StatusOK {
+			t.Fatal(st)
+		}
+	}
+
+	// Arm: 3 MiB can never fit (the free hole is 2 MiB) — the pass runs,
+	// frees nothing (everything resident is hard-pinned), records futile.
+	if s.CanStore(3 << 20) {
+		t.Fatal("CanStore(3MiB) true with only a 2MiB hole")
+	}
+	after1 := pol.victims.Load()
+	if after1 == 0 {
+		t.Fatal("first failing probe ran no eviction pass at all")
+	}
+	if s.CanStore(3 << 20) {
+		t.Fatal("CanStore(3MiB) flipped true with nothing freed")
+	}
+	if got := pol.victims.Load(); got != after1 {
+		t.Fatalf("futile passes not coalesced: Victims calls %d -> %d", after1, got)
+	}
+
+	// The admission: an UNPROTECTED block lands in the free half — no free,
+	// no unpin, no lease event, ONLY the publish moves the world.
+	evPut(t, s, 1, evKey(3), blk) // [2M,3M), evictable
+
+	// A real pass evicts the newcomer and reopens the 2 MiB hole; a stale
+	// cache answers 0 and leaves CanStore(2MiB) false.
+	if !s.CanStore(2 << 20) {
+		t.Fatal("admission did not re-arm the futile-pass cache: CanStore(2MiB) false with an evictable 1MiB block resident")
+	}
+	if got := pol.victims.Load(); got == after1 {
+		t.Fatal("no real pass ran after the admission")
+	}
+}
+
+// TestCanStoreMatchesAlloc pins the CanStore↔Alloc equivalence the probe
+// comment documents: LargestFreeRegion is the floor of the highest non-empty
+// bin and Alloc rounds requests UP to a bin, so the probe's yes/no must
+// agree with the real allocation at an awkward near-full size (25 free units
+// report as 24; Alloc(25) also refuses — both live in the same bin math).
+func TestCanStoreMatchesAlloc(t *testing.T) {
+	arena, err := dram.NewArena(128<<12, false) // 128 units of 4 KiB
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := dram.New(arena, dram.Params{LeaseDefaultMS: 5000, LeaseMaxMS: 60000})
+	t.Cleanup(func() { _ = s.Close() })
+
+	// One 103-unit block leaves exactly 25 contiguous free units, bin floor 24.
+	evPut(t, s, 1, evKey(1), 103<<12)
+	for _, tc := range []struct {
+		units int
+		want  bool
+	}{
+		{24, true},  // at the bin floor: probe yes, Alloc yes
+		{25, false}, // above the floor: probe no — and Alloc(25) also refuses
+	} {
+		if got := s.CanStore(uint32(tc.units << 12)); got != tc.want { //nolint:gosec // G115: tiny test sizes
+			t.Fatalf("CanStore(%d units) = %v, want %v", tc.units, got, tc.want)
+		}
+		st := s.Put(1, evKey(byte(0x80+tc.units)), bytes.Repeat([]byte{1}, tc.units<<12), 42)
+		if ok := st == protocol.StatusOK; ok != tc.want {
+			t.Fatalf("Alloc-backed Put(%d units) ok=%v disagrees with CanStore=%v (st=%s)", tc.units, ok, tc.want, st)
+		}
+		if tc.want { // undo the successful put so the second case sees the same hole
+			if st := s.Delete(1, evKey(byte(0x80+tc.units)), true); st != protocol.StatusOK {
+				t.Fatal(st)
+			}
+		}
 	}
 }
 

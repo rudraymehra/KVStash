@@ -64,13 +64,18 @@ func (s *Store) StartEvictor(ctx context.Context, cfg EvictorConfig) (stop func(
 		t := time.NewTicker(ev.cfg.Interval)
 		defer t.Stop()
 		for {
+			coalesce := false
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				// The ticker is the ONE prober that bypasses the futile-pass
+				// cache: lease/TTL expiry is pure time — no event bumps the
+				// occupancy generation, so somebody must keep looking.
 			case <-ev.kick:
+				coalesce = true // pressure nudges coalesce like EvictNow does
 			}
-			s.evictOnce(ev.cfg)
+			s.evictOnce(ev.cfg, coalesce)
 		}
 	}()
 	return func() {
@@ -81,13 +86,20 @@ func (s *Store) StartEvictor(ctx context.Context, cfg EvictorConfig) (stop func(
 
 // EvictNow runs one synchronous eviction pass with the evictor's config (or
 // defaults when no evictor is started — the modeltest handle) and reports
-// the bytes freed.
+// the bytes freed. With a RUNNING evictor the pass coalesces: after a
+// zero-yield pass, request-path retries are answered from the negative-
+// result cache until the occupancy generation moves (the ticker keeps
+// probing for time-based expiry) — the failure path must never cost more
+// than the success path under pressure. Without an evictor (modeltest) the
+// pass always runs: determinism beats coalescing where no prober exists.
 func (s *Store) EvictNow() int64 {
 	cfg := EvictorConfig{}.withDefaults()
+	coalesce := false
 	if s.evict != nil {
 		cfg = s.evict.cfg
+		coalesce = true
 	}
-	return s.evictOnce(cfg)
+	return s.evictOnce(cfg, coalesce)
 }
 
 // occupancy reads the trigger inputs in one allocMu hold.
@@ -102,9 +114,20 @@ func (s *Store) occupancy() (usedUnits, totalUnits uint32) {
 // evictOnce is one full pass under the singleflight lock: expired-first
 // sweep, proportional policy pass, then the quota-emergency sweep if the
 // tier is still over the watermark. Returns bytes freed.
-func (s *Store) evictOnce(cfg EvictorConfig) int64 {
+//
+// coalesce consults (and maintains) the futile-pass cache: the generation is
+// read AFTER the lock, so N callers queued behind one zero-yield pass all
+// see its recording and return without walking anything — the storm this
+// kills was N concurrent BEGINs paying N sequential full-index sweeps that
+// could not free a byte (everything protected).
+func (s *Store) evictOnce(cfg EvictorConfig, coalesce bool) int64 {
 	s.evictMu.Lock()
 	defer s.evictMu.Unlock()
+
+	gen := s.occGen.Load()
+	if coalesce && gen == s.lastFutileGen.Load() {
+		return 0 // nothing changed since a zero-yield pass — provably futile
+	}
 
 	used, total := s.occupancy()
 	byteTrigger := uint64(used)*100 >= uint64(total)*uint64(cfg.WatermarkPct) //nolint:gosec // G115: pct validated in [50,99]
@@ -180,6 +203,15 @@ func (s *Store) evictOnce(cfg EvictorConfig) int64 {
 			}
 		}
 		freed += s.sweepEmergency(now, emBytes, emCount)
+	}
+	// Record only ARMED outcomes: a zero-yield pass with triggers armed is
+	// the expensive proof the cache exists for; an unarmed early return
+	// (above) neither records nor clears. gen predates the sweeps — a free
+	// landing mid-pass bumped occGen past it, so the recording self-expires.
+	if freed == 0 {
+		s.lastFutileGen.Store(gen)
+	} else {
+		s.lastFutileGen.Store(0)
 	}
 	return freed
 }
