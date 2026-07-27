@@ -42,8 +42,9 @@ func ckptPath(dir string, seq uint64) string {
 }
 
 // writeCheckpoint snapshots every sealed segment's entries and persists
-// them atomically. Runs on the writer goroutine; the snapshot is taken
-// under RLock but the I/O happens unlocked.
+// them atomically. Callers race (the writer goroutine's cadence checkpoint
+// vs the post-adopt checkpoint), so ckptWriteMu serializes the whole write;
+// the snapshot is taken under RLock but the I/O happens unlocked.
 //
 // maxSealedSegID is a TRUST boundary: recovery skips footer reads for every
 // present segment ≤ it, believing this file holds ALL their entries. So a
@@ -53,6 +54,8 @@ func ckptPath(dir string, seq uint64) string {
 // reproduced data-loss bug). If that cap would cover nothing, skip this
 // checkpoint round entirely — footer scans stay authoritative.
 func (v *Volume) writeCheckpoint() error {
+	v.ckptWriteMu.Lock()
+	defer v.ckptWriteMu.Unlock()
 	v.mu.RLock()
 	var maxSealed uint32
 	var haveSealed, dyingBelow bool

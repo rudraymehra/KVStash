@@ -98,6 +98,11 @@ type Volume struct {
 
 	sealsSinceCkpt int
 	ckptSeq        uint64
+	// ckptWriteMu serializes whole checkpoint writes: the sequence number and
+	// the tmp file path both derive from ckptSeq, so the writer goroutine's
+	// cadence checkpoint and AdoptSegment's post-adopt checkpoint must never
+	// interleave (two writers would mint the same seq and clobber one tmp).
+	ckptWriteMu sync.Mutex
 
 	reqs       chan AppendReq
 	writerStop chan struct{} // closed by Close/CrashForTest — writer exits

@@ -1,6 +1,8 @@
 package nvme
 
 import (
+	"bytes"
+	"io"
 	"os"
 	"testing"
 
@@ -111,6 +113,133 @@ func TestCheckpointExcludesDyingCoverage(t *testing.T) {
 		}
 		mustRead(t, v2, e.Loc, i, sums[i], 60<<10)
 	}
+}
+
+// spillReclaimSetup drives the spill→reclaim shape shared by the adopt
+// regression tests: fills v past two seals, captures the oldest sealed
+// segment's byte-identical object (what the uploader would PUT), reclaims it,
+// and writes the checkpoint that now covers its id with ZERO entries.
+func spillReclaimSetup(t *testing.T, v *Volume) (id uint32, entries []footerEntry, obj []byte) {
+	t.Helper()
+	for i := 0; i < 9; i++ {
+		appendWait(t, v, i, 60<<10) // ≥2 sealed segments in 256 KiB geometry
+	}
+	id, entries, ok := v.OldestSealed(0)
+	if !ok || len(entries) == 0 {
+		t.Fatal("nothing sealed to spill")
+	}
+	f, size, err := v.OpenSegmentReadOnly(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj = make([]byte, size)
+	if _, err := io.ReadFull(f, obj); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	v.MarkSpilled(id)
+	if !v.RetireBegin(id) {
+		t.Fatal("retire begin refused")
+	}
+	if err := v.RetireFinish(id); err != nil {
+		t.Fatal(err)
+	}
+	// The checkpoint AFTER the reclaim: its maxSealedSegID still covers id
+	// (a higher sealed segment survives) but it holds no entries for it.
+	if err := v.writeCheckpoint(); err != nil {
+		t.Fatal(err)
+	}
+	return id, entries, obj
+}
+
+// assertAdoptedRecovered asserts every pre-reclaim entry of the adopted
+// segment came back at the same id and reads verified.
+func assertAdoptedRecovered(t *testing.T, v *Volume, id uint32, entries []footerEntry, ents []RecoveredEntry) {
+	t.Helper()
+	byKey := map[[32]byte]RecoveredEntry{}
+	for _, e := range ents {
+		byKey[e.Key] = e
+	}
+	for _, want := range entries {
+		got, ok := byKey[want.Key]
+		if !ok {
+			t.Fatalf("HIGH regression: adopted segment %d lost a block after crash-restart", id)
+		}
+		if got.Loc.SegmentID != id {
+			t.Fatalf("adopted block recovered from segment %d, want %d", got.Loc.SegmentID, id)
+		}
+		data, rel, st := v.Read(got.Loc, want.NS, want.Key, want.XXH3)
+		if st != ReadOK {
+			t.Fatalf("adopted block read: %d", st)
+		}
+		rel()
+		_ = data
+	}
+}
+
+// TestAdoptedSegmentSurvivesCrashBeforeCheckpoint pins the adopt-side hole in
+// the checkpoint trust boundary: AdoptSegment legally re-creates a segment
+// whose id the newest checkpoint already covers with ZERO entries (the id was
+// reclaimed before that checkpoint was written). A crash before any newer
+// checkpoint used to recover the adopted segment "trusted" with an empty
+// entry table — every restored block silently vanished and the retained S3
+// object was orphaned. Recovery must key trust on checkpoint MEMBERSHIP and
+// footer-scan a covered-but-absent segment.
+func TestAdoptedSegmentSurvivesCrashBeforeCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	p := testParams(t, dir)
+	// Checkpoints disabled: the crash lands in the exact window where the
+	// adopt published (rename + dir sync durable) but no post-adopt
+	// checkpoint exists yet — the stale one on disk stays newest.
+	p.CkptEverySegs = 0
+	v, _, _, err := OpenVolume(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, entries, obj := spillReclaimSetup(t, v)
+
+	// Lazy restore brings the segment home; then crash.
+	if err := v.AdoptSegment(id, bytes.NewReader(obj)); err != nil {
+		t.Fatal(err)
+	}
+	v.CrashForTest()
+
+	v2, _, ents := openTestVolume(t, dir)
+	defer func() { _ = v2.Close() }()
+	assertAdoptedRecovered(t, v2, id, entries, ents)
+}
+
+// TestAdoptSegmentWritesCheckpoint pins the window-shrink half of the same
+// fix: a successful adopt immediately re-checkpoints, so the adopted entries
+// are in the newest checkpoint and the common recovery path stays
+// checkpoint-trusted (no footer scan needed to keep them).
+func TestAdoptSegmentWritesCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	v, _, _ := openTestVolume(t, dir) // CkptEverySegs=2: post-adopt ckpt enabled
+	id, entries, obj := spillReclaimSetup(t, v)
+
+	if err := v.AdoptSegment(id, bytes.NewReader(obj)); err != nil {
+		t.Fatal(err)
+	}
+	ckEntries, ckMax, _, ok := loadNewestCkpt(dir, func(string, ...any) {})
+	if !ok {
+		t.Fatal("no checkpoint after adopt")
+	}
+	adopted := 0
+	for _, ce := range ckEntries {
+		if ce.SegID == id {
+			adopted++
+		}
+	}
+	if adopted != len(entries) || ckMax < id {
+		t.Fatalf("post-adopt checkpoint holds %d/%d entries for segment %d (maxSealed %d)",
+			adopted, len(entries), id, ckMax)
+	}
+	v.CrashForTest()
+
+	v2, _, ents := openTestVolume(t, dir)
+	defer func() { _ = v2.Close() }()
+	assertAdoptedRecovered(t, v2, id, entries, ents)
 }
 
 // TestSameSegmentLatestWins pins a fixed recovery bug: two generations of one

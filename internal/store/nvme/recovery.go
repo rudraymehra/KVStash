@@ -34,10 +34,13 @@ type RecoveredEntry struct {
 //
 //  1. newest CRC-valid checkpoint → entries for segments ≤ maxSealedSegID
 //     (validated, then trusted without footer reads — the warm-restart win).
-//     The entries are ALSO attached to the in-memory segment (a fixed
-//     data-loss bug: a trusted segment with a nil entry table
-//     poisoned the NEXT checkpoint into dropping it, and gave reclaim
-//     nothing to gate on);
+//     Trust requires MEMBERSHIP, not just id coverage: a present segment the
+//     checkpoint holds zero entries for (an adopted segment restored after
+//     the checkpoint was written) is footer-scanned like a post-checkpoint
+//     segment, never recovered empty. The entries are ALSO attached to the
+//     in-memory segment (a fixed data-loss bug: a trusted segment with a nil
+//     entry table poisoned the NEXT checkpoint into dropping it, and gave
+//     reclaim nothing to gate on);
 //  2. sealed segments newer than the checkpoint → footer scan; on the same
 //     (ns, key) the LATER (segID, offset) wins — offset order matters too,
 //     because delete + re-put can land two generations of one key in the
@@ -130,12 +133,21 @@ func (v *Volume) recoverDir() (*RecoveryReport, []RecoveredEntry, error) {
 		}
 		report.SegmentsScanned++
 
-		if ckOK && id <= ckMaxSealed {
+		if entries := ckBySeg[id]; ckOK && id <= ckMaxSealed && len(entries) > 0 {
 			// Trusted-sealed via checkpoint: entries come from the ckpt (the
 			// footer stays unread; reads still xxh3-verify every block).
 			// Bounds are validated against the file's own size; dataEnd is
 			// derived from the entries so downstream checks stay honest.
-			entries := ckBySeg[id]
+			//
+			// Membership, not the id watermark, is the trust boundary: a
+			// present segment ≤ ckMaxSealed with ZERO checkpoint entries is
+			// NOT known-empty — AdoptSegment legally re-creates a reclaimed
+			// id below the watermark after the covering checkpoint was
+			// written, so trusting the checkpoint here would recover it with
+			// an empty entry table and lose every block (a reproduced
+			// data-loss bug). Legitimately sealed segments always carry ≥1
+			// entry (empty tails are deleted), so zero entries falls through
+			// to the footer scan below.
 			valid := make([]footerEntry, 0, len(entries))
 			var dataEnd uint64
 			limit := uint64(size) - recordAlign //nolint:gosec // G115: size ≥ minSize > recordAlign

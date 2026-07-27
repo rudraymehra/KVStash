@@ -193,6 +193,19 @@ func (v *Volume) AdoptSegment(id uint32, r io.Reader) error {
 	}
 	v.used.Add(size)
 	v.mu.Unlock()
+	// The newest checkpoint predates this adopt, so it covers id with ZERO
+	// entries: write a fresh one now so the common recovery path stays
+	// checkpoint-trusted. Best-effort — on failure (or a crash before this
+	// line) recovery's membership gate footer-scans the segment instead of
+	// trusting the stale checkpoint, so no outcome loses the adopted blocks.
+	if v.p.CkptEverySegs > 0 {
+		if err := v.writeCheckpoint(); err != nil {
+			v.log.Warn("nvme: post-adopt checkpoint failed — recovery will footer-scan",
+				"segment", id, "err", err)
+		} else {
+			v.ckpts.Add(1)
+		}
+	}
 	return nil
 }
 
