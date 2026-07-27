@@ -3,6 +3,7 @@ package eviction
 import (
 	"encoding/binary"
 	"math/rand/v2"
+	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -247,9 +248,22 @@ func (p *S3FIFO) Remove(k Key) {
 	d.qmu.Unlock()
 }
 
+// victimsYieldEvery bounds one qmu hold inside Victims: the scan releases
+// and reacquires the lock at this visit cadence. Every loop iteration leaves
+// the queues, byte counters, and ghost consistent, so the boundary is a
+// legal yield point; the number keeps the worst-case hold at O(constant) —
+// hundreds of pointer-hop visits, single-digit µs — instead of O(domain
+// population), which serialized Admit/Remove/Usage and the demoter for
+// multi-ms stretches exactly when memory pressure peaked.
+const victimsYieldEvery = 512
+
 // Victims runs the S3-FIFO scan for tenant ns until candidates cover need
 // bytes (or the domain runs dry). Dequeued candidates leave the policy —
-// the store evicts them or hands them back via Admit.
+// the store evicts them or hands them back via Admit. The scan CHUNKS its
+// qmu hold (victimsYieldEvery): pressure-path lock cost is bounded by the
+// yield cadence, never by tenant size, and a concurrent mutation slotting
+// into a yield window is ordinary advisory staleness the store's gate
+// already re-checks.
 func (p *S3FIFO) Victims(ns uint32, need int64, _ int64, dst []Candidate) []Candidate {
 	d := p.domain(ns)
 	if d == nil || need <= 0 {
@@ -263,10 +277,23 @@ func (p *S3FIFO) Victims(ns uint32, need int64, _ int64, dst []Candidate) []Cand
 	// burns a freq point, or expels — a freq-3 small entry costs at most 5
 	// visits (1 small + 3 main decrements + 1 eviction), so 6N+8 covers
 	// every reachable schedule with headroom; freq monotonicity guarantees
-	// termination regardless.
+	// termination regardless. Entries admitted during a yield window sit
+	// outside this budget — the pass returns partial and the caller's next
+	// pass (evictor tick / re-call) covers them.
 	budget := 6*(d.small.count+d.main.count) + 8
+	sinceYield := 0
 	for got < need && budget > 0 {
 		budget--
+		if sinceYield++; sinceYield >= victimsYieldEvery {
+			sinceYield = 0
+			d.qmu.Unlock()
+			// The Gosched matters: a bare unlock/lock usually re-wins the
+			// mutex before a blocked Admit/Remove is even woken (barging),
+			// which would make the yield cosmetic until starvation mode's
+			// 1ms threshold — exactly the hold this chunking removes.
+			runtime.Gosched()
+			d.qmu.Lock()
+		}
 		// Source pick: drain small while it exceeds its 10% share.
 		fromSmall := d.smallBytes > (d.smallBytes+d.mainBytes)/10
 		if d.small.count == 0 && d.main.count == 0 {
