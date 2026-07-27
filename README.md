@@ -14,7 +14,7 @@
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/rudraymehra/KVStash/main/scripts/install.sh | sh
-kvblockd --config /usr/local/etc/kvblockd/example.yaml &   # :9440, 1 GiB DRAM arena, demo tenant
+kvblockd --config /usr/local/etc/kvblockd/example.yaml &   # 127.0.0.1:9440, 1 GiB DRAM arena, demo tenant
 echo hello | kvbctl put -ns demo -token demo-token demo-key -
 kvbctl get -ns demo -token demo-token demo-key             # → hello
 ```
@@ -64,7 +64,7 @@ TCP only (MSG_ZEROCOPY/sendfile-class optimizations in scope; RDMA/AF_XDP/DPDK o
 
 ## Security model
 
-Identity is structural: a connection authenticates a `(namespace, token)` pair once at HELLO (constant-time compare) and lives inside that namespace — no per-request auth to get wrong, and a cross-tenant key collision is impossible by construction. A daemon with **no namespaces file accepts no one** (secure by default). Transport is plaintext TCP in v1: deploy on a trusted network segment; TLS-termination guidance lives in the [deployment guide](docs/deployment-guide.md). Report vulnerabilities via GitHub security advisories.
+Identity is structural: a connection authenticates a `(namespace, token)` pair once at HELLO (constant-time compare) and lives inside that namespace — no per-request auth to get wrong, and a cross-tenant key collision is impossible by construction. A daemon with **no namespaces file accepts no one** (secure by default). Transport is plaintext TCP in v1: deploy on a trusted network segment; TLS-termination guidance lives in the [deployment guide](docs/deployment-guide.md). Report vulnerabilities per [SECURITY.md](SECURITY.md).
 
 ## License
 
