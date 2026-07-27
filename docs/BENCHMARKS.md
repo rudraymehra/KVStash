@@ -194,6 +194,23 @@ rep's own measured count) — and every record is path-stamped `chunked-slab`.
 | 16k | 4,588 ms | 4,701 ms | **300 ms** (294–319) | **15.3×** | 15.7× |
 | 32k | 10,923 ms | 10,941 ms | **535 ms** (522–536) | **20.4×** | 20.5× |
 
+**The fp8 cells (kv_cache_dtype=fp8_e4m3, n=3, token-identity certified):**
+halving the KV bytes halves the reload — every arm of these runs (baseline,
+cold, warm) ran the SAME dtype, and each run's certification is machine-
+checked before any warm number exists: 8 equivalence prompts recorded on
+engine #1, recorded TWICE to exclude kernel-nondeterministic prompts (one
+was, in one run — disclosed in that run's summary record), then replayed
+token-identical on the restarted engine.
+
+| prefix | fp8 recompute | **fp8 reload** | vs same-dtype recompute | vs bf16 recompute |
+|---|---|---|---|---|
+| 16k | 4,536 ms | **216 ms** (213–217) | **21.0×** | 21.2× |
+| 32k | 10,538 ms | **399 ms** (398–406) | **26.4×** | 27.4× |
+
+Raw: `bench/results/rig-e/chart2-ttft-qwen-fp8-{run1,run2,run3,baseline}.jsonl`.
+The bf16 column is context, not the claim: it compares across dtypes (a
+user choosing fp8 changes their numerics regardless of any store).
+
 Store-on-miss overhead on this model is **1.00–1.02×** — at 56 KiB/token
 the gathered store path makes filling the cache effectively free, which is
 also why the "vs serving" column nearly equals "vs pure" (the serving
