@@ -31,11 +31,14 @@ chains DO depend on it, and a mixed fleet would silently never share.
 
 from __future__ import annotations
 
+import logging
 import os
 import struct
 
 from blake3 import blake3
 from kvblockd.hashing import DeterminismError, startup_determinism_check
+
+logger = logging.getLogger("vllm_kvblockd")
 
 _FP_DOMAIN = b"kvblockd-vllm-fp-v1\x00"
 # chain-v2: the seed layout is (salt, lora, per-id mm tail). Sharing a domain
@@ -182,6 +185,41 @@ def parse_endpoint(endpoint: str) -> tuple[str, int]:
     return host, int(port)
 
 
+# Every kvblockd_* key from_vllm_config reads. An unknown kvblockd_* key in
+# kv_connector_extra_config is a WARNING at boot: a typo'd kvblockd_endpoint
+# otherwise silently defaults to 127.0.0.1:9440 and the operator debugs a
+# mysterious all-miss engine.
+KNOWN_EXTRA_KEYS = frozenset({
+    "kvblockd_async_lookup",
+    "kvblockd_async_store",
+    "kvblockd_codec",
+    "kvblockd_connect_timeout_s",
+    "kvblockd_endpoint",
+    "kvblockd_exists_timeout_s",
+    "kvblockd_get_fanout",
+    "kvblockd_load_deadline_cap_s",
+    "kvblockd_load_deadline_per_block_s",
+    "kvblockd_load_deadline_s",
+    "kvblockd_lookup_timeout_s",
+    "kvblockd_min_hit_tokens",
+    "kvblockd_namespace",
+    "kvblockd_op_timeout_s",
+    "kvblockd_prewarm_bytes",
+    "kvblockd_recompute_ms_per_token",
+    "kvblockd_so_rcvbuf",
+    "kvblockd_staging_bytes",
+    "kvblockd_store_dedupe_keys",
+    "kvblockd_store_dedupe_ttl_s",
+    "kvblockd_store_drain_workers",
+    "kvblockd_store_flush_timeout_s",
+    "kvblockd_store_queue_bytes",
+    "kvblockd_store_staging_bytes",
+    "kvblockd_streams",
+    "kvblockd_token",
+    "kvblockd_verify",
+})
+
+
 class AdapterConfig:
     """Everything the connector needs, pulled defensively off vllm_config."""
 
@@ -192,6 +230,7 @@ class AdapterConfig:
         "codec",
         "connect_timeout",
         "dtype",
+        "exists_timeout_s",
         "fingerprint",
         "get_fanout",
         "host",
@@ -212,6 +251,7 @@ class AdapterConfig:
         "staging_bytes",
         "store_dedupe_keys",
         "store_dedupe_ttl_s",
+        "store_drain_workers",
         "store_flush_timeout_s",
         "store_queue_bytes",
         "store_staging_bytes",
@@ -226,6 +266,18 @@ class AdapterConfig:
     @classmethod
     def from_vllm_config(cls, vllm_config) -> AdapterConfig:
         ktc = getattr(vllm_config, "kv_transfer_config", None)
+        # Unknown-key sweep FIRST, so even a config that later fails
+        # validation names the typo'd knob too. Only kvblockd_* keys are
+        # ours to judge — other connectors may share the extra-config dict.
+        extra = getattr(ktc, "kv_connector_extra_config", None) or {}
+        try:
+            for k in extra:
+                if isinstance(k, str) and k.startswith("kvblockd_") and k not in KNOWN_EXTRA_KEYS:
+                    logger.warning(
+                        "unknown kvblockd config key %r in kv_connector_extra_config is "
+                        "IGNORED (typo? the value silently falls back to its default)", k)
+        except TypeError:
+            pass  # non-iterable stand-in: nothing to sweep
         endpoint = get_extra_config(ktc, "kvblockd_endpoint", "kvblockd://127.0.0.1:9440")
         c = cls()
         c.host, c.port = parse_endpoint(str(endpoint))
@@ -234,6 +286,8 @@ class AdapterConfig:
             get_extra_config(ktc, "kvblockd_token", os.environ.get("KVBLOCKD_TOKEN", ""))
         )
         c.streams = int(get_extra_config(ktc, "kvblockd_streams", 4))
+        if c.streams < 1:
+            raise ValueError(f"kvblockd_streams must be >= 1, got {c.streams}")
         c.verify = bool(get_extra_config(ktc, "kvblockd_verify", True))
         # GET fan-out: shards per batch_get_scatter, one pooled connection
         # each. UNSET = today's behavior — the client clamps its built-in
@@ -279,6 +333,26 @@ class AdapterConfig:
         c.prewarm_bytes = int(get_extra_config(ktc, "kvblockd_prewarm_bytes", c.staging_bytes))
         c.op_timeout = float(get_extra_config(ktc, "kvblockd_op_timeout_s", 10.0))
         c.connect_timeout = float(get_extra_config(ktc, "kvblockd_connect_timeout_s", 5.0))
+        # Validate at construction (same posture as the world_size guard):
+        # socket.settimeout(0) is NON-BLOCKING mode in Python, so a 0 meant
+        # as "no timeout" would fail 100% of ops — a permanent miss storm
+        # disclosed only by rate-limited warnings. Refuse it loudly instead.
+        if c.op_timeout <= 0:
+            raise ValueError(
+                f"kvblockd_op_timeout_s must be > 0, got {c.op_timeout} "
+                "(settimeout(0) is non-blocking mode: every op would fail)")
+        if c.connect_timeout <= 0:
+            raise ValueError(
+                f"kvblockd_connect_timeout_s must be > 0, got {c.connect_timeout} "
+                "(settimeout(0) is non-blocking mode: every dial would fail)")
+        # Dedicated budget for the SCHEDULER-SIDE synchronous BATCH_EXISTS
+        # (the sync lookup blocks every scheduling step): a hung-but-accepting
+        # daemon under the global op_timeout froze scheduling ~10s per breaker
+        # window, forever. The verb is <1ms p99 by design, so a small ceiling
+        # only ever cuts off a daemon that has already failed the fail-open
+        # contract. <=0 disables the dedicated budget (per-recv op_timeout
+        # only — the pre-wave behavior).
+        c.exists_timeout_s = float(get_extra_config(ktc, "kvblockd_exists_timeout_s", 0.25))
         # Write-behind stores: wait_for_save stages OWNED copies and returns;
         # a single "kvb-store" daemon thread drains them to the daemon. False
         # = the original synchronous put loop, byte-identical, kept for A/B.
@@ -288,6 +362,19 @@ class AdapterConfig:
         # request) is dropped and counted in the connector's dropped_puts /
         # dropped_put_bytes counters.
         c.store_queue_bytes = int(get_extra_config(ktc, "kvblockd_store_queue_bytes", 1 << 30))
+        if c.store_queue_bytes < 0:
+            raise ValueError(
+                f"kvblockd_store_queue_bytes must be >= 0, got {c.store_queue_bytes}")
+        # Write-behind drain fan-out: N "kvb-store" workers, requests hashed
+        # to a worker so per-request block order (the property that makes a
+        # partial delivery a usable consecutive prefix) is preserved. The
+        # EFFECTIVE count is min(this, kvblockd_streams) — each worker needs
+        # its own pooled conn or workers serialize on checkout. Default 1 =
+        # the original single-thread drain, byte-identical.
+        c.store_drain_workers = int(get_extra_config(ktc, "kvblockd_store_drain_workers", 1))
+        if c.store_drain_workers < 1:
+            raise ValueError(
+                f"kvblockd_store_drain_workers must be >= 1, got {c.store_drain_workers}")
         # Pinned staging pool for the CUDA gathered-store fast path. 0 (or
         # negative) disables the pool; UNSET auto-sizes it to the queue byte
         # budget plus two slots of headroom (~1 GiB of pinned host RAM at

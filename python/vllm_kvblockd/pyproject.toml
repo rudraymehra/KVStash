@@ -12,6 +12,8 @@ authors = [{ name = "Rudray Mehra", email = "rudraymehra@gmail.com" }]
 dependencies = [
     "kvblockd>=0.1.0",
     "numpy",  # JobMetadata.block_ids is an np.ndarray; also zero-copy tensor views
+    "blake3>=0.4",  # config.py imports it directly (key derivation core) — declare
+    # what we import, never lean on kvblockd's transitive pin (matching version)
 ]
 
 [project.optional-dependencies]
