@@ -186,19 +186,22 @@ blocks per rep @16k, 1999–2000 per rep @32k (per-prompt calibration lands
 within a token, so reps differ by one block; the gate is exact against each
 rep's own measured count) — and every record is path-stamped `chunked-slab`.
 
-**n=3 independent runs**, write-behind cold arm, same protocol as above:
+**n=3 independent runs**, gathered-slots cold arm + pipelined-slab warm arm
+(both stamped in every run's receipts), same protocol as above:
 
 | prefix | recompute (no connector)² | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
 |---|---|---|---|---|---|
-| 16k | 4,588 ms | 6,187 ms | **369 ms** (336–379) | **12.4×** | 16.8× |
-| 32k | 10,923 ms | 13,878 ms | **685 ms** (667–697) | **15.9×** | 20.3× |
+| 16k | 4,588 ms | 4,701 ms | **300 ms** (294–319) | **15.3×** | 15.7× |
+| 32k | 10,923 ms | 10,941 ms | **535 ms** (522–536) | **20.4×** | 20.5× |
 
-The warm@16k cell's cross-run spread is **11.8% — above our 10% target**
-and flagged by the aggregate gate; the full range is printed rather than
-the median alone, and the conservative end of every ratio uses the slow
-end of the range (10,923/697 = 15.7× worst-case at 32k; 4,588/379 = 12.1×
-at 16k). Earlier single-run cells (321/636 ms, 17.2×/25.1×) predate the
-write-behind wave and are superseded by this table.
+Store-on-miss overhead on this model is **1.00–1.02×** — at 56 KiB/token
+the gathered store path makes filling the cache effectively free, which is
+also why the "vs serving" column nearly equals "vs pure" (the serving
+baseline stopped paying a cache tax, not the reload getting slower).
+Worst-case ratios from the slow end of the ranges: 4,588/319 = 14.4× at
+16k (spread 8.6%, within the 10% gate); 10,923/536 = 20.4× at 32k (2.7%).
+The previous n=3 table (369/685 ms, 12.4×/15.9×, write-behind cold arm)
+and the earlier single-run cells (321/636 ms) are superseded by this one.
 
 Why the multiple grows vs the Llama table above: the speedup is
 `prefill(L) / reload(L)` — prefill grows superlinearly with context while
