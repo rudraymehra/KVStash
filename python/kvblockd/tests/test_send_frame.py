@@ -5,9 +5,9 @@ path built it)."""
 from __future__ import annotations
 
 import time
-import pytest
-
 from types import SimpleNamespace
+
+import pytest
 
 from kvblockd import client as client_mod
 from kvblockd import protocol as p

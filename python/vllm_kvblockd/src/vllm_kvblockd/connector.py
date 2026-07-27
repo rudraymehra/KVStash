@@ -710,10 +710,9 @@ class KvblockdConnector(_Base):
             + (" — flagging the promised load range" if n_load > 0 else ""),
             err,
         )
-        if n_load > 0:
-            if self._flag_only_row(meta, rid, load_start, n_load,
-                                   self._known_block_ids(rid, new_req)):
-                self._need_load_blocks.pop(rid, None)  # consumed WITH the row
+        if n_load > 0 and self._flag_only_row(meta, rid, load_start, n_load,
+                                              self._known_block_ids(rid, new_req)):
+            self._need_load_blocks.pop(rid, None)  # consumed WITH the row
 
     def _known_block_ids(self, rid, new_req=None) -> list[int] | None:
         bids = self._blocks.get(rid)
