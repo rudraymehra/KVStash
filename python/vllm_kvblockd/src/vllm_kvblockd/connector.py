@@ -49,20 +49,13 @@ deliberately does not have.
 
 from __future__ import annotations
 
-import concurrent.futures
-import contextlib
 import logging
-import os
 import queue
 import struct
 import threading
 import time
-import zlib
-from collections import deque
 from dataclasses import dataclass, field
 
-import numpy as np
-from kvblockd import protocol as kp
 from kvblockd.client import Client
 from kvblockd.errors import ConnectionLost
 
@@ -182,36 +175,6 @@ class _DialPending(ConnectionError):
 # wedged counter can only ever DELAY the drain, never stop it.
 _DRAIN_GATE_CEILING_S = 0.25
 
-# Chunked H2D scatter: blocks per chunk and the GPU scratch depth. One chunk
-# = one non_blocking H2D of a contiguous pinned-slab region + one index_copy_
-# per layer, replacing chunk×layers synchronous pageable copies. Depth 1 is
-# deliberate (reviewer-verified): every chunk runs on the SAME stream, so the
-# copy_ into the scratch buffer cannot start until the previous chunk's
-# index_copy_ reads finished — a second buffer bought no overlap, only VRAM.
-# That same-stream argument now carries THREE users of the one ring buffer:
-# serial-slab chunks (engine's current stream), pipelined-slab chunks (the
-# dedicated copy stream — BOTH slab halves' chunks run on it, so half
-# alternation never overlaps ring reuse), and the gathered-store path
-# (current stream). Cross-path safety is an EXIT-SYNC invariant, not a
-# stream one: each path synchronizes the stream it issued ring work on
-# before returning to the engine (_scatter_slab's trailing sync, the
-# pipelined load's final copy-stream event, _store_sync in wait_for_save),
-# so no two paths ever have ring work in flight at once.
-_SCATTER_CHUNK = 64
-_SCRATCH_RING = 1
-
-# Consecutive chunked-scatter setup failures (scratch alloc / paged view)
-# before the chunked path latches OFF for the connector's lifetime — the
-# per-block-from-slab copies keep serving loads either way.
-_SCRATCH_MAX_FAILS = 3
-
-# Pipelined load: cap on ONE slab half. Passes must be small enough that the
-# prefetch drain of pass p+1 genuinely overlaps the H2D+scatter of pass p
-# (one 2GiB pass has nothing to overlap with), yet big enough to amortize
-# per-pass costs; the load path reserves TWO halves, so the pinned footprint
-# of the pipeline is 2×min(staging/2, this) — what _maybe_prewarm now pins.
-_PIPELINE_HALF_MAX = 256 << 20
-
 # Async-lookup pending-map ceiling: at the cap a NEW lookup answers (0, False)
 # — a miss — instead of None, because a None with no queued work would park
 # the request on a result that never comes (never-None-under-pressure rule).
@@ -320,6 +283,16 @@ def decode_blob_prefix(prefix: bytes) -> tuple[str, int, int, int, int, int]:
     return CODE_DTYPES[dcode], n_layers, tpb, bpl, total, codec
 
 
+# Composed collaborators — the two unit-owned extractions of this file's
+# biggest lifecycles: the slab/scatter/pipelined LOAD machinery and the
+# write-behind STORE queue machinery. Imported HERE, not at the top of the
+# file, because both modules import blob-codec / dial-plumbing names defined
+# above (cycle-safe by ordering). _AckedKeyLRU is re-exported unchanged for
+# its existing importers (tests).
+from .slab_loader import _PIPELINE_HALF_MAX, SlabLoader
+from .store_queue import StoreQueue, _AckedKeyLRU, _StagePlan  # noqa: F401
+
+
 class _RateLimitedLog:
     """One full traceback per key on first sight, then one terse line per
     interval (per-instance — mirrors the LMCache connector's discipline)."""
@@ -339,50 +312,6 @@ class _RateLimitedLog:
             logger.warning("%s: %s", msg, exc, exc_info=exc)
         else:
             logger.warning("%s: %s", msg, exc)
-
-
-class _AckedKeyLRU:
-    """Bounded TTL'd set of keys the daemon recently ACKED (OK/OK_EXISTS).
-    Populated ONLY by the kvb-store drain thread on put verdicts — an ack is
-    the daemon saying "present", so a false positive is impossible; a false
-    negative (capacity/TTL eviction here) just costs today's re-put. ADVISORY
-    by construction: the daemon evicts (S3-FIFO/TTL), so an entry's ack-time
-    truth decays — the TTL bounds how long it is trusted, and it is NEVER
-    refreshed on a hit (a hit adds no new evidence of daemon-side presence;
-    only a fresh ack does). Write-once keys make content staleness
-    impossible: the worst wrong answer is a skipped re-store after a daemon
-    eviction — a future miss bounded by the window, never a wrong byte.
-    Thread-safe: hit() runs on the engine thread, add() on the drain thread."""
-
-    def __init__(self, cap: int, ttl_s: float):
-        self._cap = cap
-        self._ttl = ttl_s
-        self._lock = threading.Lock()
-        self._entries: dict[bytes, float] = {}  # key -> ack time (insertion-ordered)
-
-    def add(self, key: bytes) -> None:
-        with self._lock:
-            self._entries.pop(key, None)  # re-ack refreshes both TTL and recency
-            self._entries[key] = time.monotonic()
-            while len(self._entries) > self._cap:
-                self._entries.pop(next(iter(self._entries)))  # oldest ack out
-
-    def hit(self, key: bytes) -> bool:
-        with self._lock:
-            t = self._entries.get(key)
-            if t is None:
-                return False
-            if time.monotonic() - t > self._ttl:
-                self._entries.pop(key, None)  # expired: past acks prove nothing now
-                return False
-            return True
-
-    def clear(self) -> None:
-        """Forget every ack at once — for the moment a connection-class
-        failure proves them ALL stale (a daemon restart empties the store,
-        so pre-outage acks would suppress the self-healing re-put)."""
-        with self._lock:
-            self._entries.clear()
 
 
 def align_to_block_size(num_tokens: int, block_size: int) -> int:
@@ -413,30 +342,6 @@ class KvbReqMeta:
 @dataclass
 class KvblockdConnectorMetadata(_MetaBase):
     requests: list[KvbReqMeta] = field(default_factory=list)
-
-
-@dataclass
-class _StagePlan:
-    """One request's gathered-store staging, enqueue DEFERRED until after the
-    device sync (wait_for_save). items rows are mutable [j, key, buf, slot_id]
-    — slot_id is nulled as ownership moves (queue / free list / rebuild), so
-    cleanup at any exit frees each slot exactly once. names/bytes_per_layer/
-    block_ids/prefix ride along so a failed sync can rebuild the blobs from
-    the still-valid paged memory."""
-
-    req_id: str
-    total: int
-    end: int
-    items: list[list]  # [j, key, bytearray | memoryview, slot_id | None]
-    dev: object
-    names: list[str]
-    bytes_per_layer: int
-    block_ids: list[int]
-    prefix: bytes
-    # items[:sent] have SETTLED accounting (enqueued, or refused-and-counted
-    # by the tail-skip); _abandon_plan counts exactly items[sent:] — the
-    # blocks a mid-plan raise would otherwise lose with dropped_puts=0.
-    sent: int = 0
 
 
 class _LookupResolver:
@@ -582,140 +487,14 @@ class KvblockdConnector(_Base):
         self._load_bps_ema: float | None = None
         self._load_bytes_per_token = 0.0
 
-        # Pinned staging slab (CUDA loads only): lazily allocated on the first
-        # CUDA-device load, grown geometrically UP TO the configured cap
-        # (kvblockd_staging_bytes), REUSED across loads — never freed
-        # per-load. Loads bigger than the cap drain through the slab in
-        # cap-sized passes. Slots are disjoint by pass-local block index,
-        # which is what makes the client's concurrent drain threads safe.
-        self._staging_bytes = self._cfg.staging_bytes
-        self._slab = None                 # 1-D pinned uint8 torch tensor
-        self._slab_np = None              # numpy view of the slab (memoryview source)
-        self._slab_disabled = False       # first-pin failure -> permanent per-block fallback
         self._prewarm_done = False        # one eager-pin attempt at first CUDA capture
-        # GPU scratch for the chunked scatter: _SCRATCH_RING × [chunk,
-        # n_layers, bytes_per_layer] uint8, cached per (device, layout).
-        self._gpu_scratch = None
-        self._gpu_scratch_key = None
-        # A failed pipelined exit sync means ring work may STILL be in
-        # flight on the copy stream; until a drain proves otherwise, no
-        # path may hand out ring memory (see _scratch_ring).
-        self._scratch_torn = False
-        self._scratch_fails = 0           # consecutive chunked-setup failures
-        self._chunked_disabled = False    # latched after _SCRATCH_MAX_FAILS in a row
-        # Pinned int64 staging for chunk-index uploads (beside _gpu_scratch):
-        # torch.tensor(list, device=cuda) is a BLOCKING pageable H2D that
-        # would puncture the pipeline from inside every chunk.
-        self._idx_pin = None
-        # Pipelined double-buffered load (CUDA): dedicated copy stream +
-        # single-worker prefetch thread, both lazy; setup failures (never
-        # drain/network failures — those degrade one load without latching)
-        # count toward the same 3-in-a-row latch as the scratch ring.
-        self._load_stream = None
-        self._prefetch_ex: concurrent.futures.ThreadPoolExecutor | None = None
-        self._pipeline_fails = 0          # consecutive pipelined-SETUP failures
-        self._pipeline_disabled = False   # latched after _SCRATCH_MAX_FAILS in a row
-        # Machine-readable path attribution: one INFO line on the first
-        # completed load, one more per mid-run switch.
-        self._reported_path = None
-        self._debug_scatter_checked = False  # KVBLOCKD_DEBUG_SCATTER_CHECK=1, once
-
-        # Write-behind store queue (kvblockd_async_store, default on):
-        # wait_for_save stages OWNED byte copies here and returns; N daemon
-        # workers ("kvb-store[-i]", lazily started on first enqueue) drain
-        # them — one deque per worker, requests HASHED to a worker (stable
-        # crc32 of req_id), so per-request block order is preserved exactly
-        # as the single FIFO preserved it: a partial delivery stays a usable
-        # consecutive prefix under the prefix-chain keys. Effective count is
-        # min(kvblockd_store_drain_workers, streams) — each worker owns one
-        # pooled conn's worth of put throughput; default 1 = the original
-        # single-thread drain, byte-identical. All queue state (deques, byte
-        # gauges, slot free list, public counters) is guarded by _sq_cond.
-        self._store_workers = max(1, min(self._cfg.store_drain_workers,
-                                         self._cfg.streams))
-        self._sqs: list[deque[tuple[bytes, bytearray | memoryview, int | None]]] = [
-            deque() for _ in range(self._store_workers)]
-        self._sq_cond = threading.Condition()
-        self._sq_bytes = 0            # bytes currently queued
-        self._sq_inflight = 0         # blocks popped, put() not finished
-        self._sq_inflight_bytes = 0
-        # In-flight blocks the SHUTDOWN disclosure already counted dropped
-        # (join timed out mid-put). The drain thread reconciles when the put
-        # finally returns: delivered -> un-count the pessimistic drop; failed
-        # -> already disclosed dropped, must not ALSO count failed.
-        self._sq_inflight_counted = 0
-        # req_id -> FIRST store block that was dropped for that request. The
-        # keys are a prefix chain, so every later block of the request is
-        # unreachable by the consecutive-prefix lookup — later _stage_one
-        # calls (chunked-prefill continuations) skip past the hole instead of
-        # queueing dead bytes. Pruned in request_finished.
-        self._store_holes: dict[str, int] = {}
-        self._store_threads: list[threading.Thread | None] = [None] * self._store_workers
-        self._store_stop = False      # shutdown: drain the remainder, then exit
-        self._store_abort = False     # wedged flush: exit without draining
-        # Public disclosure counters (the bench reads/greps these).
-        self.dropped_puts = 0
-        self.dropped_put_bytes = 0
-        self.failed_puts = 0
-        self.deduped_puts = 0  # blocks skipped by the acked-key store dedupe
-        # Acked-key store dedupe (kvblockd_store_dedupe_keys): drain-thread
-        # acks in, _stage_one leading-run skips out. None = disabled (knob 0
-        # or TTL<=0) — every path then behaves exactly as before the LRU.
-        self._acked_keys: _AckedKeyLRU | None = None
-        if self._cfg.store_dedupe_keys > 0 and self._cfg.store_dedupe_ttl_s > 0:
-            self._acked_keys = _AckedKeyLRU(self._cfg.store_dedupe_keys,
-                                            self._cfg.store_dedupe_ttl_s)
-        # Loads currently pulling KV (guarded by _sq_cond like all queue
-        # state); the drain's load-priority gate parks on it.
-        self._loads_inflight = 0
-        # Episode arm for the drain's load-priority gate (under _sq_cond —
-        # armed by the drain, cleared on episode edges): the gate parks ONCE
-        # per raised episode, not once per pop — N queued blobs under one
-        # raised gate cost one ceiling total, never N ceilings. Episodes are
-        # EDGE-TRIGGERED: start_load_kv clears the arm on the 0->1 transition
-        # of _loads_inflight, because the drain only samples the counter
-        # between puts — an episode that begins while the drain is inside
-        # put() must not inherit the previous episode's expired arm.
-        self._drain_park_until: float | None = None
-
-        # Pinned store-slot pool (CUDA gathered-store fast path): one pinned
-        # tensor cut into `total`-stride slots (32B prefix + body), leased at
-        # stage time, released when the slot's blob leaves the queue for good.
-        # Separate from the LOAD slab on purpose: a slot's lifetime crosses
-        # into the drain thread, while the load slab's contract ends at its
-        # trailing stream synchronize. Slot ownership walk: ALLOCATED (stager
-        # frees on a mid-fill failure) -> QUEUED (stager frees on enqueue
-        # refusal; shutdown walks _sq and frees before clear()) -> INFLIGHT
-        # (ONLY the drain's reconcile block frees — the memoryview sits in
-        # _send_frame's iovec, and reusing it mid-sendmsg would publish
-        # garbage under a content-chained key; a requeue keeps the lease).
-        # Invariant under _sq_cond: free + staging + queued + inflight ==
-        # total slots, single-free at every exit.
-        self._store_slab = None           # 1-D pinned uint8 torch tensor
-        self._store_slab_np = None        # numpy view (memoryview source)
-        self._store_slot_stride = 0       # bytes per slot (== blob total)
-        self._store_slot_free: list[int] = []   # free slot ids, under _sq_cond
-        self._store_slots_total = 0
-        self._store_slab_disabled = False  # first-alloc failure -> permanent
-        self._store_gather_fails = 0      # consecutive gather-path failures
-        self._store_gather_disabled = False  # latched after _SCRATCH_MAX_FAILS
-        # Store-path attribution, one-shot (+ one switch line) — deliberately
-        # NOT _note_path: the bench greps "kvblockd load path:" and a store
-        # stamp would consume that one-shot.
-        self._reported_store_path = None
-        self._store_path_switch_logged = False
-
-    @property
-    def _sq(self):
-        """Worker 0's deque — exact for the default single-worker drain (the
-        bench/test seam that inspects the staged queue); multi-worker callers
-        must iterate _sqs."""
-        return self._sqs[0]
-
-    @property
-    def _store_thread(self):
-        """First live drain thread or None (single-worker back-compat seam)."""
-        return next((t for t in self._store_threads if t is not None), None)
+        # Composed collaborators (see slab_loader.py / store_queue.py): the
+        # LOAD machinery's and STORE machinery's state lives on them and is
+        # aliased back onto the connector below (_alias_state), so every
+        # existing seam — tests, the bench counters, cross-lifecycle
+        # callers — reads and patches the connector exactly as before.
+        self._loader = SlabLoader(self)
+        self._store_q = StoreQueue(self)
 
     # ------------------------------------------------------------------
     # client plumbing (lazy: import/instantiate must succeed with no daemon)
@@ -1551,146 +1330,21 @@ class KvblockdConnector(_Base):
                 self._loads_inflight -= 1
                 self._sq_cond.notify_all()
 
+    # Load-side delegation: the slab/scatter/pipelined load machinery lives
+    # in slab_loader.SlabLoader (unit-owned). These delegates keep every
+    # connector-level seam: tests monkeypatch them as instance attributes,
+    # and ALL internal cross-boundary calls route through the connector so
+    # those patches always intercept.
     def _load_one(self, req: KvbReqMeta) -> None:
-        names, dtype_name, bytes_per_layer = self._layout()
-        if not names:
-            self._load_errors.update(self._load_range_ids(req))
-            return
-        total = BLOB_PREFIX_LEN + bytes_per_layer * len(names)
-        seed = self._seed(req.cache_salt, req.mm_ids, req.lora_name)
-        start = req.load_start_block
-        end = start + req.num_load_blocks
-        keys = self._chain_keys(req.req_id, seed, req.token_ids)[start:end]
-        # A promised block with no derivable key (token list shorter than the
-        # promise) can never be filled — flag it now, don't drop it silently.
-        for blk in range(start + len(keys), end):
-            if blk < len(req.block_ids):
-                self._load_errors.add(req.block_ids[blk])
-
-        body_len = total - BLOB_PREFIX_LEN
-        dev = self._layer_kv[names[0]].device
-        # Overall per-load deadline (kvblockd_load_deadline_s): op_timeout
-        # bounds each recv, this bounds the WHOLE load — a daemon trickling
-        # bytes passes every per-recv check forever, and the engine counted
-        # these blocks computed, so the only safe degrade is: abandon the
-        # remaining shards, flag the unfilled bids, recompute. The budget is
-        # token-scaled: min(cap, base + per_block_s * n_load_blocks) — at the
-        # flat-compat defaults (per_block=0, cap unset) it is exactly base.
-        deadline = None
-        if self._cfg.load_deadline_s > 0:
-            budget = (self._cfg.load_deadline_s
-                      + self._cfg.load_deadline_per_block_s * req.num_load_blocks)
-            if self._cfg.load_deadline_cap_s > 0:
-                budget = min(budget, self._cfg.load_deadline_cap_s)
-            deadline = time.monotonic() + budget
-        t0 = time.monotonic()
-        errs_before = len(self._load_errors)
-        path = None
-        took_slab = False
-        if keys and self._slab_path_ok(dev):
-            if not self._pipeline_disabled and body_len > 0:
-                # Pipelined double-buffered halves: passes small enough that
-                # the next pass's wire drain overlaps this pass's H2D+scatter.
-                hb = min(min(self._staging_bytes // 2, _PIPELINE_HALF_MAX) // body_len,
-                         len(keys))
-                need = (2 * hb if len(keys) > hb else hb) * body_len
-                if hb > 0 and self._slab_reserve(need):
-                    path = self._load_pipelined(req, names, dtype_name, bytes_per_layer,
-                                                total, keys, hb, deadline)
-                    took_slab = path is not None
-            if not took_slab:
-                # Serial cap-sized passes (pipeline latched off, setup failed,
-                # or one body outgrows a half): the slab never grows past the
-                # configured cap; bigger loads drain through it pass by pass.
-                cap_blocks = self._staging_bytes // body_len if body_len > 0 else 0
-                pass_blocks = min(len(keys), cap_blocks)
-                if pass_blocks > 0 and self._slab_reserve(pass_blocks * body_len):
-                    took_slab = True
-                    used_ring = self._load_slab(req, names, dtype_name, bytes_per_layer,
-                                                total, keys, pass_blocks, deadline)
-                    path = "chunked-slab" if used_ring else "per-block"
-        if keys and not took_slab:
-            self._load_perblock(req, names, dtype_name, bytes_per_layer, total, keys,
-                                deadline)
-            path = "per-block"
-        if keys:
-            self._note_path(path)
-            elapsed = time.monotonic() - t0
-            self.stats.bump("load_count")
-            self.stats.bump("load_time_s", elapsed)
-            # Estimator feed: promised minus newly-flagged approximates the
-            # delivered blocks (a bid flagged twice undercounts errors, i.e.
-            # overstates throughput — the admit-biased direction).
-            self._observe_load(len(keys) - (len(self._load_errors) - errs_before),
-                               total, elapsed)
+        self._loader._load_one(req)
 
     def _note_path(self, path: str) -> None:
-        """One machine-readable line on the first completed load — the bench
-        rig takes the LAST match to attribute measured numbers to the path
-        that served the run's tail — plus one line per DISTINCT switch (three
-        paths exist now, so a single one-shot switch line could leave the
-        last match naming a path that stopped serving). Steady state still
-        logs nothing.
-
-        WARNING level on purpose: this logger lives outside vLLM's logging
-        config, and in the engine-core process an unconfigured logger drops
-        INFO under the root default — the certification run recorded 'path
-        unattributed' exactly that way. A line per switch is not noise."""
-        if self._reported_path is None:
-            self._reported_path = path
-            logger.warning("kvblockd load path: %s", path)
-        elif path != self._reported_path:
-            logger.warning("kvblockd load path: %s (switched from %s mid-run)",
-                           path, self._reported_path)
-            self._reported_path = path
+        self._loader._note_path(path)
 
     def _load_perblock(self, req: KvbReqMeta, names, dtype_name, bytes_per_layer,
                        total, keys, deadline: float | None = None) -> None:
-        """The original per-block load: pageable torch.empty staging + one
-        synchronous dst.copy_ per (block, layer). This is THE path for CPU
-        paged tensors (the CI backend / bench/e2e/cpu rig depend on it staying
-        byte-identical in behavior) and the degrade when pinning fails."""
-        torch = _torch()
-        start = req.load_start_block
-        staged: dict[int, object] = {}
-
-        def alloc(idx, prefix, body_len):
-            try:
-                d, n_layers, tpb, bpl, tot, codec = decode_blob_prefix(prefix)
-            except BlobError:
-                return None
-            if (codec != CODEC_RAW  # this build decodes only raw bodies —
-                    # a codec blob is a clean miss until its serde (and the
-                    # pre-registered quality gate) land
-                    or d != dtype_name or n_layers != len(names) or tpb != self._block_size
-                    or bpl != bytes_per_layer or tot != total
-                    or body_len != total - BLOB_PREFIX_LEN):
-                return None  # codec/layout drift -> miss, never a corrupt scatter
-            buf = torch.empty(body_len, dtype=torch.uint8)
-            staged[idx] = buf
-            return memoryview(buf.numpy())
-
-        statuses = self._ensure().batch_get_scatter(keys, BLOB_PREFIX_LEN, alloc,
-                                                    deadline=deadline)
-        for j, st in enumerate(statuses):
-            blk = start + j
-            bid = req.block_ids[blk] if blk < len(req.block_ids) else None
-            if st != kp.Status.OK or j not in staged:
-                if bid is not None:
-                    self._load_errors.add(bid)
-                continue
-            if bid is None:
-                continue
-            buf = staged[j]
-            for li, name in enumerate(names):
-                dst = self._layer_kv[name][bid]
-                src = buf[li * bytes_per_layer : (li + 1) * bytes_per_layer]
-                try:
-                    dst.copy_(src.view(dst.dtype).reshape(dst.shape))
-                except Exception as e:  # noqa: BLE001 — never-raise boundary: a failed scatter marks the block errored, not the engine
-                    self._log.maybe("scatter", f"scatter into {name} failed", e)
-                    self._load_errors.add(bid)
-                    break
+        self._loader._load_perblock(req, names, dtype_name, bytes_per_layer,
+                                    total, keys, deadline)
 
     # ------------------------------------------------------------------
     # pinned-slab load path (CUDA paged tensors)
@@ -1706,553 +1360,61 @@ class KvblockdConnector(_Base):
         return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
 
     def _slab_reserve(self, nbytes: int) -> bool:
-        """Ensure the connector-owned pinned uint8 slab holds nbytes: lazily
-        allocated on first use, grown geometrically (>= 2x) up to the
-        configured cap, REUSED across loads — never freed per-load. A pin
-        failure with NO working slab disables the slab for the connector's
-        lifetime; a GROWTH failure keeps the old slab (this load falls back
-        per-block, smaller loads keep the slab lane). Never raises."""
-        if self._slab_disabled:
-            return False
-        if nbytes > self._staging_bytes:
-            return False  # over the cap: callers split loads into cap-sized passes
-        if self._slab is not None and self._slab.numel() >= nbytes:
-            return True
-        want = nbytes if self._slab is None else max(nbytes, 2 * self._slab.numel())
-        want = min(want, self._staging_bytes)  # still >= nbytes (checked above)
-        try:
-            slab = self._alloc_pinned(want)
-            slab_np = slab.numpy()
-        except Exception as e:  # noqa: BLE001 — never-raise boundary: cudaHostAlloc failure degrades to the per-block path
-            if self._slab is None:
-                self._log.maybe("slab", "pinned slab allocation failed — per-block fallback", e)
-                self._slab_disabled = True
-            else:
-                self._log.maybe("slab", "pinned slab GROWTH failed — keeping the "
-                                        "existing slab; per-block fallback for this load", e)
-            return False
-        self._slab, self._slab_np = slab, slab_np
-        return True
+        return self._loader._slab_reserve(nbytes)
 
     def _load_slab(self, req: KvbReqMeta, names, dtype_name, bytes_per_layer,
                    total, keys, pass_blocks: int, deadline: float | None = None,
                    key_base: int = 0) -> bool:
-        """Slab-staged load: the client drains block bodies straight into
-        disjoint pinned-slab slots (the layout gate runs in alloc BEFORE any
-        body byte is accepted, exactly like the per-block path), then
-        _scatter_slab moves them to the GPU in chunked batches. Loads bigger
-        than pass_blocks drain through the slab in pass_blocks-sized passes —
-        _scatter_slab's trailing stream synchronize makes reusing the slots
-        for the next pass safe, and key_offset keeps every pass's statuses
-        mapped to the right GLOBAL block ids. key_base offsets that mapping
-        when `keys` is a TAIL of the load's key list (the pipelined path's
-        mid-load serial fallback). Returns whether any pass used the chunked
-        fast path (path attribution)."""
-        body_len = total - BLOB_PREFIX_LEN
-        slab_np = self._slab_np
-        used_ring = False
-        for p0 in range(0, len(keys), pass_blocks):
-            if deadline is not None and time.monotonic() > deadline:
-                # Load deadline blown between passes: flag every remaining
-                # promised bid and stop — the scheduler counted them computed,
-                # so an unflagged unfilled block is silent garbage.
-                for blk in range(req.load_start_block + key_base + p0,
-                                 req.load_start_block + key_base + len(keys)):
-                    if blk < len(req.block_ids):
-                        self._load_errors.add(req.block_ids[blk])
-                self._log.maybe("load-deadline",
-                                f"load deadline exceeded — abandoning {len(keys) - p0} "
-                                f"remaining blocks (recompute) req={req.req_id}")
-                self.stats.bump("load_deadline_aborts")
-                break
-            sub = keys[p0:p0 + pass_blocks]
+        return self._loader._load_slab(req, names, dtype_name, bytes_per_layer,
+                                       total, keys, pass_blocks, deadline, key_base)
 
-            def alloc(idx, prefix, blen):
-                # Runs on the client's concurrent drain threads: slots are
-                # disjoint by (pass-local) idx and nothing else is mutated
-                # here — thread-safe by construction. idx is 0-based within
-                # this batch_get_scatter call, so slots never exceed the pass.
-                try:
-                    d, n_layers, tpb, bpl, tot, codec = decode_blob_prefix(prefix)
-                except BlobError:
-                    return None
-                # codec gate first: slot sizing below assumes the raw fixed
-                # stride (per-codec max_body_len sizing lands WITH a serde).
-                if (codec != CODEC_RAW
-                        or d != dtype_name or n_layers != len(names) or tpb != self._block_size
-                        or bpl != bytes_per_layer or tot != total or blen != body_len):
-                    return None  # codec/layout drift -> miss, never a corrupt scatter
-                off = idx * body_len
-                return memoryview(slab_np[off:off + blen])
-
-            statuses = self._ensure().batch_get_scatter(sub, BLOB_PREFIX_LEN, alloc,
-                                                        deadline=deadline)
-            used_ring |= self._scatter_slab(req, names, bytes_per_layer, statuses,
-                                            key_offset=key_base + p0)
-        return used_ring
-
-    # ------------------------------------------------------------------
-    # pipelined load path (double-buffered slab halves, CUDA)
-    # ------------------------------------------------------------------
     def _copy_stream(self, dev):
-        """The dedicated load stream (cached; loads are engine-thread-serial,
-        so one is enough). None off-CUDA: CPU copies complete synchronously,
-        so no stream or fence exists to wait on. Test seam."""
-        if getattr(dev, "type", "") != "cuda":
-            return None
-        if self._load_stream is None:
-            torch = _torch()
-            self._load_stream = torch.cuda.Stream(device=dev)
-        return self._load_stream
+        return self._loader._copy_stream(dev)
 
     def _make_event(self):
-        """One fence event (slab-half reuse + the final exit sync). None when
-        no copy stream exists — there is then nothing asynchronous to fence.
-        Test seam: the CPU suites substitute recording stand-ins."""
-        if self._load_stream is None:
-            return None
-        torch = _torch()
-        return torch.cuda.Event()
+        return self._loader._make_event()
 
     def _current_stream(self, dev):
-        """The engine's compute stream. Test seam."""
-        return _torch().cuda.current_stream(dev)
+        return self._loader._current_stream(dev)
 
     def _entry_fence(self, stream, dev) -> None:
-        """Order the copy stream after the engine's compute stream before
-        any paged write. INVARIANT: a paged block freed by a finishing
-        request and reallocated to this load may still be READ by an
-        in-flight prior-step kernel on the compute stream; an unordered
-        index_copy_ over it is a silent wrong byte no flag ever covers.
-        The serial path gets this for free by issuing on the compute
-        stream itself. Device-side wait (~µs) — the host never stalls.
-        No stream, nothing asynchronous to order."""
-        if stream is None:
-            return
-        ev = self._make_event()
-        if ev is None:
-            return
-        ev.record(self._current_stream(dev))
-        stream.wait_event(ev)
+        self._loader._entry_fence(stream, dev)
 
-    @staticmethod
-    def _stream_scope(stream):
-        if stream is None:
-            return contextlib.nullcontext()
-        return _torch().cuda.stream(stream)
+    def _stream_scope(self, stream):
+        return SlabLoader._stream_scope(stream)
 
     def _prefetch_submit(self, fn):
-        """Submit one drain to the persistent single-worker prefetch thread
-        (lazily started, joined in shutdown). ONE worker on purpose: exactly
-        one drain in flight at a time is what keeps the client's 4-conn pool
-        math and the store drain's load-priority gate unchanged."""
-        if self._prefetch_ex is None:
-            self._prefetch_ex = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="kvb-load-prefetch")
-        return self._prefetch_ex.submit(fn)
+        return self._loader._prefetch_submit(fn)
 
     def _pipeline_fail(self, msg: str, exc: BaseException | None) -> None:
-        """Consecutive pipelined-SETUP failure accounting (mirrors
-        _scratch_fails). Drain/network failures NEVER land here: latching on
-        a transient server blip would disable the pipeline for the process
-        lifetime, and a drain raise already degrades that one load serially
-        without spending the latch."""
-        self._pipeline_fails += 1
-        if self._pipeline_fails >= _SCRATCH_MAX_FAILS:
-            self._pipeline_disabled = True
-            # Own rate-limit key: the per-load fallback line below fires
-            # first and would otherwise suppress this one-shot disclosure.
-            self._log.maybe(
-                "pipeline-latch",
-                f"{msg} {self._pipeline_fails}x in a row — latched OFF for this "
-                "connector's lifetime (serial slab passes)", exc)
-        else:
-            self._log.maybe("pipeline", f"{msg} — serial slab fallback for this load", exc)
+        self._loader._pipeline_fail(msg, exc)
 
     def _load_pipelined(self, req: KvbReqMeta, names, dtype_name, bytes_per_layer,
                         total, keys, half_blocks: int,
                         deadline: float | None = None) -> str | None:
-        """Double-buffered slab load: a single-worker prefetch thread drains
-        pass p+1 into slab half (p+1)%2 over the wire WHILE the engine thread
-        scatters half p on the dedicated copy stream — the wire and PCIe
-        legs, strictly additive in the serial path, now overlap. The caller
-        reserved BOTH halves; the client's alloc contract already writes
-        disjoint slots thread-safely, so no client change is involved.
-
-        Fencing: at ENTRY the copy stream waits on an event recorded on
-        the engine's compute stream (_entry_fence) — a paged block freed
-        by a finishing request and reallocated to this load may still be
-        read by an in-flight prior-step kernel, and scattering into it
-        from an unordered stream would be a silent wrong byte
-        (write-after-read; the serial path is ordered for free by issuing
-        on the compute stream). Every LATER event is a copy-stream event:
-        half h's slots are
-        re-drained only after free_ev[h] — recorded after the half's last
-        chunk — synchronized; the same fence covers the pinned idx staging
-        the next pass's scatter refills, which is why it runs before EVERY
-        scatter, last pass included. Both halves' chunks share the ONE copy
-        stream, so the depth-1 scratch ring stays safe by same-stream
-        ordering (the _SCRATCH_RING comment's argument, now on this stream).
-        One final copy-stream event before returning keeps the synchronous
-        vLLM contract, makes the paged writes visible engine-wide, and is
-        this path's exit-sync for the ring handoff to _stage_gather.
-
-        Degrades, never raises: non-OK statuses flag per block (in
-        _scatter_slab); an expired deadline scatters the half already
-        drained-and-verified and flags ONLY the undrained remainder; a drain
-        raise flags that pass's promised sub-range and hands the undrained
-        tail to the serial slab path WITHOUT touching the latch; a failed
-        final sync flags every promised bid (nothing is provably loaded).
-        Returns the path stamp — attributed to whichever lane moved the
-        majority of the load's blocks — or None when SETUP failed (counted
-        toward the pipeline latch; the caller runs the serial path)."""
-        body_len = total - BLOB_PREFIX_LEN
-        n = len(keys)
-        slab_np = self._slab_np
-        half_off = half_blocks * body_len
-        start = req.load_start_block
-
-        def drain(p0: int, sub, half: int):
-            def alloc(idx, prefix, blen):
-                # Client drain threads: slots disjoint by (half, pass-local
-                # idx), nothing else mutated — thread-safe by construction.
-                try:
-                    d, n_layers, tpb, bpl, tot, codec = decode_blob_prefix(prefix)
-                except BlobError:
-                    return None
-                # codec gate first: half/slot strides assume the raw fixed
-                # body_len (per-codec max_body_len sizing lands WITH a serde).
-                if (codec != CODEC_RAW
-                        or d != dtype_name or n_layers != len(names) or tpb != self._block_size
-                        or bpl != bytes_per_layer or tot != total or blen != body_len):
-                    return None  # codec/layout drift -> miss, never a corrupt scatter
-                off = half * half_off + idx * body_len
-                return memoryview(slab_np[off:off + blen])
-
-            return self._ensure().batch_get_scatter(sub, BLOB_PREFIX_LEN, alloc,
-                                                    deadline=deadline)
-
-        def submit(i: int):
-            p0 = i * half_blocks
-            sub = keys[p0:p0 + half_blocks]
-            return self._prefetch_submit(lambda: drain(p0, sub, i % 2))
-
-        def flag_range(a: int, b: int) -> None:
-            for blk in range(start + a, start + min(b, n)):
-                if blk < len(req.block_ids):
-                    self._load_errors.add(req.block_ids[blk])
-
-        try:
-            dev = self._layer_kv[names[0]].device
-            stream = self._copy_stream(dev)
-            # Unprovable ordering == setup failure: fall back to the serial
-            # path, which is compute-stream-ordered by construction.
-            self._entry_fence(stream, dev)
-            fut = submit(0)
-        except Exception as e:  # noqa: BLE001 — never-raise boundary: setup failure degrades to the serial slab path
-            self._pipeline_fail("pipelined-load setup failed", e)
-            return None
-        self._pipeline_fails = 0
-        n_passes = -(-n // half_blocks)
-        free_ev = [None, None]
-        pipelined_blocks = 0
-        serial_from: int | None = None
-        try:
-            for i in range(n_passes):
-                p0 = i * half_blocks
-                p1 = min(p0 + half_blocks, n)
-                try:
-                    statuses = fut.result()
-                except Exception as e:  # noqa: BLE001 — drain failure: flag this pass, serve the tail serially, no latch (transient network is not a setup fault)
-                    self._log.maybe("load", f"pipelined drain failed req={req.req_id} "
-                                            "— serial fallback for the remainder", e)
-                    self._drop_client(e)
-                    flag_range(p0, p1)
-                    serial_from = p1
-                    fut = None
-                    break
-                fut = None
-                # The wall-clock deadline bounds WIRE time (the client threads
-                # it into every recv); a half that drained in budget was also
-                # xxh3-verified, so it is scattered even at the deadline —
-                # only the UNDRAINED remainder is abandoned and flagged.
-                expired = (deadline is not None and i + 1 < n_passes
-                           and time.monotonic() > deadline)
-                # Fence before EVERY scatter: pass i-1's event guards both
-                # the half pass i+1 will overwrite and the pinned idx slices
-                # this pass's scatter refills.
-                ev = free_ev[(i + 1) % 2]
-                if ev is not None:
-                    ev.synchronize()
-                    free_ev[(i + 1) % 2] = None
-                if i + 1 < n_passes and not expired:
-                    fut = submit(i + 1)
-                with self._stream_scope(stream):
-                    self._scatter_slab(req, names, bytes_per_layer, statuses,
-                                       key_offset=p0, sync=False,
-                                       slab_base=(i % 2) * half_off)
-                pipelined_blocks += p1 - p0
-                ev = self._make_event()
-                if ev is not None:
-                    ev.record(stream)
-                    free_ev[i % 2] = ev
-                if expired:
-                    flag_range(p1, n)
-                    self._log.maybe("load-deadline",
-                                    f"load deadline exceeded — abandoning {n - p1} "
-                                    f"remaining blocks (recompute) req={req.req_id}")
-                    self.stats.bump("load_deadline_aborts")
-                    break
-        except Exception as e:  # noqa: BLE001 — never-raise boundary: engine-side raise (event/submit) flags the whole promise (licensed superset)
-            self._log.maybe("load", f"pipelined load failed mid-run req={req.req_id}", e)
-            self._drop_client(e)
-            self._load_errors.update(self._load_range_ids(req))
-            serial_from = None
-            if fut is not None:
-                # An unconsumed drain keeps writing slab slots a FUTURE load
-                # would reuse; it is deadline/op_timeout-bounded, so waiting
-                # it out here is the bounded, safe option.
-                with contextlib.suppress(Exception):
-                    fut.result()
-        # Exit sync — the copy stream's OWN event, not the current stream's:
-        # slot-reuse for the next load, paged-write visibility for the
-        # forward pass, and the scratch-ring handoff to the store path all
-        # hang off this one fence.
-        try:
-            ev = self._make_event()
-            if ev is not None:
-                ev.record(stream)
-                ev.synchronize()
-        except Exception as e:  # noqa: BLE001 — never-raise boundary: without the fence nothing is provably loaded
-            self._log.maybe("load", "pipelined final sync failed — flagging every "
-                                    "promised block", e)
-            self._load_errors.update(self._load_range_ids(req))
-            # Ring work may STILL be in flight on the copy stream, and the
-            # failed fence was the only thing that could prove otherwise.
-            # Latch the pipeline and poison the shared scratch ring: every
-            # consumer (serial chunks, _stage_gather) degrades until
-            # _scratch_ring re-creates it behind a PROVEN copy-stream drain
-            # — otherwise the store path could publish torn bytes
-            # cache-wide under a key whose xxh3 was computed over the tear.
-            self._pipeline_disabled = True
-            self._gpu_scratch, self._gpu_scratch_key = None, None
-            self._scratch_torn = True
-            return "pipelined-slab"
-        serial_blocks = 0
-        serial_used_ring = False
-        if serial_from is not None and serial_from < n:
-            rest = keys[serial_from:]
-            cap = self._slab.numel() // body_len if body_len > 0 else 0
-            pass_blocks = min(len(rest), cap)
-            try:
-                if pass_blocks > 0:
-                    serial_used_ring = self._load_slab(req, names, dtype_name,
-                                                       bytes_per_layer, total, rest,
-                                                       pass_blocks, deadline,
-                                                       key_base=serial_from)
-                    serial_blocks = len(rest)
-                else:  # unreachable (the slab holds two halves) — flag, don't drop
-                    flag_range(serial_from, n)
-            except Exception as e:  # noqa: BLE001 — never-raise boundary: a connection-class drain raise armed the breaker, so the remainder's redial is suppressed — flagged misses, not a raise
-                self._log.maybe("load", f"serial remainder failed req={req.req_id}", e)
-                self._drop_client(e)
-                serial_blocks = 0
-                flag_range(serial_from, n)  # superset of what landed — licensed
-        if serial_blocks > pipelined_blocks:
-            return "chunked-slab" if serial_used_ring else "per-block"
-        return "pipelined-slab"
+        return self._loader._load_pipelined(req, names, dtype_name, bytes_per_layer,
+                                            total, keys, half_blocks, deadline)
 
     def _scratch_ring(self, dev, n_layers, bytes_per_layer):
-        """The GPU scratch ring (2 × [chunk, n_layers, bytes_per_layer] uint8),
-        cached per (device, layout) and reused across loads."""
-        if self._scratch_torn:
-            # A failed pipelined exit sync dropped the old ring with work
-            # possibly in flight; re-allocating before the copy stream
-            # provably drained could hand the allocator-recycled bytes to a
-            # new ring mid-write. A raise here lands in the callers'
-            # setup-failure ladders (per-block / bytearray staging).
-            ev = self._make_event()
-            if ev is not None:
-                ev.record(self._load_stream)
-                ev.synchronize()
-            self._scratch_torn = False
-        key = (str(dev), n_layers, bytes_per_layer)
-        if self._gpu_scratch is not None and self._gpu_scratch_key == key:
-            return self._gpu_scratch
-        torch = _torch()
-        ring = [
-            torch.empty((_SCATTER_CHUNK, n_layers, bytes_per_layer),
-                        dtype=torch.uint8, device=dev)
-            for _ in range(_SCRATCH_RING)
-        ]
-        self._gpu_scratch, self._gpu_scratch_key = ring, key
-        return ring
+        return self._loader._scratch_ring(dev, n_layers, bytes_per_layer)
 
     def _idx_staging(self, n: int):
-        """Pinned int64 staging for the chunk-index uploads (>= n entries,
-        cached, grown geometrically like the slab). Chunks slice it at their
-        pass-local offset, so slices are disjoint within a pass; the caller's
-        pass fence (trailing sync / per-half event) covers reuse across
-        passes exactly as it covers the slab slots the indices scatter."""
-        if self._idx_pin is None or self._idx_pin.numel() < n:
-            torch = _torch()
-            want = max(n, _SCATTER_CHUNK)
-            if self._idx_pin is not None:
-                want = max(want, 2 * self._idx_pin.numel())
-            self._idx_pin = self._alloc_pinned(want * 8).view(torch.int64)
-        return self._idx_pin
+        return self._loader._idx_staging(n)
 
     def _scatter_slab(self, req: KvbReqMeta, names, bytes_per_layer, statuses,
                       key_offset: int = 0, sync: bool = True,
                       slab_base: int = 0) -> bool:
-        """Chunked batched H2D scatter from the slab. A chunk whose statuses
-        are ALL OK takes the fast path: ONE non_blocking H2D of the contiguous
-        slab region into the scratch buffer, then per layer one index_copy_
-        into the paged buffer viewed as uint8 rows (bid index built only from
-        status-OK blocks — in the fast path that is the whole chunk). Any
-        chunk containing a non-OK/missing block falls back to per-block copies
-        for THAT chunk only. Never raises: any failure flags the affected
-        block ids (chunk-superset flagging allowed) and degrades. One stream
-        synchronize at the end — the load is synchronous by contract, and the
-        sync is what makes reusing the slab for a next pass safe. sync=False
-        is the PIPELINED caller only: it runs this on its copy stream and
-        owns both fences itself (per-half events for slot reuse, one final
-        copy-stream event before returning). key_offset maps this pass's
-        statuses onto the request's global block range; slab_base is the byte
-        offset of this pass's staging region (0 for the serial path; a
-        slab-half base for the pipelined one — pass-local index j lives at
-        slab_base + j*body_len). Returns whether the chunked fast path was
-        available (path attribution)."""
-        torch = _torch()
-        n_layers = len(names)
-        body_len = n_layers * bytes_per_layer
-        start = req.load_start_block + key_offset
-        n = len(statuses)
-        # Physical bid per local index; None = skip (non-OK — flagged — or no id).
-        bids: list[int | None] = [None] * n
-        for j, st in enumerate(statuses):
-            blk = start + j
-            bid = req.block_ids[blk] if blk < len(req.block_ids) else None
-            if st != kp.Status.OK:
-                if bid is not None:
-                    self._load_errors.add(bid)
-                continue
-            bids[j] = bid
-        dev = self._layer_kv[names[0]].device
-        paged_u8 = None
-        ring = None
-        idx_pin = None
-        if not self._chunked_disabled:
-            try:
-                paged_u8 = {}
-                for name in names:
-                    t = self._layer_kv[name]
-                    # view, NEVER reshape: view aliases or raises, and the
-                    # raise lands here -> per-block fallback. reshape silently
-                    # COPIES a non-contiguous paged tensor, so index_copy_
-                    # would write into a temporary and every byte would be
-                    # silently lost (the refuter-verified BLOCKER).
-                    paged_u8[name] = t.view(torch.uint8).view(t.shape[0], -1)
-                ring = self._scratch_ring(dev, n_layers, bytes_per_layer)
-                idx_pin = self._idx_staging(n)
-                self._scratch_fails = 0
-            except Exception as e:  # noqa: BLE001 — never-raise boundary: non-viewable layout / scratch OOM degrades to per-block copies
-                ring = None
-                self._scratch_fails += 1
-                if self._scratch_fails >= _SCRATCH_MAX_FAILS:
-                    self._chunked_disabled = True
-                    self._log.maybe(
-                        "scatter",
-                        f"chunked-scatter setup failed {self._scratch_fails}x in a row "
-                        "— latched OFF for this connector's lifetime (per-block copies)", e)
-                else:
-                    self._log.maybe("scatter", "chunked-scatter setup failed — per-block fallback", e)
-        first_fast: tuple[int, int] | None = None  # (slab slot j, bid) for the debug check
-        for c0 in range(0, n, _SCATTER_CHUNK):
-            c1 = min(c0 + _SCATTER_CHUNK, n)
-            chunk_bids = bids[c0:c1]
-            if ring is not None and all(b is not None for b in chunk_bids):
-                try:
-                    nblk = c1 - c0
-                    src = self._slab[slab_base + c0 * body_len :
-                                     slab_base + c1 * body_len].view(
-                        nblk, n_layers, bytes_per_layer)
-                    scratch = ring[0]
-                    scratch[:nblk].copy_(src, non_blocking=True)
-                    # Pinned staging slice [c0:c1) — disjoint per chunk within
-                    # a pass, so an earlier chunk's still-in-flight upload is
-                    # never overwritten; cross-PASS reuse is fenced by the
-                    # trailing sync (serial) / per-half events (pipelined).
-                    seg = idx_pin[c0:c1]
-                    seg.copy_(torch.tensor(chunk_bids, dtype=torch.long))
-                    idx = seg.to(dev, non_blocking=True)
-                    for li, name in enumerate(names):
-                        paged_u8[name].index_copy_(0, idx, scratch[:nblk, li])
-                    if first_fast is None:  # (slab BYTE offset, bid)
-                        first_fast = (slab_base + c0 * body_len, chunk_bids[0])
-                except Exception as e:  # noqa: BLE001 — never-raise boundary: a failed chunk flags its blocks, not the engine
-                    self._log.maybe("scatter", "chunked H2D scatter failed", e)
-                    self._load_errors.update(b for b in chunk_bids if b is not None)
-                continue
-            # Mixed / degraded chunk: per-block copies for this chunk only.
-            for j in range(c0, c1):
-                bid = bids[j]
-                if bid is None:
-                    continue
-                self._scatter_block_from_slab(j, bid, names, bytes_per_layer,
-                                              slab_base=slab_base)
-        if sync and getattr(dev, "type", "") == "cuda":
-            try:
-                torch.cuda.current_stream(dev).synchronize()
-            except Exception as e:  # noqa: BLE001 — never-raise boundary: an unfinished stream means nothing is provably loaded
-                self._log.maybe("scatter", "stream synchronize failed", e)
-                self._load_errors.update(b for b in bids if b is not None)
-        if (first_fast is not None and not self._debug_scatter_checked
-                and os.environ.get("KVBLOCKD_DEBUG_SCATTER_CHECK") == "1"):
-            self._debug_check_scatter(first_fast, names, bytes_per_layer)
-        return ring is not None
+        return self._loader._scatter_slab(req, names, bytes_per_layer, statuses,
+                                          key_offset, sync, slab_base)
 
     def _debug_check_scatter(self, first_fast: tuple[int, int], names,
                              bytes_per_layer) -> None:
-        """KVBLOCKD_DEBUG_SCATTER_CHECK=1: after the first chunked-scatter
-        load, compare ONE scattered block's bytes on the paged tensor against
-        its slab source (uint8 equality) and log PASS/FAIL once. Runs after
-        the stream synchronize; off by default; never raises."""
-        self._debug_scatter_checked = True
-        torch = _torch()
-        off, bid = first_fast  # slab BYTE offset (half-aware), physical bid
-        try:
-            body_len = len(names) * bytes_per_layer
-            slot = self._slab[off : off + body_len]
-            ok = True
-            for li, name in enumerate(names):
-                got = (self._layer_kv[name][bid].contiguous()
-                       .view(torch.uint8).reshape(-1).cpu())
-                want = slot[li * bytes_per_layer : (li + 1) * bytes_per_layer]
-                if not torch.equal(got, want):
-                    ok = False
-                    break
-            logger.info("kvblockd debug scatter check: %s (slab offset %d -> paged block %d)",
-                        "PASS" if ok else "FAIL", off, bid)
-        except Exception as e:  # noqa: BLE001 — a broken debug probe must not break the load
-            logger.info("kvblockd debug scatter check: FAIL (comparison errored: %s)", e)
+        self._loader._debug_check_scatter(first_fast, names, bytes_per_layer)
 
     def _scatter_block_from_slab(self, j: int, bid: int, names, bytes_per_layer,
                                  slab_base: int = 0) -> None:
-        """Per-block scatter of slab slot j (at byte base slab_base) into
-        physical block bid — the same per-layer copy_ as the original path,
-        sourced from the slab."""
-        body_len = len(names) * bytes_per_layer
-        buf = self._slab[slab_base + j * body_len : slab_base + (j + 1) * body_len]
-        for li, name in enumerate(names):
-            dst = self._layer_kv[name][bid]
-            src = buf[li * bytes_per_layer : (li + 1) * bytes_per_layer]
-            try:
-                dst.copy_(src.view(dst.dtype).reshape(dst.shape))
-            except Exception as e:  # noqa: BLE001 — never-raise boundary: a failed scatter marks the block errored, not the engine
-                self._log.maybe("scatter", f"scatter into {name} failed", e)
-                self._load_errors.add(bid)
-                break
+        self._loader._scatter_block_from_slab(j, bid, names, bytes_per_layer,
+                                              slab_base)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         # No-op by design: blob granularity is a whole block across ALL layers,
@@ -2332,613 +1494,65 @@ class KvblockdConnector(_Base):
     # ------------------------------------------------------------------
     # write-behind store queue (kvblockd_async_store)
     # ------------------------------------------------------------------
+    # Store-side delegation: the write-behind queue, drain workers, slot
+    # pool, and gathered-store staging live in store_queue.StoreQueue
+    # (unit-owned); same seam-preserving convention as the load side.
     def _stage_one(self, req: KvbReqMeta) -> _StagePlan | None:
-        """Copy every store-range block into ONE owned buffer per block
-        (32B layout prefix + all layers, exactly the blob _store_one streams)
-        and enqueue it. The copies MUST happen inside wait_for_save: after it
-        returns the scheduler may reuse the paged blocks, and _block_bytes is
-        zero-copy on CPU — draining the view later would stream whatever the
-        engine wrote over it (silent corruption armor, not an optimization).
-
-        CUDA paged tensors with a live slot pool stage through batched
-        gathers + async D2H instead of layers x blocks synchronous copies;
-        that path DEFERS the enqueues behind wait_for_save's single device
-        sync and returns the plan. Everything else (and every gather-path
-        failure — paged memory is still valid here) runs the original inline
-        bytearray loop and returns None."""
-        names, dtype_name, bytes_per_layer = self._layout()
-        if not names:
-            return None
-        total = BLOB_PREFIX_LEN + bytes_per_layer * len(names)
-        prefix = encode_blob_prefix(dtype_name, len(names), self._block_size,
-                                    bytes_per_layer, total)
-        seed = self._seed(req.cache_salt, req.mm_ids, req.lora_name)
-        keys = self._chain_keys(req.req_id, seed, req.token_ids)
-        end = min(req.store_end_block, len(keys), len(req.block_ids))
-        hole = self._store_holes.get(req.req_id)
-        if hole is not None and end > hole:
-            # TAIL-SKIP, PERSISTED: an earlier step of this request already
-            # dropped block `hole`, so every row at/past it is unreachable by
-            # the consecutive-prefix lookup no matter how much budget freed up
-            # since — count those rows dropped (no copies built) and cap the
-            # loop below the hole.
-            skipped = end - max(req.store_start_block, hole)
-            if skipped > 0:
-                with self._sq_cond:
-                    self.dropped_puts += skipped
-                    self.dropped_put_bytes += skipped * total
-            end = hole
-        if end <= req.store_start_block:
-            return None
-        start = req.store_start_block
-        if self._acked_keys is not None:
-            # Acked-key dedupe, BEFORE any copy/D2H: skip the LEADING run of
-            # keys the daemon already acked. Leading-run only, on purpose —
-            # acks land in per-request block order (FIFO drain), so the
-            # target workload (a re-served local-prefix request) re-offers an
-            # already-acked PREFIX; skipping a mid-range key would also break
-            # _finish_stage's tail-skip arithmetic (it counts plan rows by
-            # block index). A non-leading acked key just re-puts and collects
-            # OK_EXISTS — today's cost, not a correctness event.
-            while start < end and self._acked_keys.hit(keys[start]):
-                start += 1
-            if start > req.store_start_block:
-                with self._sq_cond:
-                    self.deduped_puts += start - req.store_start_block
-            if start >= end:
-                return None  # the whole range is recently-acked: nothing to stage
-        dev = self._layer_kv[names[0]].device
-        if (self._slab_path_ok(dev) and not self._store_gather_disabled
-                and self._store_pool_ready(total)):
-            plan = self._stage_gather(req, names, bytes_per_layer, total,
-                                      prefix, keys, start, end)
-            if plan is not None:
-                self._note_store_path("gathered-slots")
-                return plan
-        self._note_store_path("bytearray")
-        for j in range(start, end):
-            buf = self._build_block_blob(req.block_ids[j], names,
-                                         bytes_per_layer, prefix, total)
-            if not self._sq_enqueue(keys[j], buf, rid=req.req_id):
-                # TAIL-SKIP: block keys are a prefix chain, so once block j is
-                # missing every later block of THIS request is unreachable by
-                # BATCH_EXISTS's consecutive-prefix count — copying/queueing
-                # them would spend budget on bytes no lookup can ever count.
-                # Count them dropped (without building the copies), record the
-                # hole so LATER steps of this request skip past it too, stop.
-                self._store_holes[req.req_id] = j  # j < any prior hole (end is capped)
-                skipped = end - j - 1
-                if skipped > 0:
-                    with self._sq_cond:
-                        self.dropped_puts += skipped
-                        self.dropped_put_bytes += skipped * total
-                return None
-        return None
+        return self._store_q._stage_one(req)
 
     def _build_block_blob(self, bid: int, names, bytes_per_layer: int,
                           prefix: bytes, total: int) -> bytearray:
-        """One owned blob for physical block bid — the original per-block
-        copy loop, byte-for-byte (the gather path's fallback oracle)."""
-        buf = bytearray(total)
-        buf[:BLOB_PREFIX_LEN] = prefix
-        dst = np.frombuffer(buf, dtype=np.uint8)  # writable view of buf
-        for li, name in enumerate(names):
-            src = self._block_bytes(self._layer_kv[name][bid])
-            dst[BLOB_PREFIX_LEN + li * bytes_per_layer:
-                BLOB_PREFIX_LEN + (li + 1) * bytes_per_layer] = src  # copies
-        return buf
+        return self._store_q._build_block_blob(bid, names, bytes_per_layer,
+                                               prefix, total)
 
-    # ------------------------------------------------------------------
-    # gathered-store fast path (CUDA paged tensors, pinned slot pool)
-    # ------------------------------------------------------------------
     def _store_pool_ready(self, total: int) -> bool:
-        """Whether store slots of exactly this stride can be leased; allocates
-        the pool at the first CUDA layout capture (_maybe_prewarm) or, if
-        that never ran, lazily on the first CUDA store. Stride is fixed at
-        first allocation — a layout change mid-run simply stops matching and
-        the bytearray path serves (never realloc: queued slots reference the
-        old tensor). Auto-size (config unset) = queue byte budget + 2 slots
-        (1 in flight + 1 staging while the queue sits at budget). Enqueues
-        are DEFERRED behind the device sync, so a lease can be denied while
-        the queue still has room; denial is congestion, not failure — the
-        block degrades to an IDENTICAL bytearray blob (same bytes, same
-        accounting), never a drop. Never raises."""
-        if self._store_slab_disabled or total <= 0:
-            return False
-        if self._store_slab is not None:
-            return total == self._store_slot_stride
-        cfg_bytes = self._cfg.store_staging_bytes
-        if cfg_bytes is not None and cfg_bytes <= 0:
-            return False  # explicitly off: not a failure, no latch
-        if cfg_bytes is None:
-            n_slots = self._cfg.store_queue_bytes // total + 2
-        else:
-            n_slots = cfg_bytes // total
-        if n_slots <= 0:
-            self._store_slab_disabled = True  # can never fit one blob
-            self._log.maybe("store-slab",
-                            f"kvblockd_store_staging_bytes={cfg_bytes} holds no "
-                            f"{total}-byte slot — bytearray staging keeps serving")
-            return False
-        try:
-            slab = self._alloc_pinned(n_slots * total)
-            slab_np = slab.numpy()
-        except Exception as e:  # noqa: BLE001 — never-raise boundary: pin failure degrades to bytearray staging
-            self._store_slab_disabled = True
-            self._log.maybe("store-slab",
-                            "pinned store-slot pool allocation failed — "
-                            "bytearray staging keeps serving", e)
-            return False
-        self._store_slab, self._store_slab_np = slab, slab_np
-        self._store_slot_stride = total
-        with self._sq_cond:
-            self._store_slots_total = n_slots
-            self._store_slot_free = list(range(n_slots))
-        return True
+        return self._store_q._store_pool_ready(total)
 
     def _store_slot_lease(self) -> int | None:
-        with self._sq_cond:
-            if self._store_slot_free:
-                return self._store_slot_free.pop()
-        return None
+        return self._store_q._store_slot_lease()
 
     def _store_gather_fail(self, msg: str, exc: BaseException | None) -> None:
-        """Consecutive gather-path failure accounting (mirrors the load side's
-        _scratch_fails / _SCRATCH_MAX_FAILS latch). Slot-pool EXHAUSTION never
-        lands here — congestion falls back per block without counting."""
-        self._store_gather_fails += 1
-        if self._store_gather_fails >= _SCRATCH_MAX_FAILS:
-            self._store_gather_disabled = True
-            self._log.maybe(
-                "store-gather",
-                f"{msg} {self._store_gather_fails}x in a row — latched OFF for "
-                "this connector's lifetime (bytearray staging)", exc)
-        else:
-            self._log.maybe("store-gather", f"{msg} — bytearray fallback", exc)
+        self._store_q._store_gather_fail(msg, exc)
 
     def _note_store_path(self, path: str) -> None:
-        """Store-side twin of _note_path (same WARNING rationale), on its own
-        state so the load stamp's one-shot is never consumed by a store."""
-        if self._reported_store_path is None:
-            self._reported_store_path = path
-            logger.warning("kvblockd store path: %s", path)
-        elif path != self._reported_store_path and not self._store_path_switch_logged:
-            self._store_path_switch_logged = True
-            logger.warning("kvblockd store path: %s (switched from %s mid-run)",
-                           path, self._reported_store_path)
+        self._store_q._note_store_path(path)
 
     def _stage_gather(self, req: KvbReqMeta, names, bytes_per_layer: int,
                       total: int, prefix: bytes, keys, start: int,
                       end: int) -> _StagePlan | None:
-        """Batched gather staging: per chunk one index_select per layer into
-        the (shared) GPU scratch — the exact inverse of the load's
-        index_copy_ — then one async D2H per slot into its pinned body
-        (prefix gaps break slab contiguity, so per-slot it is). The 32B
-        prefix is CPU-stamped at lease time. Same-stream ordering makes each
-        chunk's D2H precede the next chunk's gather overwrite for free; the
-        blobs are only provably complete after wait_for_save's device sync,
-        which is why every enqueue is deferred into the returned plan.
-        A slot-pool dry spell mid-request is congestion, not failure: that
-        block takes an inline bytearray (slot None) and keeps its place in
-        the request's enqueue order. start is the caller's dedupe-adjusted
-        first block (== req.store_start_block with the acked-key LRU off).
-        Returns None on failure (counted toward the latch) with every leased
-        slot freed — paged memory is still valid, so the caller's bytearray
-        loop rebuilds everything."""
-        torch = _torch()
-        n_layers = len(names)
-        dev = self._layer_kv[names[0]].device
-        try:
-            paged_u8 = {}
-            for name in names:
-                t = self._layer_kv[name]
-                # view, NEVER reshape: reshape would silently COPY a
-                # non-contiguous paged tensor and the gather would read a
-                # temporary (the load path's refuter-verified BLOCKER class);
-                # view aliases or raises, and the raise lands here.
-                paged_u8[name] = t.view(torch.uint8).view(t.shape[0], -1)
-            scratch = self._scratch_ring(dev, n_layers, bytes_per_layer)[0]
-        except Exception as e:  # noqa: BLE001 — never-raise boundary: setup failure degrades to bytearray staging
-            self._store_gather_fail("gathered-store setup failed", e)
-            return None
-        items: list[list] = []                 # [j, key, buf, slot_id]
-        gathered: list[tuple[int, int]] = []   # (items index, slot id)
-        try:
-            for j in range(start, end):
-                slot = self._store_slot_lease()
-                if slot is None:
-                    items.append([j, keys[j],
-                                  self._build_block_blob(req.block_ids[j], names,
-                                                         bytes_per_layer, prefix,
-                                                         total), None])
-                    continue
-                base = slot * total
-                mv = memoryview(self._store_slab_np[base:base + total])
-                mv[:BLOB_PREFIX_LEN] = prefix
-                items.append([j, keys[j], mv, slot])
-                gathered.append((len(items) - 1, slot))
-            for c0 in range(0, len(gathered), _SCATTER_CHUNK):
-                chunk = gathered[c0:c0 + _SCATTER_CHUNK]
-                nblk = len(chunk)
-                idx = torch.tensor([req.block_ids[items[i][0]] for i, _ in chunk],
-                                   dtype=torch.long, device=dev)
-                for li, name in enumerate(names):
-                    # No index_select(out=): strided-view out= is
-                    # version-fragile; the assignment form is not.
-                    scratch[:nblk, li] = paged_u8[name].index_select(0, idx)
-                for ci, (_i, slot) in enumerate(chunk):
-                    body = self._store_slab[slot * total + BLOB_PREFIX_LEN:
-                                            (slot + 1) * total]
-                    body.view(n_layers, bytes_per_layer).copy_(
-                        scratch[ci], non_blocking=True)
-        except Exception as e:  # noqa: BLE001 — never-raise boundary: mid-fill failure frees the leases and degrades
-            try:
-                # A D2H may still be in flight into these slots: sync before
-                # returning them, or a re-lease could race the tail of it.
-                self._store_sync(dev)
-            except Exception:  # noqa: BLE001, S110 — best effort; the slots are being abandoned either way
-                pass
-            with self._sq_cond:
-                for _i, slot in gathered:
-                    self._store_slot_free.append(slot)
-            self._store_gather_fail("gathered-store staging failed", e)
-            return None
-        return _StagePlan(req_id=req.req_id, total=total, end=end, items=items,
-                          dev=dev, names=names, bytes_per_layer=bytes_per_layer,
-                          block_ids=list(req.block_ids), prefix=prefix)
+        return self._store_q._stage_gather(req, names, bytes_per_layer, total,
+                                           prefix, keys, start, end)
 
     def _store_sync(self, dev) -> bool:
-        """ONE event recorded after the last issued D2H, synchronized — the
-        gathered blobs are complete-or-rebuilt before any enqueue and before
-        wait_for_save returns (the paged buffer is only stable until then).
-        No-op off-CUDA (the CPU test seam). Returns False on failure — the
-        caller must treat every gathered blob as torn."""
-        if getattr(dev, "type", "") != "cuda":
-            return True
-        torch = _torch()
-        try:
-            ev = torch.cuda.Event()
-            ev.record(torch.cuda.current_stream(dev))
-            ev.synchronize()
-            return True
-        except Exception as e:  # noqa: BLE001 — never-raise boundary: an unfinished stream means nothing is provably staged
-            self._log.maybe("store-gather", "gathered-store device sync failed", e)
-            return False
+        return self._store_q._store_sync(dev)
 
     def _rebuild_plan(self, plan: _StagePlan) -> None:
-        """Device sync failed: every slot-backed blob in the plan is possibly
-        torn. Paged memory is still valid (wait_for_save has not returned),
-        so rebuild each through the bytearray path and free its slot —
-        identical bytes, identical accounting, just no overlap won."""
-        for it in plan.items:
-            j, _key, _buf, slot = it
-            if slot is None:
-                continue
-            it[2] = self._build_block_blob(plan.block_ids[j], plan.names,
-                                           plan.bytes_per_layer, plan.prefix,
-                                           plan.total)
-            it[3] = None
-            with self._sq_cond:
-                self._store_slot_free.append(slot)
+        self._store_q._rebuild_plan(plan)
 
     def _finish_stage(self, plan: _StagePlan) -> None:
-        """Deferred enqueue of one synced plan, in block order — the same
-        tail-skip contract as the inline loop (the refused block itself is
-        counted by _sq_enqueue; the unreachable tail is counted here). Slot
-        ownership moves to the queue tuple on enqueue (it[3] nulled), so
-        every slot has exactly one owner at every exit. plan.sent advances
-        only once _sq_enqueue RETURNS (it never raises — its own contract —
-        and settles the item's accounting whether it accepts or refuses), so
-        a raise anywhere leaves _abandon_plan counting exactly the items
-        never handed over, with their leases still marked in it[3]."""
-        for i, it in enumerate(plan.items):
-            j, key, buf, slot = it
-            ok = self._sq_enqueue(key, buf, slot, plan.req_id)
-            # Settled: on True the queue tuple owns the lease; on False the
-            # refusal branch below frees it. Either way the item has left
-            # the abandonable window.
-            it[3] = None
-            plan.sent = i + 1
-            if ok:
-                continue
-            with self._sq_cond:
-                if slot is not None:  # refused: the lease never reached the queue
-                    self._store_slot_free.append(slot)
-                for tail in plan.items[i + 1:]:
-                    if tail[3] is not None:
-                        self._store_slot_free.append(tail[3])
-                        tail[3] = None
-            self._store_holes[plan.req_id] = j  # j < any prior hole (end is capped)
-            skipped = plan.end - j - 1
-            if skipped > 0:
-                with self._sq_cond:
-                    self.dropped_puts += skipped
-                    self.dropped_put_bytes += skipped * plan.total
-            plan.sent = len(plan.items)  # tail fully counted here — not abandonable
-            return
+        self._store_q._finish_stage(plan)
 
     def _abandon_plan(self, plan: _StagePlan) -> None:
-        """A raise abandoned this plan before every item reached _sq_enqueue:
-        the unsent items are lost HERE, so they are counted HERE — a vanished
-        block with dropped_puts=0 breaks the disclosure contract the bench
-        rigs grep — the prefix hole is recorded so later steps of the request
-        tail-skip past it, and the leases come home only AFTER a best-effort
-        device sync (a D2H may still be in flight into these slots; same
-        rationale as _stage_gather's own mid-fill failure path). Idempotent:
-        a second call finds sent == len(items) and counts nothing."""
-        lost = plan.items[plan.sent:]
-        plan.sent = len(plan.items)
-        if not lost:
-            return
-        try:
-            self._store_sync(plan.dev)
-        except Exception:  # noqa: BLE001, S110 — best effort; the slots are being abandoned either way
-            pass
-        with self._sq_cond:
-            for it in lost:
-                if it[3] is not None:
-                    self._store_slot_free.append(it[3])
-                    it[3] = None
-            self.dropped_puts += len(lost)
-            self.dropped_put_bytes += len(lost) * plan.total
-        self._store_holes[plan.req_id] = lost[0][0]  # j < any prior hole (end is capped)
+        self._store_q._abandon_plan(plan)
 
     def _sq_enqueue(self, key: bytes, buf: bytearray | memoryview,
                     slot_id: int | None = None, rid: str = "") -> bool:
-        """Enqueue one owned blob (slot_id set when buf is a pinned store
-        slot: the queue tuple then owns the lease). rid routes the blob to a
-        drain worker (stable hash), so ONE request's blocks always share one
-        worker's FIFO — per-request delivery order is preserved under any
-        worker count. NEVER blocks and NEVER raises: past the byte budget
-        (shared across all workers' queues, or during shutdown) the block is
-        dropped and counted — the CALLER frees a refused slot — a lost store
-        is a future miss, an engine stall is an incident."""
-        n = len(buf)
-        wi = zlib.crc32(rid.encode()) % self._store_workers if rid else 0
-        with self._sq_cond:
-            if self._store_stop or self._sq_bytes + n > self._cfg.store_queue_bytes:
-                self.dropped_puts += 1
-                self.dropped_put_bytes += n
-                dropped, failed, dbytes = (self.dropped_puts, self.failed_puts,
-                                           self.dropped_put_bytes)
-            else:
-                self._sqs[wi].append((key, buf, slot_id))
-                self._sq_bytes += n
-                self.stats.note_hwm(self._sq_bytes)
-                self._sq_cond.notify_all()
-                dropped = None
-        if dropped is not None:
-            # Rate-limited in-run disclosure (the shutdown summary line is
-            # unconditional); the bench populate phase greps `dropped=`.
-            # OUTSIDE the lock: _log.maybe formats and may hit a logging
-            # handler — never hold _sq_cond across foreign code.
-            self._log.maybe(
-                "store-drop",
-                f"kvblockd store queue overflow: dropped={dropped} "
-                f"failed={failed} dropped_bytes={dbytes}",
-            )
-            return False
-        try:
-            self._store_thread_start()
-        except Exception as e:  # noqa: BLE001 — the never-raises contract must survive thread exhaustion: the blob IS queued, a later enqueue restarts the drain and shutdown counts any remainder
-            self._log.maybe("store", "kvb-store drain thread start failed", e)
-        return True
+        return self._store_q._sq_enqueue(key, buf, slot_id, rid)
 
     def _store_thread_start(self) -> None:
-        """Lazily start the "kvb-store" drain worker(s). Only ever called
-        from the engine's serving thread (wait_for_save), so the check-then-
-        start needs no extra lock. Worker 0 keeps the bare "kvb-store" name
-        (tooling greps it); a dead worker (never expected) is restarted."""
-        for i in range(self._store_workers):
-            t = self._store_threads[i]
-            if t is not None and t.is_alive():
-                continue
-            t = threading.Thread(target=self._store_drain, args=(i,),
-                                 name="kvb-store" if i == 0 else f"kvb-store-{i}",
-                                 daemon=True)
-            self._store_threads[i] = t
-            t.start()
+        self._store_q._store_thread_start()
 
     def _store_drain(self, wi: int = 0) -> None:
-        """FIFO drain loop over THIS worker's deque (requests are hashed to a
-        worker at enqueue, so per-request block order is exactly the single-
-        FIFO order): pop one staged blob, put it. A CONNECTION-class
-        failure (daemon gone, breaker window) re-queues the item ONCE at the
-        head of the SAME deque and waits out the redial backoff before
-        retrying — a blip costs one backoff window, never the whole backlog
-        burned at one doomed put per item. A SECOND consecutive failure of
-        the same item counts it failed (failed_puts) and moves on (no
-        infinite loop) — but ONLY real attempts count: _DialPending (another
-        caller owns the in-flight dial) PARKS the item (requeue, no strike,
-        no attempt telemetry) until the dial resolves, so failed_puts is
-        never inflated with a non-attempt. Non-connection failures count
-        immediately. Either way
-        the client is dropped with the same breaker discipline as loads and
-        the thread NEVER dies to an op error, so delivery resumes after a
-        redial. OK_EXISTS = dedup, fine. All counters/gauges stay under
-        _sq_cond, shared across workers — the disclosure arithmetic is
-        aggregate and worker-count-independent."""
-        q = self._sqs[wi]
-        retry_of: bytearray | memoryview | None = None  # the buf that already failed once
-        while True:
-            with self._sq_cond:
-                while not q and not self._store_stop:
-                    self._sq_cond.wait()
-                # Load-priority gate: a load is actively pulling KV, so park
-                # (bounded by the ceiling) before spending wire/GIL on a
-                # store. The ceiling is armed ONCE per raised episode — N
-                # queued blobs under one wedged gate cost one ceiling total,
-                # never N — and episodes are edge-triggered: start_load_kv
-                # clears the arm on the 0->1 load transition (this thread
-                # only samples the counter between puts, so it can miss an
-                # entire gate-down/gate-up flip inside one put). Shutdown
-                # flags cut the park short (they are in the predicate and
-                # notify_all'd) — a flush is never held hostage to the gate.
-                while (self._loads_inflight > 0 and not self._store_stop
-                       and not self._store_abort):
-                    if self._drain_park_until is None:
-                        # Armed INSIDE the loop: an episode edge can clear
-                        # the arm mid-wait, and that new episode is owed its
-                        # own fresh ceiling.
-                        self._drain_park_until = time.monotonic() + _DRAIN_GATE_CEILING_S
-                    left = self._drain_park_until - time.monotonic()
-                    if left <= 0:
-                        break
-                    self._sq_cond.wait(left)
-                if self._loads_inflight == 0:
-                    self._drain_park_until = None  # episode over cleanly
-                if self._store_abort or (not q and self._store_stop):
-                    return
-                key, buf, slot_id = q.popleft()
-                n = len(buf)
-                self._sq_bytes -= n
-                self._sq_inflight += 1
-                self._sq_inflight_bytes += n
-            err: BaseException | None = None
-            pt0 = time.monotonic()
-            try:
-                self._ensure().put(key, [buf])
-            except Exception as e:  # noqa: BLE001 — never let the drain thread die: a lost store is a future miss
-                err = e
-            # A dial owned by another caller is NOT an attempt: no strike, no
-            # attempt telemetry — PARK (requeue unchanged) until it resolves.
-            park = isinstance(err, _DialPending)
-            if not park:
-                # Latency telemetry counts ATTEMPTS (failures included): a
-                # store path that is slow because it is failing must read slow.
-                self.stats.bump("store_count")
-                self.stats.bump("store_time_s", time.monotonic() - pt0)
-            requeue = (err is not None
-                       and isinstance(err, (ConnectionLost, OSError))
-                       and (park or buf is not retry_of))
-            with self._sq_cond:
-                self._sq_inflight -= 1
-                self._sq_inflight_bytes -= n
-                # Reconcile with a shutdown that already disclosed this
-                # in-flight block as dropped (join timed out mid-put).
-                counted_dropped = self._sq_inflight_counted > 0
-                if counted_dropped:
-                    self._sq_inflight_counted -= 1
-                requeued = False
-                if err is None:
-                    retry_of = None
-                    if counted_dropped:  # delivered after all: un-count it
-                        self.dropped_puts -= 1
-                        self.dropped_put_bytes -= n
-                elif requeue and not self._store_abort:
-                    q.appendleft((key, buf, slot_id))  # keeps the lease AND the order
-                    self._sq_bytes += n
-                    if not park:  # a park is not a strike: leave retry_of as-is
-                        retry_of = buf
-                    requeued = True
-                elif not counted_dropped:  # dropped-at-shutdown is not ALSO failed
-                    retry_of = None
-                    self.failed_puts += 1
-                # THE inflight free point (delivered or terminal): the put has
-                # returned, so the memoryview is out of _send_frame's iovec.
-                if slot_id is not None and not requeued:
-                    self._store_slot_free.append(slot_id)
-                self._sq_cond.notify_all()
-            if err is None:
-                # Ack-populated dedupe: put() returned OK or OK_EXISTS (any
-                # other status raises), so the daemon holds this key NOW —
-                # the only evidence the LRU ever accepts. Outside _sq_cond
-                # (the LRU has its own lock).
-                if self._acked_keys is not None:
-                    self._acked_keys.add(key)
-                continue
-            if park:
-                if not requeued:
-                    continue  # shutdown raced the park: already disclosed
-                # Hold until the in-flight dial resolves: sit out the breaker
-                # window if one is armed, else short slices — each re-check
-                # is lock-only (_ensure raises _DialPending again while the
-                # dial is still owned), and the dial itself is bounded by
-                # connect_timeout, so the park always terminates.
-                wake = max(self._next_dial, time.monotonic() + _DIAL_PENDING_PARK_S)
-                with self._sq_cond:
-                    while not self._store_stop and not self._store_abort:
-                        left = wake - time.monotonic()
-                        if left <= 0:
-                            break
-                        self._sq_cond.wait(left)
-                continue
-            self._log.maybe("store", "kvblockd async store failed", err)
-            self._drop_client(err)
-            if requeue:
-                # Sit out exactly the dial breaker's window (armed by the
-                # _drop_client above, or by another thread earlier) instead of
-                # a full extra backoff on top of it — the post-blip backlog
-                # hold is the breaker window, no longer. The deadline loop
-                # ignores enqueue wakeups; shutdown's stop/abort flags cut it
-                # short so a flush is never held hostage.
-                wake = self._next_dial
-                if wake <= time.monotonic():
-                    wake = time.monotonic() + _REDIAL_BACKOFF_S
-                with self._sq_cond:
-                    while not self._store_stop and not self._store_abort:
-                        left = wake - time.monotonic()
-                        if left <= 0:
-                            break
-                        self._sq_cond.wait(left)
+        self._store_q._store_drain(wi)
 
     def _store_flush(self, timeout: float) -> int:
-        """Wait (up to timeout) until every worker's queue is empty and
-        nothing is in flight. Returns the UNDELIVERED block count at timeout."""
-        deadline = time.monotonic() + timeout
-        with self._sq_cond:
-            while any(self._sqs) or self._sq_inflight:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    return sum(len(q) for q in self._sqs) + self._sq_inflight
-                self._sq_cond.wait(left)
-        return 0
+        return self._store_q._store_flush(timeout)
 
     def _store_shutdown(self) -> None:
-        """Flag + notify + bounded join; whatever the drain thread could not
-        deliver inside kvblockd_store_flush_timeout_s is counted dropped. The
-        summary line is ALWAYS emitted, zero included, at WARNING — this
-        logger is unconfigured in vLLM's engine-core process, where the root
-        default drops INFO (proven on the bench rig) — so the bench can grep
-        for the line's presence, not just its value."""
-        with self._sq_cond:
-            self._store_stop = True
-            self._sq_cond.notify_all()
-        # ONE shared flush budget across every worker's join — N workers must
-        # not multiply the shutdown ceiling.
-        join_by = time.monotonic() + self._cfg.store_flush_timeout_s
-        for t in self._store_threads:
-            if t is not None and t.is_alive():
-                t.join(max(0.0, join_by - time.monotonic()))
-        with self._sq_cond:
-            self._store_abort = True  # a wedged put must not keep delivering
-            remainder = sum(len(q) for q in self._sqs) + self._sq_inflight
-            if remainder:
-                self.dropped_puts += remainder
-                self.dropped_put_bytes += self._sq_bytes + self._sq_inflight_bytes
-                # An in-flight put is UNDELIVERED at disclosure time, so it
-                # counts dropped — but the put may still return: remember how
-                # many were counted so the drain thread can reconcile
-                # (delivered -> un-count; failed -> not ALSO failed_puts).
-                self._sq_inflight_counted = self._sq_inflight
-            # QUEUED slots come home before the clear (their puts never
-            # started, so no iovec can reference them); an INFLIGHT slot is
-            # NEVER freed here — only the drain's reconcile block may, once
-            # the put has returned (else a wedged sendmsg still reads it).
-            for q in self._sqs:
-                for _k, _b, sid in q:
-                    if sid is not None:
-                        self._store_slot_free.append(sid)
-                q.clear()
-            self._sq_bytes = 0
-            self._sq_cond.notify_all()
-            dropped, failed, dbytes, deduped = (self.dropped_puts, self.failed_puts,
-                                                self.dropped_put_bytes,
-                                                self.deduped_puts)
-        # deduped rides at the END so the bench's existing dropped=/failed=
-        # greps keep matching the unchanged head of the line.
-        logger.warning("kvblockd store queue: dropped=%d failed=%d dropped_bytes=%d"
-                       " deduped=%d", dropped, failed, dbytes, deduped)
+        self._store_q._store_shutdown()
+
+    def _store_one(self, req: KvbReqMeta) -> None:
+        self._store_q._store_one(req)
 
     def handle_preemptions(self, *args, **kwargs) -> None:
         """Explicit NO-OP, on purpose: the write-behind queue holds OWNED
@@ -2947,26 +1561,46 @@ class KvblockdConnector(_Base):
         immediately without corrupting a queued store."""
         return
 
-    def _store_one(self, req: KvbReqMeta) -> None:
-        names, dtype_name, bytes_per_layer = self._layout()
-        if not names:
-            return
-        total = BLOB_PREFIX_LEN + bytes_per_layer * len(names)
-        prefix = encode_blob_prefix(dtype_name, len(names), self._block_size,
-                                    bytes_per_layer, total)
-        seed = self._seed(req.cache_salt, req.mm_ids, req.lora_name)
-        keys = self._chain_keys(req.req_id, seed, req.token_ids)
-        client = self._ensure()
-        end = min(req.store_end_block, len(keys), len(req.block_ids))
-        for j in range(req.store_start_block, end):
-            bid = req.block_ids[j]
-            bufs = [prefix]
-            bufs.extend(self._block_bytes(self._layer_kv[name][bid]) for name in names)
-            client.put(keys[j], bufs)  # OK_EXISTS = idempotent dedup (write-once)
-
     def get_finished(self, finished_req_ids):
         return None, None  # all loads/saves are synchronous within the step
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         errs, self._load_errors = self._load_errors, set()
         return errs
+
+
+def _alias_state(owner: str, names: tuple[str, ...]) -> None:
+    """Alias collaborator-owned state onto the connector, one property
+    (getter + setter) per name: tests, the bench, and connector-resident
+    code keep reading AND monkeypatching these as connector attributes,
+    while exactly ONE storage location exists — the collaborator's. A
+    read-only collaborator property (_sq, _store_thread) stays read-only
+    through the alias (the setattr raises exactly as it did before)."""
+    for name in names:
+        def _get(self, _o=owner, _n=name):
+            return getattr(getattr(self, _o), _n)
+
+        def _set(self, value, _o=owner, _n=name):
+            setattr(getattr(self, _o), _n, value)
+
+        setattr(KvblockdConnector, name, property(_get, _set))
+
+
+_alias_state("_loader", (
+    "_staging_bytes", "_slab", "_slab_np", "_slab_disabled",
+    "_gpu_scratch", "_gpu_scratch_key", "_scratch_torn", "_scratch_fails",
+    "_chunked_disabled", "_idx_pin", "_load_stream", "_prefetch_ex",
+    "_pipeline_fails", "_pipeline_disabled", "_reported_path",
+    "_debug_scatter_checked",
+))
+_alias_state("_store_q", (
+    "_store_workers", "_sqs", "_sq", "_sq_cond", "_sq_bytes", "_sq_inflight",
+    "_sq_inflight_bytes", "_sq_inflight_counted", "_store_holes",
+    "_store_threads", "_store_thread", "_store_stop", "_store_abort",
+    "dropped_puts", "dropped_put_bytes", "failed_puts", "deduped_puts",
+    "_acked_keys", "_loads_inflight", "_drain_park_until",
+    "_store_slab", "_store_slab_np", "_store_slot_stride", "_store_slot_free",
+    "_store_slots_total", "_store_slab_disabled", "_store_gather_fails",
+    "_store_gather_disabled", "_reported_store_path",
+    "_store_path_switch_logged",
+))
