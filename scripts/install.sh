@@ -9,7 +9,9 @@
 #                    an explicit KVB_VERSION or the /releases fallback below)
 #   KVB_INSTALL_DIR  target dir (default /usr/local/bin)
 #   KVB_CONFIG_DIR   config dir (default /usr/local/etc/kvblockd)
-#   KVB_TARBALL      install from a local tarball instead of downloading
+#   KVB_TARBALL      install from a local tarball instead of downloading —
+#                    installed AS-GIVEN, no checksum verification (verify it
+#                    yourself against the release's checksums.txt)
 set -eu
 
 REPO="rudraymehra/KVStash"
@@ -41,7 +43,7 @@ esac
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
 if [ -n "${KVB_TARBALL:-}" ]; then
-  say "installing from local tarball $KVB_TARBALL"
+  say "installing from local tarball $KVB_TARBALL (as-given, NOT checksum-verified)"
   tar -xzf "$KVB_TARBALL" -C "$TMP"
 else
   command -v curl >/dev/null 2>&1 || die "curl is required"
@@ -59,9 +61,30 @@ else
     [ -n "$TAG" ] || die "could not resolve latest release"
   fi
   VER=${TAG#v}
-  URL="https://github.com/$REPO/releases/download/$TAG/kvblockd_${VER}_${OS}_${ARCH}.tar.gz"
+  TARBALL="kvblockd_${VER}_${OS}_${ARCH}.tar.gz"
+  URL="https://github.com/$REPO/releases/download/$TAG/$TARBALL"
   say "downloading $URL"
   curl -fsSL "$URL" -o "$TMP/kvb.tar.gz" || die "download failed: $URL"
+
+  # Verify against the release's checksums.txt: catches truncated/corrupted
+  # downloads and post-publish tampering of a single asset. Honest limit:
+  # both files share one origin and one TLS channel, so this is NOT a
+  # defense against a fully compromised release — that needs a signature/
+  # attestation (cosign / gh attestation), tracked separately.
+  SUMS_URL="https://github.com/$REPO/releases/download/$TAG/checksums.txt"
+  curl -fsSL "$SUMS_URL" -o "$TMP/checksums.txt" || die "checksum download failed: $SUMS_URL"
+  WANT=$(awk -v n="$TARBALL" '$2 == n { print $1 }' "$TMP/checksums.txt")
+  [ -n "$WANT" ] || die "checksums.txt has no entry for $TARBALL"
+  if command -v sha256sum >/dev/null 2>&1; then
+    GOT=$(sha256sum "$TMP/kvb.tar.gz" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    GOT=$(shasum -a 256 "$TMP/kvb.tar.gz" | awk '{print $1}')
+  else
+    die "neither sha256sum nor shasum on PATH — cannot verify the download"
+  fi
+  [ "$GOT" = "$WANT" ] || die "sha256 mismatch for $TARBALL: got $GOT, want $WANT — refusing to install"
+  say "sha256 verified against checksums.txt"
+
   tar -xzf "$TMP/kvb.tar.gz" -C "$TMP"
 fi
 
@@ -100,7 +123,7 @@ say ""
 say "installed: $("$INSTALL_DIR/kvblockd" --version)"
 say ""
 say "60-second start:"
-say "  kvblockd --config $CONF_DIR/example.yaml &     # :9440, 1 GiB DRAM arena, demo tenant"
+say "  kvblockd --config $CONF_DIR/example.yaml &     # 127.0.0.1:9440, 1 GiB DRAM arena, demo tenant"
 say "  echo hello | kvbctl put -ns demo -token demo-token demo-key -"
 say "  kvbctl get -ns demo -token demo-token demo-key"
 say "  kvbctl stats -ns demo -token demo-token"

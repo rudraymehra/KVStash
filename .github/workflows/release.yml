@@ -1,5 +1,10 @@
 # Tag-driven release: v* tag → tests → goreleaser (static matrix, checksums,
 # SBOM, scratch image). Never ships untested — the test step gates the build.
+#
+# Third-party actions are pinned by commit SHA, never by mutable tag: this
+# workflow holds contents:write + a ghcr login, so a retargeted upstream tag
+# would publish under this project's name. Bump pins deliberately (the # vN
+# comment records the tag each SHA carried when pinned).
 name: release
 
 on:
@@ -14,11 +19,11 @@ jobs:
   goreleaser:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0 # goreleaser reads full history for the changelog
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
 
@@ -26,20 +31,20 @@ jobs:
         run: go test -race -short ./...
 
       - name: install syft (SBOM)
-        uses: anchore/sbom-action/download-syft@v0
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
 
-      - uses: docker/setup-qemu-action@v3 # arm64 image leg
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3 (arm64 image leg)
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: ghcr login
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: goreleaser
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           distribution: goreleaser
           # pinned minor: dockers/docker_manifests are deprecated upstream —
