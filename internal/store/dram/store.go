@@ -2,6 +2,7 @@ package dram
 
 import (
 	"encoding/json"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -98,6 +99,17 @@ func New(arena *Arena, p Params) *Store {
 	now := p.Now
 	if now == nil {
 		now = func() int64 { return time.Now().UnixNano() }
+	}
+	// Defense-in-depth for the lease foot-gun the config layer already
+	// rejects: LeaseMaxMS below a nonzero default clamps EVERY lease
+	// (including the §3.3 auto-lease on every GET) to the max — at zero,
+	// protection is silently OFF and eviction can remove blocks mid-client-
+	// workflow. Harnesses constructing Params directly get a loud default,
+	// never silence (the AdmitMinHits / pin_quota silent-config class).
+	if p.LeaseDefaultMS > 0 && p.LeaseMaxMS < p.LeaseDefaultMS {
+		slog.Warn("dram: lease_max_ms below lease_default_ms — raising it so leases keep protecting",
+			"lease_default_ms", p.LeaseDefaultMS, "lease_max_ms", p.LeaseMaxMS)
+		p.LeaseMaxMS = p.LeaseDefaultMS
 	}
 	s := &Store{
 		arena:  arena,
@@ -461,36 +473,69 @@ func (s *Store) PinOp(ns uint32, key [32]byte, sub uint8) protocol.Status {
 
 // ---------------------------------------------------------------------------
 
-// Stats returns the tier's JSON document — a superset of ramstub's shape so
-// existing wire assertions (`"blocks":N`) keep working.
-func (s *Store) Stats() []byte {
-	var blocks int
-	var bytes uint64
-	s.index.Range(func(_ Key, ref *BlockRef) bool {
-		blocks++
-		bytes += uint64(ref.Len)
-		return true
-	})
+// StatsDoc is the DRAM tier's stats document — a typed struct so the tiered
+// store composes its own document around it instead of unmarshal/remarshal
+// through map[string]any. Field tags are the wire-stable JSON keys.
+type StatsDoc struct {
+	Schema            int              `json:"schema"`
+	Store             string           `json:"store"`
+	Blocks            int64            `json:"blocks"`
+	Bytes             int64            `json:"bytes"`
+	ShardCount        int              `json:"shard_count"`
+	ArenaBytes        uint64           `json:"arena_bytes"`
+	ArenaFreeBytes    uint64           `json:"arena_free_bytes"`
+	LargestFreeRegion uint64           `json:"largest_free_region_bytes"`
+	Hugepages         bool             `json:"hugepages"`
+	PinnedBytes       map[uint32]int64 `json:"pinned_bytes"`
+	EvictionsTotal    uint64           `json:"evictions_total"`
+	// EvictionGhostBytes is the policy's ghost/fingerprint memory summed
+	// across tenants — DRAM spent OUTSIDE the arena budget. Produced by the
+	// policy since the ghost-decay fix; surfacing it here is what makes that
+	// memory observable at all (scrape gauge kvb_eviction_ghost_bytes).
+	EvictionGhostBytes int64  `json:"eviction_ghost_bytes"`
+	LiveAllocs         int64  `json:"live_allocs"`
+	MaxAllocs          uint32 `json:"max_allocs"`
+}
+
+// StatsSnapshot fills the document from the funnel-maintained index counters
+// (O(1) — never a full index walk per scrape) plus the allocator report.
+func (s *Store) StatsSnapshot() StatsDoc {
+	blocks, bytes := s.index.Stats()
 	s.allocMu.Lock()
 	rep := s.alloc.StorageReport()
 	s.allocMu.Unlock()
-
-	doc := map[string]any{
-		"schema":                    1,
-		"store":                     "dram",
-		"blocks":                    blocks,
-		"bytes":                     bytes,
-		"shard_count":               indexShards,
-		"arena_bytes":               s.arena.Size(),
-		"arena_free_bytes":          uint64(rep.TotalFreeSpace) << AllocUnitShift,
-		"largest_free_region_bytes": uint64(rep.LargestFreeRegion) << AllocUnitShift,
-		"hugepages":                 s.arena.Huge(),
-		"pinned_bytes":              s.life.pinnedBytes(),
-		"evictions_total":           s.evictions.Load(),
-		"live_allocs":               s.liveAllocs.Load(),
-		"max_allocs":                s.alloc.MaxAllocs(),
+	var ghost int64
+	if p := s.policy; p != nil {
+		// Tenants number a handful: the tiny per-scrape append beats owning
+		// a scratch slice that would race the evictor's. Passing the real
+		// clock also makes the scrape a decay tick — harmless (epoch-gated)
+		// and one more guarantee the ghost ratchet cannot stick.
+		for _, u := range p.Usage(s.now(), nil) {
+			ghost += u.GhostBytes
+		}
 	}
-	b, err := json.Marshal(doc)
+	return StatsDoc{
+		Schema:             1,
+		Store:              "dram",
+		Blocks:             blocks,
+		Bytes:              bytes,
+		ShardCount:         indexShards,
+		ArenaBytes:         s.arena.Size(),
+		ArenaFreeBytes:     uint64(rep.TotalFreeSpace) << AllocUnitShift,
+		LargestFreeRegion:  uint64(rep.LargestFreeRegion) << AllocUnitShift,
+		Hugepages:          s.arena.Huge(),
+		PinnedBytes:        s.life.pinnedBytes(),
+		EvictionsTotal:     s.evictions.Load(),
+		EvictionGhostBytes: ghost,
+		LiveAllocs:         s.liveAllocs.Load(),
+		MaxAllocs:          s.alloc.MaxAllocs(),
+	}
+}
+
+// Stats returns the tier's JSON document — a superset of ramstub's shape so
+// existing wire assertions (`"blocks":N`) keep working.
+func (s *Store) Stats() []byte {
+	b, err := json.Marshal(s.StatsSnapshot())
 	if err != nil {
 		return []byte(`{"schema":1,"store":"dram","error":"stats encode failed"}`)
 	}

@@ -248,3 +248,29 @@ func TestPinCapForConstructorPath(t *testing.T) {
 		t.Fatalf("ns2 global fallback: %s", st)
 	}
 }
+
+// TestLeaseMaxZeroDoesNotDisableProtection: a harness-built Params with
+// LeaseMaxMS 0 and a nonzero default used to clamp every EXPLICIT lease
+// grant to zero — the protection a client asked for silently evaporated,
+// and eviction was free to remove blocks mid-workflow. (The §3.3 auto-lease
+// takes the unclamped default and was never affected.) The package boundary
+// now defends itself with a loud default.
+func TestLeaseMaxZeroDoesNotDisableProtection(t *testing.T) {
+	arena, err := dram.NewArena(16<<20, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := dram.New(arena, dram.Params{LeaseDefaultMS: 5000, LeaseMaxMS: 0}) // the foot-gun shape
+	t.Cleanup(func() { _ = s.Close() })
+
+	blob := bytes.Repeat([]byte{0x11}, 4096)
+	if st := s.Put(1, k(9), blob, xxh3.Hash(blob)); st != protocol.StatusOK {
+		t.Fatalf("put: %s", st)
+	}
+	if st := s.TouchLease(1, k(9), protocol.LeaseGrant, 30_000); st != protocol.StatusOK {
+		t.Fatalf("lease grant: %s", st)
+	}
+	if st := s.Delete(1, k(9), false); st != protocol.StatusErrLeased {
+		t.Fatalf("delete during an explicit 30s lease answered %s, want ERR_LEASED — the lease protected nothing", st)
+	}
+}

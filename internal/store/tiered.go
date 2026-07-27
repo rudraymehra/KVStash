@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -214,6 +215,14 @@ const promoteMinGap = int64(10 * time.Millisecond)
 // policy must be the SAME instance attached to the dram store (victims are
 // nominated once, dequeued once).
 func NewTiered(d *dram.Store, pol eviction.Policy, vols []*nvme.Volume, reports []*nvme.RecoveryReport, recovered [][]nvme.RecoveredEntry, p Params) *Tiered {
+	// Same lease boundary defense as dram.New: LeaseMaxMS below a nonzero
+	// default silently clamps every NVMe-side lease grant — loud default,
+	// never silence.
+	if p.LeaseDefaultMS > 0 && p.LeaseMaxMS < p.LeaseDefaultMS {
+		slog.Warn("store: lease_max_ms below lease_default_ms — raising it so leases keep protecting",
+			"lease_default_ms", p.LeaseDefaultMS, "lease_max_ms", p.LeaseMaxMS)
+		p.LeaseMaxMS = p.LeaseDefaultMS
+	}
 	t := &Tiered{
 		d:         d,
 		pol:       pol,
@@ -740,18 +749,21 @@ func (t *Tiered) CanStore(n uint32) bool {
 
 // Stats is the dram document (top level — existing assertions and the
 // scrape collector keep working) plus an "nvme" sub-document, and — when the
-// cold tier is wired — an "s3" sub-document.
+// cold tier is wired — an "s3" sub-document. Composed from the dram tier's
+// typed snapshot: no unmarshal/remarshal through map[string]any, and every
+// tier count comes from funnel-maintained counters (O(1) per scrape).
 func (t *Tiered) Stats() []byte {
-	var doc map[string]any
-	if err := json.Unmarshal(t.d.Stats(), &doc); err != nil {
-		doc = map[string]any{"schema": 1, "store": "dram", "error": "dram stats decode failed"}
-	}
+	doc := struct {
+		dram.StatsDoc
+		Nvme map[string]any `json:"nvme"`
+		S3   map[string]any `json:"s3,omitempty"`
+	}{StatsDoc: t.d.StatsSnapshot()}
 	// The index holds BOTH nvme-resident and retire-flipped (s3-only)
 	// entries; report each tier's own residency so the sub-documents sum to
 	// the index, matching the per-tenant quota ledger's tier split. Read the
-	// s3 counters BEFORE walking the index (a flip landing in between
-	// otherwise oversubtracts) and clamp: a removal racing the walk can
-	// still skew one sample transiently, but never below zero.
+	// s3 counters BEFORE the index counters (a flip landing in between
+	// otherwise oversubtracts) and clamp: a removal racing the sample can
+	// still skew it transiently, but never below zero.
 	s3Blocks, s3Bytes := t.s3Blocks.Load(), t.s3Bytes.Load()
 	blocks, bytes := t.idx.stats()
 	if s3Blocks > 0 {
@@ -787,14 +799,14 @@ func (t *Tiered) Stats() []byte {
 	for k, v := range volStats {
 		nv[k] = v
 	}
-	doc["nvme"] = nv
+	doc.Nvme = nv
 	if t.p.Spill != nil {
 		spilled, drops, putErrs := t.p.Spill.Stats()
 		var rangedGets, restores uint64
 		if t.p.Restore != nil {
 			rangedGets, restores = t.p.Restore.Stats()
 		}
-		doc["s3"] = map[string]any{
+		doc.S3 = map[string]any{
 			"blocks":                 s3Blocks,
 			"bytes":                  s3Bytes,
 			"spilled_segments_total": spilled,

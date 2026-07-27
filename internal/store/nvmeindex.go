@@ -61,9 +61,16 @@ type nvmeShard struct {
 // nvmeIndex mirrors the dram Index's sharding (seeded maphash — the same
 // hash-flood posture). LOCK ORDER: a dram shard lock may nest an nvme shard
 // lock (CompleteDemotion's publish); never the reverse.
+//
+// blocks/bytes are maintained AT the two mutation funnels (putThen,
+// deleteIf) — the same seam discipline the tenant quota refunds audit —
+// so stats() is two atomic loads, never a 512-shard walk of a
+// tens-of-millions-entry index per scrape.
 type nvmeIndex struct {
 	seed   maphash.Seed
 	shards [nvmeIndexShards]nvmeShard
+	blocks atomic.Int64
+	bytes  atomic.Int64
 }
 
 func newNvmeIndex() *nvmeIndex {
@@ -114,10 +121,20 @@ func (idx *nvmeIndex) putThen(k dram.Key, ref *nvmeRef, fn func()) {
 	// dual-residency demote path completes without republishing — but
 	// s3SegRefs widened what a silent overwrite would leak, so the debug
 	// build trips the moment some future path makes it reachable.
-	if old := s.m[k]; old != nil {
+	old := s.m[k]
+	if old != nil {
 		assertf(!old.S3Only.Load(), "putThen: overwriting s3-resident ref %v (charge+liveness would leak)", k)
 	}
 	s.m[k] = ref
+	// Counter updates stay under the shard hold so a racing deleteIf on
+	// this key can never decrement before the increment lands (a transient
+	// negative in a scrape).
+	if old != nil {
+		idx.bytes.Add(int64(ref.Len) - int64(old.Len)) // overwrite: re-demotion refreshes the Loc
+	} else {
+		idx.blocks.Add(1)
+		idx.bytes.Add(int64(ref.Len))
+	}
 	if fn != nil {
 		fn()
 	}
@@ -139,6 +156,8 @@ func (idx *nvmeIndex) deleteIf(k dram.Key, gate func(ref *nvmeRef) protocol.Stat
 		return nil, st
 	}
 	delete(s.m, k)
+	idx.blocks.Add(-1)
+	idx.bytes.Add(-int64(ref.Len))
 	return ref, protocol.StatusOK
 }
 
@@ -167,12 +186,8 @@ func (idx *nvmeIndex) rangeAll(fn func(k dram.Key, ref *nvmeRef) bool) {
 	}
 }
 
-// stats sums blocks and bytes.
+// stats reports blocks and bytes from the funnel-maintained counters —
+// O(1) in index size (observability must not scale with data volume).
 func (idx *nvmeIndex) stats() (blocks int, bytes int64) {
-	idx.rangeAll(func(_ dram.Key, ref *nvmeRef) bool {
-		blocks++
-		bytes += int64(ref.Len)
-		return true
-	})
-	return blocks, bytes
+	return int(idx.blocks.Load()), idx.bytes.Load()
 }

@@ -3,6 +3,7 @@ package dram
 import (
 	"hash/maphash"
 	"sync"
+	"sync/atomic"
 
 	"github.com/kvstash/kvblockd/internal/protocol"
 )
@@ -27,9 +28,15 @@ type indexShard struct {
 // controls key bytes cannot aim every key at one shard's lock (hash-flood
 // defense — the InfiniStore #200 lesson). Tests must therefore never assert
 // WHICH shard a key lands in — only aggregate behavior.
+//
+// blocks/bytes are maintained at the three mutation funnels (Put, Delete,
+// DeleteIf) so Stats is two atomic loads, never a full Range under every
+// shard's read lock per scrape.
 type Index struct {
 	seed   maphash.Seed
 	shards [indexShards]indexShard
+	blocks atomic.Int64
+	bytes  atomic.Int64
 }
 
 // NewIndex returns an empty index with a fresh random shard seed.
@@ -79,6 +86,10 @@ func (idx *Index) Put(k Key, ref *BlockRef) (existing *BlockRef, inserted bool) 
 		return cur, false
 	}
 	sh.m[k] = ref
+	// Under the shard hold: a racing Delete of this key can never
+	// decrement before this increment lands.
+	idx.blocks.Add(1)
+	idx.bytes.Add(int64(ref.Len))
 	return ref, true
 }
 
@@ -91,6 +102,8 @@ func (idx *Index) Delete(k Key) (*BlockRef, bool) {
 	ref, ok := sh.m[k]
 	if ok {
 		delete(sh.m, k)
+		idx.blocks.Add(-1)
+		idx.bytes.Add(-int64(ref.Len))
 	}
 	sh.mu.Unlock()
 	return ref, ok
@@ -125,7 +138,15 @@ func (idx *Index) DeleteIf(k Key, gate func(*BlockRef) protocol.Status) (*BlockR
 		return nil, st
 	}
 	delete(sh.m, k)
+	idx.blocks.Add(-1)
+	idx.bytes.Add(-int64(ref.Len))
 	return ref, protocol.StatusOK
+}
+
+// Stats reports blocks and total payload bytes from the funnel-maintained
+// counters — O(1) in index size.
+func (idx *Index) Stats() (blocks, bytes int64) {
+	return idx.blocks.Load(), idx.bytes.Load()
 }
 
 // Range calls fn for every published ref until fn returns false. Takes each
