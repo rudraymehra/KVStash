@@ -90,7 +90,7 @@ class FakeClient:
         self.closed = False
         self.put_started = threading.Event()
 
-    def batch_exists(self, keys):
+    def batch_exists(self, keys, deadline=None):
         return 0, None
 
     def put(self, key, bufs, ttl_ms=0):
@@ -186,9 +186,9 @@ def test_tail_skip_after_drop(daemon):
     offered = []
     real_enqueue = conn._sq_enqueue
 
-    def spy(key, buf):
+    def spy(key, buf, *a, **kw):
         offered.append(bytes(key))
-        return real_enqueue(key, buf)
+        return real_enqueue(key, buf, *a, **kw)
 
     conn._sq_enqueue = spy
     kv = fresh_kv()
@@ -236,9 +236,9 @@ def test_tail_skip_persists_across_chunked_prefill_steps(daemon):
     offered = []
     real_enqueue = conn._sq_enqueue
 
-    def spy(key, buf):
+    def spy(key, buf, *a, **kw):
         offered.append(bytes(key))
-        return real_enqueue(key, buf)
+        return real_enqueue(key, buf, *a, **kw)
 
     conn._sq_enqueue = spy
     conn._stage_one(meta(4, 6))  # step 2 (later chunk): rows 4,5 are past the hole

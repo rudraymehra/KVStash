@@ -152,9 +152,9 @@ def test_enqueue_deferred_until_after_device_sync():
     conn._store_sync = lambda dev: (events.append("sync"), real_sync(dev))[1]
     real_enq = conn._sq_enqueue
 
-    def spy_enq(key, buf, slot_id=None):
+    def spy_enq(key, buf, slot_id=None, rid=""):
         events.append("enqueue")
-        return real_enq(key, buf, slot_id)
+        return real_enq(key, buf, slot_id, rid)
 
     conn._sq_enqueue = spy_enq
     kv = big_kv(8)
@@ -431,11 +431,11 @@ def test_finish_raise_mid_plan_counts_only_unsent_tail():
     real_enq = conn._sq_enqueue
     calls = []
 
-    def boom_on_second(key, buf, slot_id=None):
+    def boom_on_second(key, buf, slot_id=None, rid=""):
         calls.append(1)
         if len(calls) == 2:
             raise RuntimeError("injected enqueue-plumbing fault")
-        return real_enq(key, buf, slot_id)
+        return real_enq(key, buf, slot_id, rid)
 
     conn._sq_enqueue = boom_on_second
     stage(conn, [smeta("mp", list(range(2200, 2212)), [0, 1, 2], salt="sg-mid")], kv)

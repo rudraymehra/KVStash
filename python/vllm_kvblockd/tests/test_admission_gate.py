@@ -152,7 +152,7 @@ class DeadlineSpy:
     def __init__(self):
         self.deadlines: list[float | None] = []
 
-    def batch_exists(self, keys):
+    def batch_exists(self, keys, deadline=None):
         return 0, None
 
     def batch_get_scatter(self, keys, prefix_len, alloc, deadline=None):

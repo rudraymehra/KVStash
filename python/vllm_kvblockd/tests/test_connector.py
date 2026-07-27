@@ -223,7 +223,7 @@ def test_op_failure_drops_client_and_arms_dial_breaker(daemon):
     conn = make_connector(daemon)
     client = conn._ensure()
 
-    def boom(keys):
+    def boom(keys, deadline=None):
         raise ConnectionLost("injected mid-op death")
 
     client.batch_exists = boom

@@ -57,6 +57,7 @@ import queue
 import struct
 import threading
 import time
+import zlib
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -160,6 +161,21 @@ CODEC_NAMES = {CODEC_RAW: "raw", CODEC_FP8_CAST: "fp8-cast"}
 # After a failed dial, further dial attempts short-circuit for this long —
 # callers degrade to a miss instantly instead of each eating a connect timeout.
 _REDIAL_BACKOFF_S = 5.0
+# How long the store drain parks per check while another caller's dial is in
+# flight (see _DialPending) — bounded overall by connect_timeout, since the
+# dial itself is.
+_DIAL_PENDING_PARK_S = 0.05
+
+
+class _DialPending(ConnectionError):
+    """_ensure()'s 'another caller owns the in-flight dial' signal. NOT a
+    wire failure and NOT a delivery attempt: lookups/loads degrade to a miss
+    on it exactly as before (it is still a ConnectionError), but the store
+    drain PARKS on it — requeue with NO strike — because charging it as a
+    requeued block's second put failure counted failed_puts += 1 and freed
+    the slot without a second wire attempt ever happening (a permanently
+    lost block plus a failed_puts count inflated with a non-attempt,
+    breaking byte-for-byte disclosure exactness)."""
 # Load-priority drain gate: while the engine is actively pulling KV, the
 # kvb-store drain parks (bounded) so store traffic never contends with a
 # latency-path load for the wire or the GIL. The ceiling guarantees a
@@ -200,6 +216,69 @@ _PIPELINE_HALF_MAX = 256 << 20
 # — a miss — instead of None, because a None with no queued work would park
 # the request on a result that never comes (never-None-under-pressure rule).
 _LOOKUP_PENDING_CAP = 1024
+
+# Worker-side chain-key memo ceiling (entries = requests). Chunked prefill
+# re-derives the FULL BLAKE3 chain over the whole prompt in _stage_one and
+# _load_one each step — O(prompt^2) over a long prefill; the chain is
+# append-only per request, so caching (seed, keys) and extending from the
+# last key makes each step O(new blocks). Correctness never depends on the
+# cache (evicted entries recompute), so a plain FIFO cap is enough armor.
+_CHAIN_CACHE_CAP = 2048
+
+# Periodic one-line stats summary interval (WARNING on purpose — this logger
+# is unconfigured in vLLM's engine-core process, where the root default drops
+# INFO; the grep-based rigs read the same line).
+_STATS_SUMMARY_S = 60.0
+
+
+class _ConnStats:
+    """Connector telemetry: hits/misses, per-verb latency sums, store-queue
+    high-water, breaker trips, deadline aborts. Public via
+    KvblockdConnector.stats (attributes + snapshot()) and a periodic one-line
+    WARNING summary — the answers to 'is the cache helping', 'is the queue
+    about to overflow', and 'is the breaker flapping' without log
+    archaeology. Thread-safe: engine, resolver, and drain threads all bump."""
+
+    __slots__ = ("_lock", "breaker_trips", "hits", "load_count",
+                 "load_deadline_aborts", "load_time_s", "lookup_count",
+                 "lookup_time_s", "misses", "sq_bytes_hwm", "store_count",
+                 "store_time_s")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+        self.lookup_count = 0
+        self.lookup_time_s = 0.0
+        self.load_count = 0
+        self.load_time_s = 0.0
+        self.load_deadline_aborts = 0
+        self.store_count = 0
+        self.store_time_s = 0.0
+        self.sq_bytes_hwm = 0
+        self.breaker_trips = 0
+
+    def bump(self, name: str, n=1) -> None:
+        with self._lock:
+            setattr(self, name, getattr(self, name) + n)
+
+    def note_lookup(self, hit: bool, elapsed: float | None = None) -> None:
+        with self._lock:
+            if hit:
+                self.hits += 1
+            else:
+                self.misses += 1
+            if elapsed is not None:
+                self.lookup_count += 1
+                self.lookup_time_s += elapsed
+
+    def note_hwm(self, sq_bytes: int) -> None:
+        with self._lock:
+            self.sq_bytes_hwm = max(self.sq_bytes_hwm, sq_bytes)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {s: getattr(self, s) for s in self.__slots__ if s != "_lock"}
 
 
 class BlobError(ValueError):
@@ -451,8 +530,15 @@ class KvblockdConnector(_Base):
         self._client: Client | None = None
         self._client_lock = threading.Lock()
         self._next_dial = 0.0  # monotonic gate arming the dial breaker
+        # True while ONE caller dials outside _client_lock; every concurrent
+        # caller fails fast (degrades to miss) instead of queueing behind a
+        # connect_timeout — the documented 'one bounded delay' contract.
+        self._dialing = False
         self._log = _RateLimitedLog()
         self._closed = False
+        # Telemetry (commit: degrade-to-miss visibility). Public on purpose.
+        self.stats = _ConnStats()
+        self._stats_last_emit = time.monotonic()
 
         # Scheduler-side state.
         self._inflight: dict[str, object] = {}        # req_id -> Request
@@ -476,6 +562,13 @@ class KvblockdConnector(_Base):
         # Worker-side state.
         self._layer_kv: dict[str, object] = {}        # layer_name -> paged KV tensor
         self._load_errors: set[int] = set()
+        # req_id -> (seed, chain keys derived so far). The chain is append-
+        # only per request (prompt tokens are immutable, the seed pins
+        # salt/lora/mm identity), so chunked-prefill steps extend from the
+        # last cached key instead of re-hashing the whole prompt — O(new
+        # blocks) per step instead of O(prompt) (O(prompt^2) per prefill).
+        # Worker-side + engine-thread-only; FIFO-capped, never authoritative.
+        self._chain_cache: dict[str, tuple[bytes, list[bytes]]] = {}
         # Cost-crossover estimator inputs (kvblockd_recompute_ms_per_token):
         # EMA of observed load throughput (bytes/s over whole _load_one
         # calls) and the live layout's blob bytes per token. Written by the
@@ -528,12 +621,20 @@ class KvblockdConnector(_Base):
         self._debug_scatter_checked = False  # KVBLOCKD_DEBUG_SCATTER_CHECK=1, once
 
         # Write-behind store queue (kvblockd_async_store, default on):
-        # wait_for_save stages OWNED byte copies here and returns; ONE daemon
-        # thread ("kvb-store", lazily started on first enqueue) drains FIFO.
-        # FIFO preserves per-request block order, so a partial delivery is a
-        # usable consecutive prefix under the prefix-chain keys. All queue
-        # state (deque, byte gauges, public counters) is guarded by _sq_cond.
-        self._sq: deque[tuple[bytes, bytearray | memoryview, int | None]] = deque()
+        # wait_for_save stages OWNED byte copies here and returns; N daemon
+        # workers ("kvb-store[-i]", lazily started on first enqueue) drain
+        # them — one deque per worker, requests HASHED to a worker (stable
+        # crc32 of req_id), so per-request block order is preserved exactly
+        # as the single FIFO preserved it: a partial delivery stays a usable
+        # consecutive prefix under the prefix-chain keys. Effective count is
+        # min(kvblockd_store_drain_workers, streams) — each worker owns one
+        # pooled conn's worth of put throughput; default 1 = the original
+        # single-thread drain, byte-identical. All queue state (deques, byte
+        # gauges, slot free list, public counters) is guarded by _sq_cond.
+        self._store_workers = max(1, min(self._cfg.store_drain_workers,
+                                         self._cfg.streams))
+        self._sqs: list[deque[tuple[bytes, bytearray | memoryview, int | None]]] = [
+            deque() for _ in range(self._store_workers)]
         self._sq_cond = threading.Condition()
         self._sq_bytes = 0            # bytes currently queued
         self._sq_inflight = 0         # blocks popped, put() not finished
@@ -549,7 +650,7 @@ class KvblockdConnector(_Base):
         # calls (chunked-prefill continuations) skip past the hole instead of
         # queueing dead bytes. Pruned in request_finished.
         self._store_holes: dict[str, int] = {}
-        self._store_thread: threading.Thread | None = None
+        self._store_threads: list[threading.Thread | None] = [None] * self._store_workers
         self._store_stop = False      # shutdown: drain the remainder, then exit
         self._store_abort = False     # wedged flush: exit without draining
         # Public disclosure counters (the bench reads/greps these).
@@ -604,36 +705,76 @@ class KvblockdConnector(_Base):
         self._reported_store_path = None
         self._store_path_switch_logged = False
 
+    @property
+    def _sq(self):
+        """Worker 0's deque — exact for the default single-worker drain (the
+        bench/test seam that inspects the staged queue); multi-worker callers
+        must iterate _sqs."""
+        return self._sqs[0]
+
+    @property
+    def _store_thread(self):
+        """First live drain thread or None (single-worker back-compat seam)."""
+        return next((t for t in self._store_threads if t is not None), None)
+
     # ------------------------------------------------------------------
     # client plumbing (lazy: import/instantiate must succeed with no daemon)
     # ------------------------------------------------------------------
     def _ensure(self) -> Client:
+        """Return the live client, dialing OUTSIDE _client_lock: a dial
+        blocks up to connect_timeout and primes a connection, and holding
+        the lock across it stalled every other caller (engine, resolver,
+        drain, shutdown) behind one redial — quietly exceeding the documented
+        'one bounded delay' contract. Under the lock: breaker check + a
+        dialing flag; concurrent callers seeing the flag raise the dial-
+        suppressed ConnectionError immediately (degrade to miss)."""
         with self._client_lock:
             if self._closed:
                 raise ConnectionError("connector closed")
-            if self._client is None:
-                # Dial breaker: without it, every caller of a dead endpoint
-                # eats a full connect timeout (one stalled scheduler step per
-                # waiting request under a blackholed daemon).
-                now = time.monotonic()
-                if now < self._next_dial:
-                    raise ConnectionError("kvblockd dial suppressed after recent failure")
-                try:
-                    self._client = Client(
-                        (self._cfg.host, self._cfg.port),
-                        namespace=self._cfg.namespace,
-                        token=self._cfg.token,
-                        streams=self._cfg.streams,
-                        get_fanout=self._cfg.get_fanout,
-                        connect_timeout=self._cfg.connect_timeout,
-                        op_timeout=self._cfg.op_timeout,
-                        verify=self._cfg.verify,
-                        so_rcvbuf=self._cfg.so_rcvbuf,
-                    )
-                except Exception:
-                    self._next_dial = time.monotonic() + _REDIAL_BACKOFF_S
-                    raise
-            return self._client
+            if self._client is not None:
+                return self._client
+            # Dial breaker: without it, every caller of a dead endpoint
+            # eats a full connect timeout (one stalled scheduler step per
+            # waiting request under a blackholed daemon).
+            now = time.monotonic()
+            if now < self._next_dial:
+                raise ConnectionError("kvblockd dial suppressed after recent failure")
+            if self._dialing:
+                raise _DialPending("kvblockd dial in progress — degraded to miss")
+            self._dialing = True
+        try:
+            client = Client(
+                (self._cfg.host, self._cfg.port),
+                namespace=self._cfg.namespace,
+                token=self._cfg.token,
+                streams=self._cfg.streams,
+                get_fanout=self._cfg.get_fanout,
+                connect_timeout=self._cfg.connect_timeout,
+                op_timeout=self._cfg.op_timeout,
+                verify=self._cfg.verify,
+                so_rcvbuf=self._cfg.so_rcvbuf,
+            )
+        except Exception:
+            with self._client_lock:
+                self._dialing = False
+                self._next_dial = time.monotonic() + _REDIAL_BACKOFF_S
+            self.stats.bump("breaker_trips")
+            raise
+        with self._client_lock:
+            self._dialing = False
+            if self._closed:
+                pass  # shutdown raced the dial: don't install (closed below)
+            elif self._client is None:
+                self._client = client
+                return client
+            else:
+                # Another caller installed first (cannot happen under the
+                # dialing flag, but stay single-owner defensively).
+                pass
+            stale = client
+        stale.close()
+        raise ConnectionError("connector closed" if self._closed
+                              else "kvblockd dial superseded")
 
     def _drop_client(self, exc: BaseException) -> None:
         """ConnectionLost/OSError out of a batch op means the pooled
@@ -643,6 +784,11 @@ class KvblockdConnector(_Base):
         pooled conn re-dialing under it. A dial-suppressed ConnectionError
         (client already None) re-arms nothing: extending the window on every
         suppressed call would starve the retry forever under constant load."""
+        if isinstance(exc, _DialPending):
+            # Not a wire failure — another caller owns the in-flight dial,
+            # and racing it here could drop the client that dial is about
+            # to install (then arm the breaker against a healthy daemon).
+            return
         if not isinstance(exc, (ConnectionLost, OSError)):
             return  # e.g. StatusError: the conn is in sync, keep the pool
         with self._client_lock:
@@ -650,6 +796,7 @@ class KvblockdConnector(_Base):
             if client is None:
                 return  # dial failure/suppression: _ensure already armed it
             self._next_dial = time.monotonic() + _REDIAL_BACKOFF_S
+        self.stats.bump("breaker_trips")
         # Every entry in the ack LRU was proven against the connection that
         # just died; the daemon behind the redial may have restarted with an
         # EMPTY store, and a trusted stale ack suppresses the self-healing
@@ -690,6 +837,30 @@ class KvblockdConnector(_Base):
             self._seeds[rid] = seed
         return seed
 
+    def _chain_keys(self, rid: str, seed: bytes, token_ids: list[int]) -> list[bytes]:
+        """Chain keys for token_ids, memoized per request (worker side). The
+        chain's prefix property makes extension exact: key_i folds key_{i-1},
+        so block_chain_keys(prev=last cached key, tail tokens) IS the tail of
+        block_chain_keys(seed, all tokens) — proven byte-for-byte by
+        tests/test_connector.py::test_chain_key_cache_extends_exactly. A seed
+        mismatch (different salt/lora/mm identity, or a flag-only row) or a
+        SHORTER token list than the cache falls back to a full recompute —
+        the cache can only ever save work, never change bytes."""
+        n_blocks = len(token_ids) // self._block_size
+        ent = self._chain_cache.pop(rid, None)  # pop: reinsert refreshes FIFO order
+        if ent is not None and ent[0] == seed and len(ent[1]) <= n_blocks:
+            keys = ent[1]
+            if len(keys) < n_blocks:
+                prev = keys[-1] if keys else seed
+                keys = keys + block_chain_keys(
+                    prev, token_ids[len(keys) * self._block_size:], self._block_size)
+        else:
+            keys = block_chain_keys(seed, token_ids, self._block_size)
+        self._chain_cache[rid] = (seed, keys)
+        while len(self._chain_cache) > _CHAIN_CACHE_CAP:
+            self._chain_cache.pop(next(iter(self._chain_cache)))
+        return keys
+
     @staticmethod
     def _mm_ids(request) -> list[str]:
         try:
@@ -719,9 +890,44 @@ class KvblockdConnector(_Base):
             # num_computed_tokens here IS the local prefix-cache hit; the
             # Request object still reads 0 at update_state_after_alloc time.
             self._local_hit_tokens[rid] = int(num_computed_tokens or 0)
+        self._maybe_stats_summary()
         if self._cfg.async_lookup and rid is not None:
             return self._lookup_async(rid, request, num_computed_tokens)
         return self._lookup_sync(request, num_computed_tokens)
+
+    def _maybe_stats_summary(self) -> None:
+        """One periodic WARNING line per role instance (scheduler counters
+        and worker counters live in different processes) — the grep-based
+        rigs' view of hit rate, queue pressure, and breaker health. Never
+        raises; steady-state cost is one clock read."""
+        now = time.monotonic()
+        if now - self._stats_last_emit < _STATS_SUMMARY_S:
+            return
+        self._stats_last_emit = now
+        try:
+            s = self.stats.snapshot()
+            client = self._client
+            cc = getattr(client, "counters", None)
+            extra = ""
+            if cc is not None:
+                c = cc.snapshot()
+                extra = (f" client_evictions={c['evictions']}"
+                         f" client_deadline_misses={c['deadline_misses']}"
+                         f" client_corrupt_blocks={c['corrupt_blocks']}"
+                         f" client_degraded_keys={c['degraded_keys']}")
+            with self._sq_cond:
+                sq_bytes = self._sq_bytes
+            logger.warning(
+                "kvblockd stats: hits=%d misses=%d lookup_s=%.3f/%d load_s=%.3f/%d "
+                "store_s=%.3f/%d sq_bytes=%d sq_hwm=%d breaker_trips=%d "
+                "deadline_aborts=%d dropped=%d failed=%d deduped=%d%s",
+                s["hits"], s["misses"], s["lookup_time_s"], s["lookup_count"],
+                s["load_time_s"], s["load_count"], s["store_time_s"], s["store_count"],
+                sq_bytes, s["sq_bytes_hwm"], s["breaker_trips"],
+                s["load_deadline_aborts"], self.dropped_puts, self.failed_puts,
+                self.deduped_puts, extra)
+        except Exception:  # noqa: BLE001, S110 — telemetry must never break serving
+            pass
 
     def _load_ms_per_token(self) -> float | None:
         """Measured load cost in ms/token from the throughput EMA, or None
@@ -775,7 +981,12 @@ class KvblockdConnector(_Base):
 
     def _lookup_sync(self, request, num_computed_tokens: int):
         """The original synchronous lookup (flag off / fallback), now routed
-        through the admission gate (identity at the gate's defaults)."""
+        through the admission gate (identity at the gate's defaults) and
+        budgeted by kvblockd_exists_timeout_s: this call blocks EVERY
+        scheduling step, so a hung-but-accepting daemon must cost a bounded
+        blip (then the breaker answers instantly for its window), never the
+        global 10s op_timeout per recv — the verb is <1ms p99 by design."""
+        t0 = time.monotonic()
         try:
             token_ids = list(getattr(request, "prompt_token_ids", None) or [])
             aligned = align_to_block_size(len(token_ids), self._block_size)
@@ -784,12 +995,26 @@ class KvblockdConnector(_Base):
             seed = self._seed(getattr(request, "cache_salt", None), self._mm_ids(request),
                               self._lora_name(request))
             keys = block_chain_keys(seed, token_ids[:aligned], self._block_size)
-            n_consec, _ = self._ensure().batch_exists(keys)
+            # The budget covers the EXCHANGE, never the dial or the O(prompt)
+            # chain hashing above: _ensure() may legitimately spend up to
+            # connect_timeout priming a connection (its own bounded,
+            # breaker-guarded budget — the documented 'one bounded delay').
+            # Armed at t0, any dial+HELLO slower than exists_timeout_s raised
+            # 'deadline exceeded before checkout' against a HEALTHY daemon,
+            # dropped the freshly-primed client, and armed the breaker — a
+            # self-sustaining permanent-0%-hit-rate loop.
+            client = self._ensure()
+            et = self._cfg.exists_timeout_s
+            deadline = time.monotonic() + et if et > 0 else None
+            n_consec, _ = client.batch_exists(keys, deadline=deadline)
             hit_tokens = min(n_consec * self._block_size, aligned)
-            return self._gate_hit_tokens(max(0, hit_tokens - num_computed_tokens)), False
+            granted = self._gate_hit_tokens(max(0, hit_tokens - num_computed_tokens))
+            self.stats.note_lookup(granted > 0, time.monotonic() - t0)
+            return granted, False
         except Exception as e:  # noqa: BLE001 — never raise: a failed lookup is a miss
             self._log.maybe("lookup", "kvblockd BATCH_EXISTS failed (treated as miss)", e)
             self._drop_client(e)
+            self.stats.note_lookup(False, time.monotonic() - t0)
             return 0, False
 
     def _lookup_async(self, rid: str, request, num_computed_tokens: int):
@@ -815,8 +1040,10 @@ class KvblockdConnector(_Base):
             hit = resolver.pop(rid)  # a result posted before a thread death still counts
             if hit is not None:
                 self._lookup_pending.pop(rid, None)
-                return (self._gate_hit_tokens(
-                    max(0, min(hit, aligned) - num_computed_tokens)), False)
+                granted = self._gate_hit_tokens(
+                    max(0, min(hit, aligned) - num_computed_tokens))
+                self.stats.note_lookup(granted > 0)
+                return granted, False
             if not resolver.alive():
                 # Dead resolver (never expected; armor): serve inline, sync.
                 self._log.maybe("lookup-thread",
@@ -832,11 +1059,13 @@ class KvblockdConnector(_Base):
                     resolver.discard(rid, inflight=True)
                     self._log.maybe("lookup-deadline",
                                     f"async lookup timed out — treated as miss req={rid}")
+                    self.stats.note_lookup(False)
                     return 0, False
                 return None, False
             if len(self._lookup_pending) >= _LOOKUP_PENDING_CAP:
                 self._log.maybe("lookup-cap",
                                 "async lookup pending map at capacity — treated as miss")
+                self.stats.note_lookup(False)
                 return 0, False
             resolver.post(rid, token_ids[:aligned], getattr(request, "cache_salt", None),
                           self._mm_ids(request), self._lora_name(request))
@@ -847,6 +1076,7 @@ class KvblockdConnector(_Base):
             if (self._lookup_pending.pop(rid, None) is not None
                     and self._resolver is not None):
                 self._resolver.discard(rid, inflight=True)  # same orphan armor
+            self.stats.note_lookup(False)
             return 0, False
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
@@ -1029,8 +1259,18 @@ class KvblockdConnector(_Base):
             return
         computed = int(computed_list[i]) if i < len(computed_list) else 0
         scheduled = int(num_scheduled.get(rid, 0))
-        all_tokens = list(getattr(request, "all_token_ids", None) or [])
-        n_prompt = int(getattr(request, "num_prompt_tokens", len(all_tokens)) or 0)
+        # Cheapest predicate first: `aligned` needs only num_prompt_tokens,
+        # and the pure-decode bail below fires for EVERY running request on
+        # EVERY decode step — materializing list(request.all_token_ids) first
+        # was an O(context) copy per request per step in the scheduling loop
+        # (a 128k-token request copied its whole history to then do nothing).
+        # all_token_ids is materialized ONLY on the paths that emit a row.
+        all_tokens: list | None = None
+        n_prompt = getattr(request, "num_prompt_tokens", None)
+        if n_prompt is None:  # shape-churn fallback: same bytes as before
+            all_tokens = list(getattr(request, "all_token_ids", None) or [])
+            n_prompt = len(all_tokens)
+        n_prompt = int(n_prompt or 0)
         aligned = align_to_block_size(n_prompt, self._block_size)
         if aligned <= 0:
             return
@@ -1060,6 +1300,8 @@ class KvblockdConnector(_Base):
             # Blocks computed during the resume step itself still need a
             # store; everything at/below the loaded range is present.
             store_start = max(load_start + n_load, computed // self._block_size)
+            if all_tokens is None:  # a row is being emitted: NOW pay the copy
+                all_tokens = list(getattr(request, "all_token_ids", None) or [])
             meta.requests.append(
                 KvbReqMeta(
                     req_id=rid,
@@ -1096,6 +1338,8 @@ class KvblockdConnector(_Base):
         # skip rather than guess (a smaller cache, never a wrong byte).
         if not block_ids or len(block_ids) < store_end:
             return
+        if all_tokens is None:  # a row is being emitted: NOW pay the copy
+            all_tokens = list(getattr(request, "all_token_ids", None) or [])
         meta.requests.append(
             KvbReqMeta(
                 req_id=rid,
@@ -1120,6 +1364,7 @@ class KvblockdConnector(_Base):
             self._seeds.pop(rid, None)
             self._blocks.pop(rid, None)
             self._store_holes.pop(rid, None)
+            self._chain_cache.pop(rid, None)  # worker-role instances rely on the FIFO cap
             # Async-lookup abort cleanup (the #42372 leak class): an aborted
             # request must not leave a pending deadline, an unclaimed result,
             # OR a result still on the wire — a pending entry with no result
@@ -1315,7 +1560,7 @@ class KvblockdConnector(_Base):
         seed = self._seed(req.cache_salt, req.mm_ids, req.lora_name)
         start = req.load_start_block
         end = start + req.num_load_blocks
-        keys = block_chain_keys(seed, req.token_ids, self._block_size)[start:end]
+        keys = self._chain_keys(req.req_id, seed, req.token_ids)[start:end]
         # A promised block with no derivable key (token list shorter than the
         # promise) can never be filled — flag it now, don't drop it silently.
         for blk in range(start + len(keys), end):
@@ -1370,11 +1615,14 @@ class KvblockdConnector(_Base):
             path = "per-block"
         if keys:
             self._note_path(path)
+            elapsed = time.monotonic() - t0
+            self.stats.bump("load_count")
+            self.stats.bump("load_time_s", elapsed)
             # Estimator feed: promised minus newly-flagged approximates the
             # delivered blocks (a bid flagged twice undercounts errors, i.e.
             # overstates throughput — the admit-biased direction).
             self._observe_load(len(keys) - (len(self._load_errors) - errs_before),
-                               total, time.monotonic() - t0)
+                               total, elapsed)
 
     def _note_path(self, path: str) -> None:
         """One machine-readable line on the first completed load — the bench
@@ -1515,6 +1763,7 @@ class KvblockdConnector(_Base):
                 self._log.maybe("load-deadline",
                                 f"load deadline exceeded — abandoning {len(keys) - p0} "
                                 f"remaining blocks (recompute) req={req.req_id}")
+                self.stats.bump("load_deadline_aborts")
                 break
             sub = keys[p0:p0 + pass_blocks]
 
@@ -1752,6 +2001,7 @@ class KvblockdConnector(_Base):
                     self._log.maybe("load-deadline",
                                     f"load deadline exceeded — abandoning {n - p1} "
                                     f"remaining blocks (recompute) req={req.req_id}")
+                    self.stats.bump("load_deadline_aborts")
                     break
         except Exception as e:  # noqa: BLE001 — never-raise boundary: engine-side raise (event/submit) flags the whole promise (licensed superset)
             self._log.maybe("load", f"pipelined load failed mid-run req={req.req_id}", e)
@@ -2029,6 +2279,7 @@ class KvblockdConnector(_Base):
         BEFORE any enqueue and before this call returns. The sync is a
         correctness invariant, not tuning — a torn D2H is a wrong byte
         published cache-wide under a content-chained key, never a miss."""
+        self._maybe_stats_summary()
         try:
             metadata = self._get_connector_metadata()
         except Exception:  # noqa: BLE001 — never-raise boundary: missing metadata = nothing to store this step
@@ -2102,7 +2353,7 @@ class KvblockdConnector(_Base):
         prefix = encode_blob_prefix(dtype_name, len(names), self._block_size,
                                     bytes_per_layer, total)
         seed = self._seed(req.cache_salt, req.mm_ids, req.lora_name)
-        keys = block_chain_keys(seed, req.token_ids, self._block_size)
+        keys = self._chain_keys(req.req_id, seed, req.token_ids)
         end = min(req.store_end_block, len(keys), len(req.block_ids))
         hole = self._store_holes.get(req.req_id)
         if hole is not None and end > hole:
@@ -2148,7 +2399,7 @@ class KvblockdConnector(_Base):
         for j in range(start, end):
             buf = self._build_block_blob(req.block_ids[j], names,
                                          bytes_per_layer, prefix, total)
-            if not self._sq_enqueue(keys[j], buf):
+            if not self._sq_enqueue(keys[j], buf, rid=req.req_id):
                 # TAIL-SKIP: block keys are a prefix chain, so once block j is
                 # missing every later block of THIS request is unreachable by
                 # BATCH_EXISTS's consecutive-prefix count — copying/queueing
@@ -2382,7 +2633,7 @@ class KvblockdConnector(_Base):
         never handed over, with their leases still marked in it[3]."""
         for i, it in enumerate(plan.items):
             j, key, buf, slot = it
-            ok = self._sq_enqueue(key, buf, slot)
+            ok = self._sq_enqueue(key, buf, slot, plan.req_id)
             # Settled: on True the queue tuple owns the lease; on False the
             # refusal branch below frees it. Either way the item has left
             # the abandonable window.
@@ -2433,13 +2684,17 @@ class KvblockdConnector(_Base):
         self._store_holes[plan.req_id] = lost[0][0]  # j < any prior hole (end is capped)
 
     def _sq_enqueue(self, key: bytes, buf: bytearray | memoryview,
-                    slot_id: int | None = None) -> bool:
+                    slot_id: int | None = None, rid: str = "") -> bool:
         """Enqueue one owned blob (slot_id set when buf is a pinned store
-        slot: the queue tuple then owns the lease). NEVER blocks and NEVER
-        raises: past the byte budget (or during shutdown) the block is
+        slot: the queue tuple then owns the lease). rid routes the blob to a
+        drain worker (stable hash), so ONE request's blocks always share one
+        worker's FIFO — per-request delivery order is preserved under any
+        worker count. NEVER blocks and NEVER raises: past the byte budget
+        (shared across all workers' queues, or during shutdown) the block is
         dropped and counted — the CALLER frees a refused slot — a lost store
         is a future miss, an engine stall is an incident."""
         n = len(buf)
+        wi = zlib.crc32(rid.encode()) % self._store_workers if rid else 0
         with self._sq_cond:
             if self._store_stop or self._sq_bytes + n > self._cfg.store_queue_bytes:
                 self.dropped_puts += 1
@@ -2447,8 +2702,9 @@ class KvblockdConnector(_Base):
                 dropped, failed, dbytes = (self.dropped_puts, self.failed_puts,
                                            self.dropped_put_bytes)
             else:
-                self._sq.append((key, buf, slot_id))
+                self._sqs[wi].append((key, buf, slot_id))
                 self._sq_bytes += n
+                self.stats.note_hwm(self._sq_bytes)
                 self._sq_cond.notify_all()
                 dropped = None
         if dropped is not None:
@@ -2469,30 +2725,44 @@ class KvblockdConnector(_Base):
         return True
 
     def _store_thread_start(self) -> None:
-        """Lazily start the single "kvb-store" drain thread. Only ever called
+        """Lazily start the "kvb-store" drain worker(s). Only ever called
         from the engine's serving thread (wait_for_save), so the check-then-
-        start needs no extra lock."""
-        t = self._store_thread
-        if t is not None and t.is_alive():
-            return
-        t = threading.Thread(target=self._store_drain, name="kvb-store", daemon=True)
-        self._store_thread = t
-        t.start()
+        start needs no extra lock. Worker 0 keeps the bare "kvb-store" name
+        (tooling greps it); a dead worker (never expected) is restarted."""
+        for i in range(self._store_workers):
+            t = self._store_threads[i]
+            if t is not None and t.is_alive():
+                continue
+            t = threading.Thread(target=self._store_drain, args=(i,),
+                                 name="kvb-store" if i == 0 else f"kvb-store-{i}",
+                                 daemon=True)
+            self._store_threads[i] = t
+            t.start()
 
-    def _store_drain(self) -> None:
-        """FIFO drain loop: pop one staged blob, put it. A CONNECTION-class
+    def _store_drain(self, wi: int = 0) -> None:
+        """FIFO drain loop over THIS worker's deque (requests are hashed to a
+        worker at enqueue, so per-request block order is exactly the single-
+        FIFO order): pop one staged blob, put it. A CONNECTION-class
         failure (daemon gone, breaker window) re-queues the item ONCE at the
-        head and waits out the redial backoff before retrying — a blip costs
-        one backoff window, never the whole backlog burned at one doomed put
-        per item. A SECOND consecutive failure of the same item counts it
-        failed (failed_puts) and moves on (no infinite loop); non-connection
-        failures count immediately. Either way the client is dropped with the
-        same breaker discipline as loads and the thread NEVER dies to an op
-        error, so delivery resumes after a redial. OK_EXISTS = dedup, fine."""
+        head of the SAME deque and waits out the redial backoff before
+        retrying — a blip costs one backoff window, never the whole backlog
+        burned at one doomed put per item. A SECOND consecutive failure of
+        the same item counts it failed (failed_puts) and moves on (no
+        infinite loop) — but ONLY real attempts count: _DialPending (another
+        caller owns the in-flight dial) PARKS the item (requeue, no strike,
+        no attempt telemetry) until the dial resolves, so failed_puts is
+        never inflated with a non-attempt. Non-connection failures count
+        immediately. Either way
+        the client is dropped with the same breaker discipline as loads and
+        the thread NEVER dies to an op error, so delivery resumes after a
+        redial. OK_EXISTS = dedup, fine. All counters/gauges stay under
+        _sq_cond, shared across workers — the disclosure arithmetic is
+        aggregate and worker-count-independent."""
+        q = self._sqs[wi]
         retry_of: bytearray | memoryview | None = None  # the buf that already failed once
         while True:
             with self._sq_cond:
-                while not self._sq and not self._store_stop:
+                while not q and not self._store_stop:
                     self._sq_cond.wait()
                 # Load-priority gate: a load is actively pulling KV, so park
                 # (bounded by the ceiling) before spending wire/GIL on a
@@ -2517,21 +2787,30 @@ class KvblockdConnector(_Base):
                     self._sq_cond.wait(left)
                 if self._loads_inflight == 0:
                     self._drain_park_until = None  # episode over cleanly
-                if self._store_abort or (not self._sq and self._store_stop):
+                if self._store_abort or (not q and self._store_stop):
                     return
-                key, buf, slot_id = self._sq.popleft()
+                key, buf, slot_id = q.popleft()
                 n = len(buf)
                 self._sq_bytes -= n
                 self._sq_inflight += 1
                 self._sq_inflight_bytes += n
             err: BaseException | None = None
+            pt0 = time.monotonic()
             try:
                 self._ensure().put(key, [buf])
             except Exception as e:  # noqa: BLE001 — never let the drain thread die: a lost store is a future miss
                 err = e
+            # A dial owned by another caller is NOT an attempt: no strike, no
+            # attempt telemetry — PARK (requeue unchanged) until it resolves.
+            park = isinstance(err, _DialPending)
+            if not park:
+                # Latency telemetry counts ATTEMPTS (failures included): a
+                # store path that is slow because it is failing must read slow.
+                self.stats.bump("store_count")
+                self.stats.bump("store_time_s", time.monotonic() - pt0)
             requeue = (err is not None
                        and isinstance(err, (ConnectionLost, OSError))
-                       and buf is not retry_of)
+                       and (park or buf is not retry_of))
             with self._sq_cond:
                 self._sq_inflight -= 1
                 self._sq_inflight_bytes -= n
@@ -2547,9 +2826,10 @@ class KvblockdConnector(_Base):
                         self.dropped_puts -= 1
                         self.dropped_put_bytes -= n
                 elif requeue and not self._store_abort:
-                    self._sq.appendleft((key, buf, slot_id))  # keeps the lease
+                    q.appendleft((key, buf, slot_id))  # keeps the lease AND the order
                     self._sq_bytes += n
-                    retry_of = buf
+                    if not park:  # a park is not a strike: leave retry_of as-is
+                        retry_of = buf
                     requeued = True
                 elif not counted_dropped:  # dropped-at-shutdown is not ALSO failed
                     retry_of = None
@@ -2567,14 +2847,34 @@ class KvblockdConnector(_Base):
                 if self._acked_keys is not None:
                     self._acked_keys.add(key)
                 continue
+            if park:
+                if not requeued:
+                    continue  # shutdown raced the park: already disclosed
+                # Hold until the in-flight dial resolves: sit out the breaker
+                # window if one is armed, else short slices — each re-check
+                # is lock-only (_ensure raises _DialPending again while the
+                # dial is still owned), and the dial itself is bounded by
+                # connect_timeout, so the park always terminates.
+                wake = max(self._next_dial, time.monotonic() + _DIAL_PENDING_PARK_S)
+                with self._sq_cond:
+                    while not self._store_stop and not self._store_abort:
+                        left = wake - time.monotonic()
+                        if left <= 0:
+                            break
+                        self._sq_cond.wait(left)
+                continue
             self._log.maybe("store", "kvblockd async store failed", err)
             self._drop_client(err)
             if requeue:
-                # Sit out the redial backoff (and the dial breaker _drop_client
-                # just armed) instead of instantly re-failing the retry. The
-                # deadline loop ignores enqueue wakeups; shutdown's stop/abort
-                # flags cut it short so a flush is never held hostage.
-                wake = max(time.monotonic() + _REDIAL_BACKOFF_S, self._next_dial)
+                # Sit out exactly the dial breaker's window (armed by the
+                # _drop_client above, or by another thread earlier) instead of
+                # a full extra backoff on top of it — the post-blip backlog
+                # hold is the breaker window, no longer. The deadline loop
+                # ignores enqueue wakeups; shutdown's stop/abort flags cut it
+                # short so a flush is never held hostage.
+                wake = self._next_dial
+                if wake <= time.monotonic():
+                    wake = time.monotonic() + _REDIAL_BACKOFF_S
                 with self._sq_cond:
                     while not self._store_stop and not self._store_abort:
                         left = wake - time.monotonic()
@@ -2583,14 +2883,14 @@ class KvblockdConnector(_Base):
                         self._sq_cond.wait(left)
 
     def _store_flush(self, timeout: float) -> int:
-        """Wait (up to timeout) until the queue is empty and nothing is in
-        flight. Returns the number of UNDELIVERED blocks left at timeout."""
+        """Wait (up to timeout) until every worker's queue is empty and
+        nothing is in flight. Returns the UNDELIVERED block count at timeout."""
         deadline = time.monotonic() + timeout
         with self._sq_cond:
-            while self._sq or self._sq_inflight:
+            while any(self._sqs) or self._sq_inflight:
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    return len(self._sq) + self._sq_inflight
+                    return sum(len(q) for q in self._sqs) + self._sq_inflight
                 self._sq_cond.wait(left)
         return 0
 
@@ -2604,12 +2904,15 @@ class KvblockdConnector(_Base):
         with self._sq_cond:
             self._store_stop = True
             self._sq_cond.notify_all()
-        t = self._store_thread
-        if t is not None and t.is_alive():
-            t.join(self._cfg.store_flush_timeout_s)
+        # ONE shared flush budget across every worker's join — N workers must
+        # not multiply the shutdown ceiling.
+        join_by = time.monotonic() + self._cfg.store_flush_timeout_s
+        for t in self._store_threads:
+            if t is not None and t.is_alive():
+                t.join(max(0.0, join_by - time.monotonic()))
         with self._sq_cond:
             self._store_abort = True  # a wedged put must not keep delivering
-            remainder = len(self._sq) + self._sq_inflight
+            remainder = sum(len(q) for q in self._sqs) + self._sq_inflight
             if remainder:
                 self.dropped_puts += remainder
                 self.dropped_put_bytes += self._sq_bytes + self._sq_inflight_bytes
@@ -2622,10 +2925,11 @@ class KvblockdConnector(_Base):
             # started, so no iovec can reference them); an INFLIGHT slot is
             # NEVER freed here — only the drain's reconcile block may, once
             # the put has returned (else a wedged sendmsg still reads it).
-            for _k, _b, sid in self._sq:
-                if sid is not None:
-                    self._store_slot_free.append(sid)
-            self._sq.clear()
+            for q in self._sqs:
+                for _k, _b, sid in q:
+                    if sid is not None:
+                        self._store_slot_free.append(sid)
+                q.clear()
             self._sq_bytes = 0
             self._sq_cond.notify_all()
             dropped, failed, dbytes, deduped = (self.dropped_puts, self.failed_puts,
@@ -2651,7 +2955,7 @@ class KvblockdConnector(_Base):
         prefix = encode_blob_prefix(dtype_name, len(names), self._block_size,
                                     bytes_per_layer, total)
         seed = self._seed(req.cache_salt, req.mm_ids, req.lora_name)
-        keys = block_chain_keys(seed, req.token_ids, self._block_size)
+        keys = self._chain_keys(req.req_id, seed, req.token_ids)
         client = self._ensure()
         end = min(req.store_end_block, len(keys), len(req.block_ids))
         for j in range(req.store_start_block, end):
