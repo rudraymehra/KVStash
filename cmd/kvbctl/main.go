@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/kvstash/kvblockd/pkg/client"
@@ -32,20 +33,40 @@ var version = "dev"
 
 // common holds the flags every subcommand shares.
 type common struct {
-	addr    string
-	token   string
-	ns      string
-	timeout time.Duration
-	hexKeys bool
+	addr      string
+	token     string
+	tokenFile string
+	ns        string
+	timeout   time.Duration
+	hexKeys   bool
 }
 
 // register wires the shared flags into a subcommand's FlagSet.
 func (c *common) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.addr, "addr", "127.0.0.1:9440", "daemon address")
-	fs.StringVar(&c.token, "token", "", "bearer token")
+	fs.StringVar(&c.token, "token", "", "bearer token (VISIBLE in ps/shell history — smoke use only; prefer -token-file or KVBCTL_TOKEN)")
+	fs.StringVar(&c.tokenFile, "token-file", "", "file holding the bearer token (keeps the credential out of argv; matches the admin plane)")
 	fs.StringVar(&c.ns, "ns", "", "namespace")
 	fs.DurationVar(&c.timeout, "timeout", 10*time.Second, "dial/request timeout")
 	fs.BoolVar(&c.hexKeys, "hex", false, "key args are 64-char hex [32]byte literals (default: sha256 of the arg)")
+}
+
+// resolveToken picks the credential by precedence flag > file > KVBCTL_TOKEN.
+// The token grants full namespace data access, so it must never be forced
+// through argv (ps output, shell history, process accounting all see argv) —
+// -token stays only as the documented smoke-use escape hatch.
+func (c *common) resolveToken() (string, error) {
+	if c.token != "" {
+		return c.token, nil
+	}
+	if c.tokenFile != "" {
+		b, err := os.ReadFile(c.tokenFile) //nolint:gosec // G304: operator-supplied path (same posture as the admin plane's -token-file)
+		if err != nil {
+			return "", fmt.Errorf("-token-file: %w", err)
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	return os.Getenv("KVBCTL_TOKEN"), nil
 }
 
 // key derives the [32]byte block key from a CLI argument.
@@ -64,10 +85,14 @@ func (c *common) key(arg string) ([32]byte, error) {
 
 // dial opens a single-stream client with the shared options.
 func (c *common) dial(ctx context.Context) (*client.Client, error) {
+	tok, err := c.resolveToken()
+	if err != nil {
+		return nil, err
+	}
 	return client.Dial(ctx, c.addr, client.Options{
 		Streams:     1,
 		Namespace:   c.ns,
-		Token:       c.token,
+		Token:       tok,
 		DialTimeout: c.timeout,
 	})
 }
@@ -85,7 +110,9 @@ Usage:
   kvbctl quota set [flags]              per-tier tenant quota (admin socket)
   kvbctl version                        print version
 
-Shared flags: -addr -token -ns -timeout -hex   (see 'kvbctl CMD -h')
+Shared flags: -addr -token-file -ns -timeout -hex   (see 'kvbctl CMD -h')
+Token sources, by precedence: -token (smoke use ONLY — argv is visible in ps
+and shell history) > -token-file > KVBCTL_TOKEN.
 `)
 	os.Exit(2)
 }
