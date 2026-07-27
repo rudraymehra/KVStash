@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -29,14 +30,51 @@ import (
 // "dev" means a non-release build.
 var version = "dev"
 
-func main() {
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "kvblockd:", err)
-		os.Exit(1)
+// errDegradedShutdown marks a shutdown that abandoned resources to process
+// exit (data-plane drain or s3compat handlers outliving their grace). It maps
+// to its own exit code so systemd/monitoring can tell degraded from clean (0)
+// and from startup failure (1).
+var errDegradedShutdown = errors.New("degraded shutdown")
+
+const exitDegradedShutdown = 3
+
+func exitCode(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, errDegradedShutdown):
+		return exitDegradedShutdown
+	default:
+		return 1
 	}
 }
 
-func run() error {
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "kvblockd:", err)
+		os.Exit(exitCode(err))
+	}
+}
+
+// cleanupStack is run()'s shutdown ordering, declared ONCE at startup:
+// each subsystem pushes its release as it starts and the single deferred
+// run executes in reverse (acquire/release symmetry) on every path —
+// early error return, degraded shutdown, clean exit. The alternative —
+// re-deriving stop order by hand in every error branch — is how the
+// spiller once outlived the store it serves by an accident of defer
+// ordering.
+type cleanupStack struct{ steps []func() }
+
+func (c *cleanupStack) push(f func()) { c.steps = append(c.steps, f) }
+
+func (c *cleanupStack) run() {
+	for i := len(c.steps) - 1; i >= 0; i-- {
+		c.steps[i]()
+	}
+	c.steps = nil
+}
+
+func run() (err error) {
 	cfgPath := flag.String("config", "", "path to config YAML (empty = built-in defaults)")
 	listen := flag.String("listen", "", "override listen_addr")
 	namespaces := flag.String("namespaces", "", "override namespaces_path")
@@ -89,37 +127,48 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Eviction: policy attach + the watermark goroutine. stopEvict must run
-	// before EVERY store close (and on the drain-timeout path too) so no
-	// eviction free races the arena unmap; it is safe to call repeatedly.
-	stopEvict := func() {}
+	// The LIFO cleanup stack (see the type). closeStore is the ONE step with
+	// per-path judgement: a failed drain leaves arena views (and pooled read
+	// buffers) referenced by peers, so the degraded paths set skipStoreClose
+	// and let process exit reclaim — unmapping then could send unrelated
+	// process memory to a peer.
+	var cleanup cleanupStack
+	defer cleanup.run()
+	skipStoreClose := false
+	closeStore := dstore.Close
+	cleanup.push(func() {
+		if skipStoreClose {
+			return
+		}
+		if cerr := closeStore(); cerr != nil && err == nil {
+			err = fmt.Errorf("store close: %w", cerr)
+		}
+	})
+
+	// Eviction: policy attach + the watermark goroutine. Its stop step runs
+	// before every store close (LIFO) so no eviction free races the arena
+	// unmap.
 	var pol eviction.Policy
 	if cfg.EvictionPolicy != "none" {
 		ghost := cfg.EvictionGhostEntries
 		if ghost == 0 {
 			// Auto ceiling: one fingerprint per conceivable resident block
 			// (arena / 64 KiB) — the policy itself stays arena-ignorant.
+			// This is a CEILING, not a grant: each domain's ring tracks its
+			// observed residency (mainHi, decayed per epoch), so tenant
+			// churn no longer accumulates the sum of per-tenant peaks.
 			ghost = int(cfg.DramArenaBytes >> 16)
 		}
 		var perr error
 		pol, perr = eviction.New(cfg.EvictionPolicy, ghost)
 		if perr != nil {
-			_ = dstore.Close()
 			return perr
 		}
 		dstore.AttachPolicy(pol)
-		stopOnce := dstore.StartEvictor(ctx, dram.EvictorConfig{
+		cleanup.push(dstore.StartEvictor(ctx, dram.EvictorConfig{
 			WatermarkPct: cfg.EvictionWatermarkPct,
 			BatchPct:     cfg.EvictionBatchPct,
-		})
-		var stopped bool
-		stopEvict = func() {
-			if !stopped {
-				stopped = true
-				stopOnce()
-			}
-		}
-		defer stopEvict()
+		}))
 		fmt.Fprintln(os.Stderr, "kvblockd: eviction policy", pol.Name(),
 			"watermark", cfg.EvictionWatermarkPct, "batch", cfg.EvictionBatchPct)
 	}
@@ -129,18 +178,11 @@ func run() error {
 	// tiered orchestrator on top. The server sees ONE store either way.
 	var srvStore server.Store = dstore
 	statsFn := dstore.Stats
-	closeStore := dstore.Close
-	stopTier := func() {}
 	if len(cfg.NvmePaths) > 0 {
 		vols := make([]*nvme.Volume, 0, len(cfg.NvmePaths))
 		reports := make([]*nvme.RecoveryReport, 0, len(cfg.NvmePaths))
 		recovered := make([][]nvme.RecoveredEntry, 0, len(cfg.NvmePaths))
 		perVol := cfg.NvmeMaxBytes / int64(len(cfg.NvmePaths))
-		closeVols := func() {
-			for _, v := range vols {
-				_ = v.Close()
-			}
-		}
 		for _, dir := range cfg.NvmePaths {
 			v, rep, ents, verr := nvme.OpenVolume(nvme.VolumeParams{
 				Dir:            dir,
@@ -152,11 +194,17 @@ func run() error {
 				MaxBlobLen:     cfg.MaxBlobLen,
 			})
 			if verr != nil {
-				closeVols()
-				stopEvict()
-				_ = dstore.Close()
 				return fmt.Errorf("nvme volume %s: %w", dir, verr)
 			}
+			// Volume.Close is idempotent: once the tiered store owns the
+			// volumes its Close (the closeStore step) closes them too; this
+			// step covers the error paths before that ownership transfer and
+			// honors skipStoreClose for the same reader-held-buffer reason.
+			cleanup.push(func() {
+				if !skipStoreClose {
+					_ = v.Close()
+				}
+			})
 			fmt.Fprintf(os.Stderr, "kvblockd: nvme volume %s recovered: %d segments scanned, %d blocks, %d bytes truncated, %s\n",
 				dir, rep.SegmentsScanned, rep.BlocksRecovered, rep.BytesTruncated, rep.Duration)
 			vols = append(vols, v)
@@ -172,14 +220,21 @@ func run() error {
 			}
 			api, aerr := s3spill.NewClient(ctx, s3cfg)
 			if aerr != nil {
-				closeVols()
-				stopEvict()
-				_ = dstore.Close()
 				return fmt.Errorf("s3 tier: %w", aerr)
 			}
 			sp := s3spill.NewSpiller(api, s3cfg, cfg.S3SpillQueue)
-			defer sp.Close()
-			spillB, restoreB = sp, s3spill.NewRestorer(api, s3cfg)
+			// Pushed AFTER the volume steps and BEFORE the tier's stop: LIFO
+			// then closes the spiller after the movers stop feeding it and
+			// before the store (and its segment files) goes away — the
+			// spiller once outlived the store by an accident of defer order.
+			cleanup.push(sp.Close)
+			rst := s3spill.NewRestorer(api, s3cfg)
+			// Same slot: a belt-cut restore's DETACHED download can still be
+			// running after the tier movers stop — this drain keeps it from
+			// outliving process teardown (its adopt into an already-closed
+			// volume is refused and discarded; see nvme.AdoptSegment).
+			cleanup.push(rst.Close)
+			spillB, restoreB = sp, rst
 			fmt.Fprintln(os.Stderr, "kvblockd: s3 tier on", cfg.S3Bucket, "node", cfg.S3NodeID)
 		}
 		tiered := store.NewTiered(dstore, pol, vols, reports, recovered, store.Params{
@@ -196,15 +251,9 @@ func run() error {
 			Restore:        restoreB,
 			S3ReadTimeout:  time.Duration(cfg.S3ReadTimeoutMS) * time.Millisecond,
 		})
-		stopT := tiered.Start(ctx)
-		var tierStopped bool
-		stopTier = func() {
-			if !tierStopped {
-				tierStopped = true
-				stopT()
-			}
-		}
-		defer stopTier()
+		// The tier movers stop strictly before the spiller/volumes/store
+		// close (LIFO): the demoter releases its arena holds first.
+		cleanup.push(tiered.Start(ctx))
 		srvStore, statsFn, closeStore = tiered, tiered.Stats, tiered.Close
 		fmt.Fprintln(os.Stderr, "kvblockd: nvme tier on", len(vols), "volume(s),",
 			cfg.NvmeMaxBytes, "bytes budget, demote at", cfg.NvmeDemoteWatermarkPct, "%")
@@ -221,12 +270,9 @@ func run() error {
 		admin := server.NewAdminServer(ns.Registry(), quotas, cfg.DramArenaBytes)
 		aBound, aWait, aErr := admin.Serve(ctx, cfg.AdminAddr)
 		if aErr != nil {
-			stopTier()
-			stopEvict()
-			_ = closeStore()
 			return fmt.Errorf("admin endpoint: %w", aErr)
 		}
-		defer func() { stop(); aWait() }()
+		cleanup.push(func() { stop(); aWait() })
 		fmt.Fprintln(os.Stderr, "kvblockd: admin on", aBound)
 	}
 	if cfg.MetricsAddr != "" {
@@ -236,25 +282,21 @@ func run() error {
 					"is not loopback — /debug/pprof (heap, CPU, cmdline) is exposed unauthenticated on it")
 			}
 		}
-		bound, wait, err := set.Serve(ctx, cfg.MetricsAddr)
-		if err != nil {
-			stopTier()
-			stopEvict()
-			_ = closeStore()
-			return fmt.Errorf("metrics endpoint: %w", err)
+		bound, wait, serr := set.Serve(ctx, cfg.MetricsAddr)
+		if serr != nil {
+			return fmt.Errorf("metrics endpoint: %w", serr)
 		}
-		// Defers run LIFO: cancel the signal ctx BEFORE blocking on the ops
+		// The step cancels the signal ctx BEFORE blocking on the ops
 		// endpoint's shutdown, or an early error return (data port in use)
 		// deadlocks in wait() with nothing ever cancelling ctx.
-		defer func() { stop(); wait() }()
+		cleanup.push(func() { stop(); wait() })
 		fmt.Fprintln(os.Stderr, "kvblockd: metrics on", bound)
 	}
 
 	// S3-compat endpoint (s3compat_addr set): the NIXL obj / vLLM obj
 	// zero-code path, on the SAME store and tenant table as the data plane.
-	// Its handlers read the store, so the CLEAN shutdown path below must wait
-	// for them before closeStore — the drain-before-Close rule again.
-	s3wait := func() bool { return true }
+	// Its handlers read the store, so its cleanup step must complete before
+	// closeStore (LIFO guarantees it) — the drain-before-Close rule again.
 	if cfg.S3CompatAddr != "" {
 		if host, _, herr := net.SplitHostPort(cfg.S3CompatAddr); herr == nil {
 			if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
@@ -263,28 +305,38 @@ func run() error {
 			}
 		}
 		s3 := server.NewS3Compat(cfg, srvStore, ns)
-		bound, wait, err := s3.Serve(ctx, cfg.S3CompatAddr)
-		if err != nil {
-			stopTier()
-			stopEvict()
-			_ = closeStore()
-			return fmt.Errorf("s3compat endpoint: %w", err)
+		s3.SetRecorder(set) // obj-client traffic feeds the same meters as the wire plane
+		bound, wait, serr := s3.Serve(ctx, cfg.S3CompatAddr)
+		if serr != nil {
+			return fmt.Errorf("s3compat endpoint: %w", serr)
 		}
-		s3wait = wait
-		// Early-error/timeout paths: cancel ctx, then reap the listener
-		// goroutines (waiting twice is safe — both channels are closed).
-		defer func() { stop(); _ = s3wait() }()
+		// The s3compat server counts as one more reader population: an HTTP
+		// handler outliving the shutdown grace (possibly mid-Get) gets the
+		// same treatment as a failed Drain — skip the close, let process
+		// exit reclaim, and exit degraded so monitoring sees it.
+		cleanup.push(func() {
+			stop()
+			if !wait() {
+				fmt.Fprintln(os.Stderr, "kvblockd: s3compat shutdown timed out — leaving the store open for process exit")
+				skipStoreClose = true
+				if err == nil {
+					err = fmt.Errorf("%w: s3compat handlers outlived the shutdown grace", errDegradedShutdown)
+				}
+			}
+		})
 		fmt.Fprintln(os.Stderr, "kvblockd: s3compat on", bound)
 	}
 
-	if _, err := srv.Start(ctx); err != nil {
-		stopTier()
-		stopEvict()
-		_ = closeStore()
-		return err
+	if _, serr := srv.Start(ctx); serr != nil {
+		return serr
 	}
 	set.SetReady() // arena prefaulted (NewArena) and listener accepting
 	<-ctx.Done()
+	// Deregister the signal handlers NOW: the ctx is already cancelled, so
+	// the only thing continued registration buys is swallowing the
+	// operator's second Ctrl-C during a hung shutdown — restore default
+	// disposition so it kills the process.
+	stop()
 	fmt.Fprintln(os.Stderr, "kvblockd: draining...")
 	drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -293,23 +345,14 @@ func run() error {
 		// Unmapping now could send unrelated process memory to that peer —
 		// skip the unmap; the process exit reclaims everything anyway (open
 		// segment fds included; kill -9 is the recovery path's whole job).
+		// The cleanup stack still stops the movers/evictor/listeners.
 		fmt.Fprintln(os.Stderr, "kvblockd: drain timed out — leaving the arena mapped for process exit")
-		stopTier()
-		stopEvict()
-		return nil
+		skipStoreClose = true
+		return fmt.Errorf("%w: data-plane drain timed out", errDegradedShutdown)
 	}
-	// Strictly AFTER a SUCCESSFUL Drain: stop the tier movers (the demoter
-	// releases its arena holds), then the evictor, then close — volumes
-	// first (writer drain + final sync), dram arena last. The s3compat
-	// server counts as one more reader population: a false from its wait
-	// (an HTTP handler outliving the shutdown grace, possibly mid-Get)
-	// gets the same treatment as a failed Drain — skip the close, let
-	// process exit reclaim.
-	stopTier()
-	stopEvict()
-	if !s3wait() {
-		fmt.Fprintln(os.Stderr, "kvblockd: s3compat shutdown timed out — leaving the store open for process exit")
-		return nil
-	}
-	return closeStore()
+	// Clean path: the deferred cleanup stack runs everything in reverse —
+	// listeners (s3compat wait included), tier movers (the demoter releases
+	// its arena holds), evictor, then close: volumes first (writer drain +
+	// final sync), dram arena last.
+	return nil
 }
