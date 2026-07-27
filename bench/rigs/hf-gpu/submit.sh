@@ -18,7 +18,17 @@
 # KV_CACHE_DTYPE (vLLM --kv-cache-dtype; same dtype feeds BOTH arms of a run
 # and stamps every record — the fp8 disclosure rule), FP8_PREFLIGHT (comma
 # dtype list or 1: probe-only job, FP8PROBE verdict lines, exits before any
-# measured run).
+# measured run), EQUIV_N (token-identity prompts around the restart; job.sh
+# defaults it to 8 on fp8 runs — the certification gate), FP8_CAMPAIGN
+# (1 = ONE command submits the WHOLE certifiable fp8 story: the two-phase
+# job — cold + warm arms, fp8 in both engine boots, token-identity hard
+# gate — AND the pure-recompute baseline job under the SAME dtype, so all
+# three chart arms share one kv_cache_dtype and the multiple measures the
+# store, never the quantizer; each job runs its own fresh daemon — arms
+# never share a store, and the fp8 keyspace forks from bf16 by fingerprint;
+# a caller-set EQUIV_N goes to the two-phase job ONLY — the baseline control
+# has no store to certify against — and an explicit EQUIV_N=0 is refused at
+# submit time: it would strip the campaign's token-identity certification).
 #
 # The job container clones the PUBLIC repo tarball at GIT_REF — local
 # uncommitted changes are NOT visible to the job; push first.
@@ -38,6 +48,30 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"           # optional; job.sh derives it from 
 RESULTS_REPO="${RESULTS_REPO:-}"   # optional: HF dataset repo to receive the JSONL
 
 [[ -x "$HF_BIN" ]] || { echo "hf CLI not found at $HF_BIN (set HF_BIN)" >&2; exit 1; }
+
+# ---- FP8 campaign mode: one command -> two jobs, three same-dtype arms -------
+FP8_CAMPAIGN="${FP8_CAMPAIGN:-0}"
+if [[ "$FP8_CAMPAIGN" == "1" ]]; then
+  if [[ "${BASELINE_ONLY:-0}" == "1" ]]; then
+    echo "refusing: FP8_CAMPAIGN=1 submits its own baseline job — drop BASELINE_ONLY=1" >&2; exit 1
+  fi
+  if [[ -n "${FP8_PREFLIGHT:-}" ]]; then
+    echo "refusing: FP8_PREFLIGHT is a probe job; run it (and read its FP8PROBE verdicts) BEFORE spending on a campaign" >&2; exit 1
+  fi
+  # e4m3 is the default on purpose: vLLM's published accuracy campaign backs
+  # it. (The bare 'fp8' alias is fine too — job.sh normalizes the stamp.)
+  KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
+  case "$KV_CACHE_DTYPE" in
+    fp8*) ;;
+    *) echo "refusing: FP8_CAMPAIGN=1 with KV_CACHE_DTYPE='$KV_CACHE_DTYPE' (not an fp8 dtype)" >&2; exit 1;;
+  esac
+  # EQUIV_N=0 would silently strip the token-identity certification from the
+  # campaign's fp8 two-phase job (job.sh defaults it to 8 there) — the whole
+  # point of the campaign is the certifiable run, so refuse before billing.
+  if [[ "${EQUIV_N:-}" == "0" ]]; then
+    echo "refusing: FP8_CAMPAIGN=1 with EQUIV_N=0 strips the token-identity certification from the fp8 two-phase job — drop EQUIV_N (job.sh defaults it to 8) or set it >0" >&2; exit 1
+  fi
+fi
 
 # ---- refuse incoherent knobs BEFORE billing starts --------------------------
 # Run 3 passed LENGTHS=...,32000 while the job's MAX_MODEL_LEN default was
@@ -74,26 +108,63 @@ curl -fsSL "https://codeload.github.com/rudraymehra/KVStash/tar.gz/${GIT_REF}" |
 mv KVStash-* kvstash
 bash /work/kvstash/bench/rigs/hf-gpu/job.sh'
 
-CMD=("$HF_BIN" jobs run
-  --name "${JOB_NAME:-chart2-ttft}"
-  --flavor "$FLAVOR"
-  --timeout "$TIMEOUT"
-  --detach
-  --secrets HF_TOKEN
-  -e GIT_REF="$GIT_REF"
-  -e MODEL="$MODEL"
-  -e LENGTHS="$LENGTHS"
-  -e REPS="$REPS"
-  -e GEN_TOKENS="$GEN_TOKENS"
-  -e FLAVOR="$FLAVOR")
-# optional knobs: forward only when the caller set them (job.sh has the defaults/derivations)
-for v in MAX_MODEL_LEN GPU_MEM_UTIL WARMUP KVBD_ARENA_BYTES CONNECTOR_STAGING_GB KVBD_STORE_QUEUE_BYTES KV_BYTES_PER_TOKEN RESULTS_REPO BASELINE_ONLY HF_OVERRIDES KV_CACHE_DTYPE FP8_PREFLIGHT; do
-  if [[ -n "${!v:-}" ]]; then CMD+=(-e "$v=${!v}"); fi
-done
-CMD+=("$IMAGE" /bin/bash -c "$BOOTSTRAP")
+mk_cmd() {  # $1 = job name; reads the CURRENT env (incl. BASELINE_ONLY)
+  CMD=("$HF_BIN" jobs run
+    --name "$1"
+    --flavor "$FLAVOR"
+    --timeout "$TIMEOUT"
+    --detach
+    --secrets HF_TOKEN
+    -e GIT_REF="$GIT_REF"
+    -e MODEL="$MODEL"
+    -e LENGTHS="$LENGTHS"
+    -e REPS="$REPS"
+    -e GEN_TOKENS="$GEN_TOKENS"
+    -e FLAVOR="$FLAVOR")
+  # optional knobs: forward only when the caller set them (job.sh has the defaults/derivations)
+  local v
+  for v in MAX_MODEL_LEN GPU_MEM_UTIL WARMUP KVBD_ARENA_BYTES CONNECTOR_STAGING_GB KVBD_STORE_QUEUE_BYTES KV_BYTES_PER_TOKEN RESULTS_REPO BASELINE_ONLY HF_OVERRIDES KV_CACHE_DTYPE FP8_PREFLIGHT EQUIV_N; do
+    if [[ -n "${!v:-}" ]]; then CMD+=(-e "$v=${!v}"); fi
+  done
+  CMD+=("$IMAGE" /bin/bash -c "$BOOTSTRAP")
+}
 
-echo "== hf jobs command =="
-printf ' %q' "${CMD[@]}"; echo; echo
+# job specs: "<name>|<BASELINE_ONLY override or empty>". The single-job path
+# is byte-for-byte the old behavior; the campaign adds the same-dtype
+# baseline control as its second submission (two-phase first).
+JOB_SPECS=("${JOB_NAME:-chart2-ttft}|")
+if [[ "$FP8_CAMPAIGN" == "1" ]]; then
+  CAMPAIGN_TAG="${JOB_NAME:-chart2-fp8}"
+  JOB_SPECS=("${CAMPAIGN_TAG}-twophase|" "${CAMPAIGN_TAG}-baseline|1")
+fi
+
+# Per-spec env is set UNCONDITIONALLY from a snapshot of the caller's values.
+# Both loops below call this: a set-only guard here once let the preview
+# loop's baseline spec leak BASELINE_ONLY=1 into the submission loop's
+# two-phase job — both billed jobs ran as pure-recompute baselines, and the
+# echoed preview (printed before the pollution) could not show it.
+ORIG_BASELINE_ONLY="${BASELINE_ONLY:-}"
+ORIG_EQUIV_N="${EQUIV_N:-}"
+apply_spec() {  # $1 = "<name>|<BASELINE_ONLY override>"; sets name, BASELINE_ONLY, EQUIV_N
+  name="${1%%|*}"
+  local b="${1#*|}"
+  BASELINE_ONLY="${b:-$ORIG_BASELINE_ONLY}"
+  if [[ "$FP8_CAMPAIGN" == "1" && "$BASELINE_ONLY" == "1" ]]; then
+    # The campaign's baseline control never gets EQUIV_N: job.sh refuses
+    # EQUIV_N>0 + BASELINE_ONLY=1 inside the billed container (no store to
+    # prove token identity against).
+    EQUIV_N=""
+  else
+    EQUIV_N="$ORIG_EQUIV_N"
+  fi
+}
+
+echo "== hf jobs command(s) =="
+for spec in "${JOB_SPECS[@]}"; do
+  apply_spec "$spec"
+  mk_cmd "$name"
+  printf ' %q' "${CMD[@]}"; echo; echo
+done
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   echo "DRY_RUN=1 — nothing submitted."
@@ -101,24 +172,39 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
 fi
 
 echo "flavor $FLAVOR is billed per minute (a10g-small was \$1.00/hr; a10g-large costs more — check current HF Jobs pricing)."
-echo "expected run <1h (two vLLM boots: populate, then a fresh measure engine); timeout $TIMEOUT caps the spend."
+echo "expected run <1h per job (two vLLM boots: populate, then a fresh measure engine); timeout $TIMEOUT caps the spend."
+if [[ "$FP8_CAMPAIGN" == "1" ]]; then
+  echo "FP8_CAMPAIGN=1: TWO jobs (two-phase + baseline control), both kv_cache_dtype=$KV_CACHE_DTYPE — ~2x the single-job cost."
+fi
 if [[ "${KVB_SUBMIT_N_CONFIRMED:-0}" == "1" ]]; then
   echo "KVB_SUBMIT_N_CONFIRMED=1 — confirmation was given upstream (submit-n.sh batch)."
 else
-  read -r -p "Submit and start billing? [y/N] " ans
+  read -r -p "Submit ${#JOB_SPECS[@]} job(s) and start billing? [y/N] " ans
   [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "aborted."; exit 1; }
 fi
 
-JOB_OUT="$("${CMD[@]}")"
-echo "$JOB_OUT"
-JOB_ID="$(printf '%s\n' "$JOB_OUT" | tail -n1 | awk '{print $NF}')"  # --detach prints the Job ID
-echo "submitted: $JOB_ID"
+JOB_IDS=()
+for spec in "${JOB_SPECS[@]}"; do
+  apply_spec "$spec"
+  mk_cmd "$name"
+  JOB_OUT="$("${CMD[@]}")"
+  echo "$JOB_OUT"
+  JOB_ID="$(printf '%s\n' "$JOB_OUT" | tail -n1 | awk '{print $NF}')"  # --detach prints the Job ID
+  echo "submitted: $JOB_ID"
+  JOB_IDS+=("$JOB_ID")
+done
 echo
-echo "follow logs:     $HF_BIN jobs logs -f $JOB_ID"
-echo "check status:    $HF_BIN jobs inspect $JOB_ID"
-echo "cancel:          $HF_BIN jobs cancel $JOB_ID"
+for JOB_ID in "${JOB_IDS[@]}"; do
+  echo "follow logs:     $HF_BIN jobs logs -f $JOB_ID"
+done
+echo "check status:    $HF_BIN jobs inspect <job_id>"
+echo "cancel:          $HF_BIN jobs cancel <job_id>"
 # The sed requires a '{' after the marker (drops the job's own hint line and
 # any prose mentioning the marker); selftest stub records are already renamed
 # SELFTESTJSONL by job.sh.
-echo "fetch results:   mkdir -p bench/results/rig-e && $HF_BIN jobs logs $JOB_ID | sed -n 's/^.*CHART2JSONL \\({.*\\)$/\\1/p' > bench/results/rig-e/chart2-ttft.jsonl"
+echo "fetch results:   mkdir -p bench/results/rig-e && $HF_BIN jobs logs ${JOB_IDS[0]} | sed -n 's/^.*CHART2JSONL \\({.*\\)$/\\1/p' > bench/results/rig-e/chart2-ttft.jsonl"
+if [[ "$FP8_CAMPAIGN" == "1" ]]; then
+  echo "                 (repeat for the baseline job ${JOB_IDS[1]:-<baseline_id>} into its own file; plot both together — same dtype, so the mixed-dtype refusal stays quiet)"
+  echo "token identity:  $HF_BIN jobs logs ${JOB_IDS[0]} | sed -n 's/^.*EQUIVJSONL \\({.*\\)$/\\1/p' > bench/results/rig-e/chart2-fp8-equivalence.jsonl"
+fi
 echo "render chart:    python3 bench/report/plot.py chart2 --in bench/results/rig-e/chart2-ttft.jsonl --out chart2.png"

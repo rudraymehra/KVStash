@@ -42,7 +42,10 @@ weaker than claimed — some compare prompts could not be attributed to
 kvblockd (equivalence proven only against recompute, not against the store)
 or were compared at text level only (the server elided logprobs.tokens).
 2 = phase-level failure (severed store path, bad state, prompt calibration
-could not land exactly).
+could not land exactly, or a cross-dtype compare — the state records the
+engine kv-cache dtype and compare REFUSES a mismatch: an fp8 arm's
+equivalence claim is fp8-vs-fp8, never fp8-vs-bf16, and every record is
+labeled with that scope).
 
 `--selftest` proves the exact-landing calibration, the equality gate, the
 first-divergence report, the store receipt, the attribution rule, and the
@@ -193,6 +196,19 @@ def expected_hit_blocks(prompt_tokens: int, block_size: int) -> int:
     return (prompt_tokens - 1) // block_size * block_size // block_size
 
 
+def equivalence_scope(kv_cache_dtype: str) -> str:
+    """The greppable disclosure label stamped into every record: WHAT was
+    proven equal to what. Both phases run one engine config (the harness
+    feeds the same --kv-cache-dtype to record and compare, and the compare
+    phase refuses a mismatch), so the claim is always same-dtype. For fp8
+    engines it is spelled out as fp8-vs-fp8 — the fp8 arm's token-identity
+    story is fp8 reload vs fp8 recompute, NEVER fp8 vs bf16 recompute."""
+    if kv_cache_dtype.startswith("fp8"):
+        return (f"fp8-vs-fp8 (both phases kv_cache_dtype={kv_cache_dtype}; "
+                "never fp8-vs-bf16)")
+    return f"same-dtype ({kv_cache_dtype}-vs-{kv_cache_dtype})"
+
+
 def boundary_lengths(block_size: int, multiples: list[int],
                      extra: list[int]) -> list[int]:
     """Adversarial targets: m*B-1 / m*B / m*B+1 for each multiple, plus the
@@ -240,7 +256,8 @@ def run_record(args) -> int:
         return 2
     print(f"[record] n={args.n} prompts over lengths {lengths} "
           f"(block_size={args.block_size}, seed={args.seed}, "
-          f"gen_tokens={args.gen_tokens})", flush=True)
+          f"gen_tokens={args.gen_tokens}, kv_cache_dtype={args.kv_cache_dtype})",
+          flush=True)
     state = {
         "state_schema": 1,
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -248,6 +265,9 @@ def run_record(args) -> int:
         "seed": args.seed,
         "gen_tokens": args.gen_tokens,
         "block_size": args.block_size,
+        # The engine KV dtype this state was recorded under: the compare
+        # phase REFUSES a mismatch (fp8-vs-bf16 is not an equivalence claim).
+        "kv_cache_dtype": args.kv_cache_dtype,
         "entries": [],
     }
     for i in range(args.n):
@@ -297,6 +317,22 @@ def run_compare(args, stamp: dict) -> int:
         print(f"FATAL(compare): state recorded model {state.get('model')!r}, "
               f"compare asked for {args.model!r}", file=sys.stderr)
         return 2
+    # Dtype coherence gate (fp8 disclosure rule): the recorded tokens and the
+    # replayed tokens must come from the SAME engine KV dtype. A cross-dtype
+    # compare would either (a) mismatch and mislabel quantization drift as
+    # store corruption, or worse (b) match and be quotable as "fp8 outputs
+    # equal bf16 recompute" — a claim this suite must be UNABLE to produce.
+    # States predating the field are the auto-bf16 era (rig convention).
+    state_dtype = state.get("kv_cache_dtype", "auto-bf16")
+    if state_dtype != args.kv_cache_dtype:
+        print(f"FATAL(compare): state was recorded under kv_cache_dtype="
+              f"{state_dtype!r} but compare is running under "
+              f"{args.kv_cache_dtype!r} — cross-dtype token equivalence "
+              "(fp8-vs-bf16) is not the claim this suite makes; the fp8 story "
+              "is fp8-vs-fp8: rerun both phases under one engine dtype.",
+              file=sys.stderr)
+        return 2
+    scope = equivalence_scope(args.kv_cache_dtype)
     seed, gen_tokens = state["seed"], state["gen_tokens"]
     block_size = state["block_size"]
     entries = state["entries"]
@@ -320,6 +356,10 @@ def run_compare(args, stamp: dict) -> int:
                "target_tokens": e["target_tokens"],
                "prompt_tokens": e["prompt_tokens"]}
         rec.update(stamp)
+        # AFTER the stamp: these two are checked against the state above, so
+        # a harness stamp can never overwrite them with a prettier story.
+        rec["kv_cache_dtype"] = args.kv_cache_dtype
+        rec["equivalence_scope"] = scope
         # equality: token-level when both sides have token lists, else text
         if e["tokens"] is not None and r["tokens"] is not None:
             div = first_divergence(e["tokens"], r["tokens"])
@@ -371,6 +411,8 @@ def run_compare(args, stamp: dict) -> int:
                # says "unverified".
                "isolation": "unverified"}
     summary.update(stamp)
+    summary["kv_cache_dtype"] = args.kv_cache_dtype  # state-checked, post-stamp
+    summary["equivalence_scope"] = scope
     emit(summary)
     if args.out:
         # One shot at the end; the marker lines above are the streaming
@@ -516,7 +558,8 @@ def selftest() -> int:
              "gen_tokens": 6, "seed": 0, "block_size": 12,
              "boundary_multiples": "8", "lengths": "120", "state": "",
              "out": "", "min_match": 100.0, "put_wait_s": 0.6,
-             "request_timeout": 15.0, "print_prefix": PRINT_PREFIX}
+             "request_timeout": 15.0, "print_prefix": PRINT_PREFIX,
+             "kv_cache_dtype": "auto-bf16"}
         d.update(kw)
         return argparse.Namespace(**d)
 
@@ -657,6 +700,49 @@ def selftest() -> int:
             print("[selftest] text-fallback compare: rc=3, 4/4 text-matched but "
                   "counted as fallback; stamped isolation honored")
         ctl["elide_logprobs"] = False
+
+        # 8) fp8 disclosure labeling: a run recorded AND compared under an
+        # fp8 engine dtype must label every record/summary fp8-vs-fp8 (the
+        # only equivalence story the fp8 arm may tell) and carry the dtype.
+        ctl["on_completion"] = "store"
+        fp8_state = os.path.join(tmp, "fp8-state.json")
+        rc = run_record(mkargs(state=fp8_state, kv_cache_dtype="fp8_e4m3"))
+        if rc != 0:
+            print(f"FAIL: fp8 record rc={rc}", file=sys.stderr)
+            ok = False
+        ctl["on_completion"] = "hit"
+        out_fp8 = os.path.join(tmp, "fp8.jsonl")
+        rc = run_compare(mkargs(state=fp8_state, out=out_fp8,
+                                kv_cache_dtype="fp8_e4m3"),
+                         {"rig": "selftest"})
+        with open(out_fp8) as f:
+            recs = [json.loads(line) for line in f]
+        if rc != 0 or not recs \
+                or any(r.get("kv_cache_dtype") != "fp8_e4m3" for r in recs) \
+                or any(not str(r.get("equivalence_scope", "")).startswith("fp8-vs-fp8")
+                       for r in recs):
+            print(f"FAIL: fp8 records not labeled fp8-vs-fp8: rc={rc} "
+                  f"sample={recs[:1]}", file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] fp8 run: every record labeled "
+                  f"equivalence_scope={recs[0]['equivalence_scope']!r}")
+
+        # 9) cross-dtype compare must be REFUSED (rc 2): fp8 output matching
+        # bf16 recompute is NOT the claim this suite makes — an fp8-vs-bf16
+        # comparison is exactly the forbidden equivalence story, and letting
+        # it run would produce mismatches labeled as store corruption.
+        rc = run_compare(mkargs(state=fp8_state,
+                                out=os.path.join(tmp, "cross.jsonl"),
+                                kv_cache_dtype="auto-bf16"),
+                         {"rig": "selftest"})
+        if rc != 2:
+            print(f"FAIL: cross-dtype compare rc={rc}, expected 2 (refusal) — "
+                  "an fp8-vs-bf16 'equivalence' ran", file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] cross-dtype compare refused (rc=2): the harness "
+                  "cannot produce an fp8-vs-bf16 equivalence claim")
     finally:
         srv.shutdown()
     print("SELFTEST " + ("PASS" if ok else "FAIL"))
@@ -692,6 +778,12 @@ def main() -> int:
     ap.add_argument("--min-match", type=float, default=100.0,
                     help="compare: minimum match rate %% (default 100 — any "
                          "mismatch from a byte-exact store is a finding)")
+    ap.add_argument("--kv-cache-dtype", default="auto-bf16",
+                    help="the engine KV dtype BOTH phases run under (the rig's "
+                         "stamp convention: auto-bf16, fp8_e4m3, ...). Recorded "
+                         "into --state; compare REFUSES a mismatch and every "
+                         "record is labeled with its equivalence scope — an fp8 "
+                         "run is fp8-vs-fp8, never fp8-vs-bf16")
     ap.add_argument("--put-wait-s", type=float, default=60.0)
     ap.add_argument("--request-timeout", type=float, default=600.0)
     ap.add_argument("--out", default="",

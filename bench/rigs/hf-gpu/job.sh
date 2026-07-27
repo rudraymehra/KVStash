@@ -36,6 +36,12 @@
 #   - the kvblockd arena is sized so every populated block stays resident
 #     across the restart (derived below; eviction mid-run would silently turn
 #     warm hits into misses).
+#   - fp8 runs are CERTIFIED: bench/e2e/equivalence.py records greedy outputs
+#     on engine #1 and replays them on the restarted engine BEFORE the warm
+#     pass (EQUIV_N, hard fail). Same dtype in both engines by construction;
+#     the equivalence claim is labeled fp8-vs-fp8 in every EQUIVJSONL record
+#     and the suite REFUSES a cross-dtype compare — "fp8 matches bf16
+#     recompute" is a claim this rig cannot emit.
 #
 # Base image: vllm/vllm-openai:v0.25.1 (CUDA torch + vLLM prebuilt; the pin
 # matches bench/e2e/cpu/versions.env). Submit with bench/rigs/hf-gpu/submit.sh.
@@ -61,19 +67,31 @@ GEN_TOKENS="${GEN_TOKENS:-16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"            # empty -> derived: max(LENGTHS) + GEN_TOKENS + 384
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 GO_VERSION="${GO_VERSION:-1.26.5}"
-KV_BYTES_PER_TOKEN="${KV_BYTES_PER_TOKEN:-131072}"  # bf16 KV/token upper bound for the 7-8B class.
+KV_BYTES_PER_TOKEN="${KV_BYTES_PER_TOKEN:-}"  # KV/token upper bound for the 7-8B class; empty ->
+                                              # derived from the dtype below (131072 bf16, 65536 fp8).
                                               # Llama-3.1-8B measured 128KiB/token; Qwen2.5-7B is 56KiB.
                                               # The native connector's blob = the raw paged block + 32B
                                               # prefix, so the same per-token bound holds.
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"          # optional --kv-cache-dtype for vLLM (fp8 / fp8_e4m3 /
-                                              # fp8_e5m2; empty = vLLM's auto -> bf16 KV here).
-                                              # DISCLOSURE RULE (hard): an fp8 warm arm may never be
-                                              # charted against a bf16 cold arm — one env var feeds
-                                              # BOTH phases of a run, every JSONL record is stamped
-                                              # kv_cache_dtype=..., and plot.py refuses to render a
-                                              # chart that mixes dtypes. When set, the operator must
-                                              # pass a matching KV_BYTES_PER_TOKEN (fp8 halves it) —
-                                              # WARN below if it still looks like the bf16 default.
+                                              # fp8_e5m2; empty = vLLM's auto -> bf16 KV here; the
+                                              # bare 'fp8' alias is normalized to fp8_e4m3 below so
+                                              # the stamp is canonical). DISCLOSURE RULE (hard): an
+                                              # fp8 warm arm may never be charted against a bf16 cold
+                                              # arm — one env var feeds BOTH phases of a run, every
+                                              # JSONL record is stamped kv_cache_dtype=..., and
+                                              # plot.py/aggregate.py refuse mixed-dtype inputs. On an
+                                              # explicit KV_BYTES_PER_TOKEN that still looks like the
+                                              # bf16 default under fp8, WARN below.
+EQUIV_N="${EQUIV_N:-}"                        # token-identity prompts (bench/e2e/equivalence.py) run
+                                              # around the SAME vLLM restart: record on engine #1
+                                              # after populate, compare on engine #2 BEFORE the warm
+                                              # pass, HARD FAIL on any mismatch/unattributed prompt.
+                                              # Empty -> 8 on an fp8 run (an fp8 arm is not
+                                              # certifiable without its token-identity proof),
+                                              # 0 otherwise (bf16 behavior unchanged). The claim is
+                                              # same-dtype BY CONSTRUCTION (one env var, both
+                                              # engines) and every EQUIVJSONL record is labeled
+                                              # fp8-vs-fp8 — never fp8-vs-bf16.
 FP8_PREFLIGHT="${FP8_PREFLIGHT:-}"            # comma list of kv-cache dtypes to PROBE ("1" = fp8):
                                               # per dtype, boot the engine with the flag, one ~1k-token
                                               # prefill, verdict from kvblockd's OWN counters
@@ -146,6 +164,40 @@ log "git_sha stamp: $GIT_SHA"
 if [[ -n "$FP8_PREFLIGHT" && "$BASELINE_ONLY" == "1" ]]; then
   die "FP8_PREFLIGHT and BASELINE_ONLY=1 are mutually exclusive: the baseline control runs no daemon/connector, so there is nothing for the probe to witness — submit them as two separate jobs"
 fi
+
+# fp8 alias: vLLM spells the same e4m3 KV cache 'fp8' and 'fp8_e4m3', and the
+# connector normalizes them into ONE keyspace at boot (config.py's alias
+# table). Normalize the stamp too, or aggregate.py/plot.py would see 'fp8'
+# and 'fp8_e4m3' as two dtypes that refuse to merge — the alias footgun
+# reborn one layer up.
+if [[ "$KV_CACHE_DTYPE" == "fp8" ]]; then
+  KV_CACHE_DTYPE="fp8_e4m3"
+  log "KV_CACHE_DTYPE=fp8 normalized to fp8_e4m3 (vLLM alias; canonical stamp + keyspace)"
+fi
+
+# KV bytes/token: derived from the dtype unless the operator sized it — the
+# one-command fp8 run must not inherit bf16 arena/fit arithmetic (~2x off).
+if [[ -z "$KV_BYTES_PER_TOKEN" ]]; then
+  if [[ "$KV_CACHE_DTYPE" == fp8* ]]; then KV_BYTES_PER_TOKEN=65536; else KV_BYTES_PER_TOKEN=131072; fi
+  log "derived KV_BYTES_PER_TOKEN=$KV_BYTES_PER_TOKEN (${KV_CACHE_DTYPE:-auto-bf16} KV upper bound, 7-8B class)"
+fi
+
+# Token-identity certification defaults ON for an fp8 measured run and OFF
+# everywhere else (bf16 runs unchanged; the preflight probes, the baseline
+# has no store to prove anything against).
+if [[ -z "$EQUIV_N" ]]; then
+  if [[ "$KV_CACHE_DTYPE" == fp8* && "$BASELINE_ONLY" != "1" && -z "$FP8_PREFLIGHT" ]]; then
+    EQUIV_N=8
+  else
+    EQUIV_N=0
+  fi
+  log "derived EQUIV_N=$EQUIV_N"
+fi
+[[ "$EQUIV_N" =~ ^[0-9]+$ ]] || die "EQUIV_N='$EQUIV_N' is not a number"
+if (( EQUIV_N > 0 )) && [[ "$BASELINE_ONLY" == "1" ]]; then
+  die "EQUIV_N=$EQUIV_N with BASELINE_ONLY=1: the baseline control has no connector/daemon, so there is no store to prove token identity against — drop EQUIV_N or the baseline flag"
+fi
+
 SUM_TOKENS=0
 MAX_LEN=0
 IFS=',' read -ra _LENS <<< "$LENGTHS"
@@ -177,11 +229,15 @@ PAIRS=$((REPS + WARMUP))
 if [[ "$BASELINE_ONLY" == "1" ]]; then
   KVBD_ARENA_BYTES=0   # no daemon in this mode; silence the derivation below
 fi
+# Equivalence prompts live in the SAME arena across the restart: boundary
+# cells top out at 257 tokens (multiples 4,16 at block 16) + 32 gen + slack.
+EQUIV_MAX_TOKENS=320
 if [[ -z "$KVBD_ARENA_BYTES" ]]; then
   # The warm arm only works if EVERY populated block is still resident when
-  # its measured read arrives: arena >= all populated KV + 15% headroom.
-  KVBD_ARENA_BYTES=$((SUM_TOKENS * PAIRS * KV_BYTES_PER_TOKEN * 115 / 100))
-  log "derived KVBD_ARENA_BYTES=$KVBD_ARENA_BYTES (~$((KVBD_ARENA_BYTES / 1073741824))GiB = $SUM_TOKENS sweep tokens x $PAIRS pairs x ${KV_BYTES_PER_TOKEN}B/token x 1.15)"
+  # its measured read arrives: arena >= all populated KV (the TTFT sweep AND
+  # the token-identity prompts) + 15% headroom.
+  KVBD_ARENA_BYTES=$(( (SUM_TOKENS * PAIRS + EQUIV_N * EQUIV_MAX_TOKENS) * KV_BYTES_PER_TOKEN * 115 / 100 ))
+  log "derived KVBD_ARENA_BYTES=$KVBD_ARENA_BYTES (~$((KVBD_ARENA_BYTES / 1073741824))GiB = ($SUM_TOKENS sweep tokens x $PAIRS pairs + $EQUIV_N equiv prompts x $EQUIV_MAX_TOKENS) x ${KV_BYTES_PER_TOKEN}B/token x 1.15)"
 fi
 
 # Fit check: the arena is PREFAULTED, so an oversubscribed box OOMs mid-run.
@@ -297,6 +353,13 @@ fi
 # never scoop stub records into a results file (it did once — the run-4
 # extraction picked up 8 selftest records until filtered by rig).
 python3 "$HERE/run_ttft.py" --selftest | sed 's/^CHART2JSONL /SELFTESTJSONL /'
+# Same rule for the token-identity suite when it will run: its gates (exact
+# landing, store receipt, attribution, fp8-vs-fp8 labeling, the cross-dtype
+# REFUSAL) must be proven against the stub before any engine boots, and its
+# stub EQUIVJSONL lines are renamed so log retrieval can never scoop them.
+if (( EQUIV_N > 0 )); then
+  python3 "$ROOT/bench/e2e/equivalence.py" --selftest | sed 's/^EQUIVJSONL /SELFTESTEQUIV /'
+fi
 
 # ---- 8. vLLM lifecycle (started twice: populate engine, then a fresh measure engine)
 VLLM_LOG=""
@@ -577,6 +640,24 @@ python3 "$HERE/run_ttft.py" --phase populate \
     die "populate failed — kvblockd never received the blocks, so there is nothing honest to measure (see FATAL(populate) above)"
   }
 
+# ---- 9b. token-identity RECORD (same engine, greedy, receipts verified) ------
+# Runs AFTER the sweep populate so its prompts are the last stored, first
+# read after the restart. One env var (KV_CACHE_DTYPE) fed this engine and
+# will feed the measure engine, so the equivalence claim is same-dtype by
+# construction; the suite persists the dtype and its compare phase refuses a
+# mismatch (the fp8-vs-bf16 story is unphraseable, not just unphrased).
+EQUIV_STATE="$WORK/results/equiv-state.json"
+EQUIV_OUT="$WORK/results/equivalence.jsonl"
+if (( EQUIV_N > 0 )); then
+  log "token-identity record: $EQUIV_N greedy prompts via engine #1 (equivalence suite, hard fail)"
+  python3 "$ROOT/bench/e2e/equivalence.py" --phase record \
+    --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
+    --model "$MODEL" --n "$EQUIV_N" --block-size 16 \
+    --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" \
+    --state "$EQUIV_STATE" \
+    || die "token-identity record failed — an fp8 arm without its equivalence proof is not certifiable (nothing was measured yet)"
+fi
+
 # ---- 10. RESTART: fresh engine = no local KV anywhere; kvblockd keeps blocks -
 log "restarting vLLM: a fresh engine has no local KV, so a warm hit can only be a kvblockd TCP read"
 stop_vllm
@@ -611,6 +692,28 @@ if [[ -n "$DISCLOSURE_FINAL" ]]; then
 fi
 start_vllm "$WORK/vllm-measure.log" 1200    # weights already on disk
 
+# ---- 10b. token-identity COMPARE on the RESTARTED engine (hard fail) ---------
+# BEFORE the warm pass: (a) the equivalence blocks are read before any cold
+# junk is stored (the same eviction-by-ordering argument as warm-before-cold),
+# and (b) a failed token-identity gate must abort before GPU-minutes are
+# spent measuring an arm that could not be published anyway. Exit 3 (matched
+# but unattributed / text-level only) is a failure here too: certification
+# wants the STORE proven, not just the tokens.
+TOKEN_IDENTITY=""
+if (( EQUIV_N > 0 )); then
+  log "token-identity compare on the restarted engine (greedy identity, labeled ${KV_CACHE_DTYPE:-auto-bf16}-vs-${KV_CACHE_DTYPE:-auto-bf16}, hard fail)"
+  python3 "$ROOT/bench/e2e/equivalence.py" --phase compare \
+    --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
+    --model "$MODEL" --block-size 16 \
+    --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" \
+    --state "$EQUIV_STATE" --out "$EQUIV_OUT" \
+    --stamp isolation=vllm-restart --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
+    --stamp git_sha="$GIT_SHA" \
+    || die "token-identity compare FAILED — the warm arm must not be published without machine-checked same-dtype token identity (records above behind the EQUIV''JSONL marker)"
+  TOKEN_IDENTITY="equivalence-passed (${KV_CACHE_DTYPE:-auto-bf16}-vs-${KV_CACHE_DTYPE:-auto-bf16}, n=$EQUIV_N, greedy, hard-fail)"
+  log "token identity certified: $TOKEN_IDENTITY"
+fi
+
 # ---- 11. PHASE 2: measure (warm reps first, then cold — see run_ttft.py) -----
 CONNECTOR_VER="$(python3 -c 'import vllm_kvblockd; print(vllm_kvblockd.__version__)')"
 CONNECTOR_STAMP="vllm_kvblockd $CONNECTOR_VER (native)"
@@ -632,6 +735,7 @@ python3 "$HERE/run_ttft.py" --phase measure \
   --stamp connector="$CONNECTOR_STAMP" \
   --stamp tc_link="$TC_LINK" --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
   --stamp kv_cache_dtype="${KV_CACHE_DTYPE:-auto-bf16}" \
+  ${TOKEN_IDENTITY:+--stamp token_identity="$TOKEN_IDENTITY"} \
   ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \
   --stamp git_sha="$GIT_SHA" || rc=$?
 
@@ -665,6 +769,9 @@ fi
 
 # ---- 12. results out ---------------------------------------------------------
 log "JSONL at $OUT_JSONL ($(wc -l < "$OUT_JSONL" 2>/dev/null || echo 0) records); every record was also printed above as a CHART2JSONL line"
+if (( EQUIV_N > 0 )); then
+  log "token-identity JSONL at $EQUIV_OUT — retrieve with the EQUIV''JSONL marker (stub selftest lines were renamed SELFTESTEQUIV)"
+fi
 if [[ -n "$RESULTS_REPO" && -s "$OUT_JSONL" ]]; then
   log "uploading JSONL to dataset $RESULTS_REPO"
   python3 - "$RESULTS_REPO" "$OUT_JSONL" "$GIT_SHA" <<'PY' || log "WARN: upload failed (non-fatal — the CHART2JSONL log lines are the primary retrieval path)"
