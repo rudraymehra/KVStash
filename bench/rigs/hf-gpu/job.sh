@@ -642,8 +642,8 @@ python3 "$HERE/run_ttft.py" --phase measure \
 LOAD_PATH="$(grep -h -o 'kvblockd load path: [a-z-]*' "$WORK"/vllm-populate.log "$WORK"/vllm-measure.log 2>/dev/null | tail -1 | awk '{print $NF}')"
 if [[ -n "$LOAD_PATH" ]]; then
   log "connector load path: $LOAD_PATH (JSONL connector stamp carries path=$LOAD_PATH)"
-  if [[ "$LOAD_PATH" != "chunked-slab" ]]; then
-    log "WARN WARN WARN: warm loads ran on the '$LOAD_PATH' path on a CUDA run — the pinned-slab chunked scatter did NOT serve these numbers (pin/scratch alloc failed or the paged layout was not viewable). Attribute the results to path=$LOAD_PATH."
+  if [[ "$LOAD_PATH" != "pipelined-slab" && "$LOAD_PATH" != "chunked-slab" ]]; then
+    log "WARN WARN WARN: warm loads ran on the '$LOAD_PATH' path on a CUDA run — neither the pipelined nor the chunked slab served these numbers (pin/scratch alloc failed or the paged layout was not viewable). Attribute the results to path=$LOAD_PATH."
   fi
 else
   log "WARN: no 'kvblockd load path:' line found in the engine logs — load path unattributed"
