@@ -54,7 +54,8 @@ type s3Domain struct {
 	smallBytes int64
 	mainBytes  int64
 	mainCount  int
-	mainHi     int // main entry-count high-watermark → ghost sizing
+	mainHi     int   // main entry-count high-watermark → ghost sizing (decays — see maybeDecay)
+	lastDecay  int64 // epoch base for the mainHi decay (callers' now, nanos)
 	ghost      ghostRing
 }
 
@@ -150,7 +151,7 @@ func (p *S3FIFO) Touch(k Key, _ int64) {
 // before proving itself — the scan-resistance route), miss → small. A key
 // the policy already tracks is a no-op (defensive: double-Admit must not
 // corrupt the queues).
-func (p *S3FIFO) Admit(k Key, size int64, _ int64) {
+func (p *S3FIFO) Admit(k Key, size int64, now int64) {
 	if size <= 0 {
 		return
 	}
@@ -167,6 +168,7 @@ func (p *S3FIFO) Admit(k Key, size int64, _ int64) {
 	ts.mu.Unlock()
 
 	d.qmu.Lock()
+	p.maybeDecay(d, now)
 	if e.where == qDead {
 		// A Remove raced into the publish window and tombstoned us (it
 		// already took the table entry) — the block is gone; never queue.
@@ -214,6 +216,48 @@ func (p *S3FIFO) maybeGrowGhost(d *s3Domain) {
 		capacity = p.ghostMax
 	}
 	d.ghost.grow(capacity)
+}
+
+// ghostDecayEpoch is the mainHi half-life cadence. Long enough that a
+// steady tenant's ring never thrashes; short enough that a tenant whose
+// data left stops holding its PEAK's ghost memory within minutes.
+const ghostDecayEpoch = int64(60_000_000_000) // 60s in nanos
+
+// maybeDecay halves mainHi's gap above the CURRENT residency once per
+// epoch and shrinks the ghost ring to the decayed target. Without decay,
+// mainHi is a ratchet and total ghost memory is the sum of per-tenant
+// peaks — bounded by tenant churn, not by the arena. Ticked from Admit,
+// Victims, and — the guarantee that makes it real — Usage: Admit/Victims
+// need traffic to the domain, so a departed idle tenant would otherwise
+// hold its peak's ghost ring for process lifetime, while Usage runs for
+// every domain on the movers' unconditional cadence. Caller holds qmu;
+// now==0 (clock-less callers) disables decay.
+func (p *S3FIFO) maybeDecay(d *s3Domain, now int64) {
+	if now == 0 {
+		return
+	}
+	if d.lastDecay == 0 {
+		d.lastDecay = now
+		return
+	}
+	if now-d.lastDecay < ghostDecayEpoch {
+		return
+	}
+	d.lastDecay = now
+	if d.mainHi > d.mainCount {
+		d.mainHi -= (d.mainHi - d.mainCount) / 2
+	}
+	// Shrink toward the decayed watermark: same power-of-two ladder the
+	// grow side climbs, floored, so capacity tracks observed concurrent
+	// residency in both directions.
+	want := ghostFloor
+	for want < d.mainHi {
+		want <<= 1
+	}
+	if p.ghostMax > 0 && want > p.ghostMax {
+		want = p.ghostMax
+	}
+	d.ghost.shrink(want)
 }
 
 // Remove drops a key the store removed on its own (DELETE, expired sweep,
@@ -264,7 +308,7 @@ const victimsYieldEvery = 512
 // yield cadence, never by tenant size, and a concurrent mutation slotting
 // into a yield window is ordinary advisory staleness the store's gate
 // already re-checks.
-func (p *S3FIFO) Victims(ns uint32, need int64, _ int64, dst []Candidate) []Candidate {
+func (p *S3FIFO) Victims(ns uint32, need int64, now int64, dst []Candidate) []Candidate {
 	d := p.domain(ns)
 	if d == nil || need <= 0 {
 		return dst
@@ -273,6 +317,7 @@ func (p *S3FIFO) Victims(ns uint32, need int64, _ int64, dst []Candidate) []Cand
 
 	d.qmu.Lock()
 	defer d.qmu.Unlock()
+	p.maybeDecay(d, now)
 	// Bound one pass: every visit either moves an entry between queues,
 	// burns a freq point, or expels — a freq-3 small entry costs at most 5
 	// visits (1 small + 3 main decrements + 1 eviction), so 6N+8 covers
@@ -351,17 +396,44 @@ func (p *S3FIFO) expel(d *s3Domain, e *entry, dst []Candidate) []Candidate {
 	return append(dst, Candidate{Key: e.key, Size: e.size})
 }
 
-// Usage reports each domain's resident bytes (small + main).
-func (p *S3FIFO) Usage(dst []DomainUsage) []DomainUsage {
+// Usage reports each domain's resident bytes (small + main) and its ghost
+// footprint — a domain whose data left but whose ghost still holds memory
+// stays visible. It is also the decay tick that reaches EVERY domain: the
+// movers call Usage each pass regardless of pressure, so an idle departed
+// tenant's mainHi/ghost ring decays here even though no Admit or Victims
+// call will ever visit its domain again.
+func (p *S3FIFO) Usage(now int64, dst []DomainUsage) []DomainUsage {
 	for ns, d := range *p.domains.Load() {
 		d.qmu.Lock()
+		p.maybeDecay(d, now)
 		b := d.smallBytes + d.mainBytes
+		gb := d.ghost.bytes()
 		d.qmu.Unlock()
-		if b > 0 {
-			dst = append(dst, DomainUsage{NS: ns, Bytes: b})
+		if b > 0 || gb > 0 {
+			dst = append(dst, DomainUsage{NS: ns, Bytes: b, GhostBytes: gb})
 		}
 	}
 	return dst
+}
+
+// DropDomain forgets tenant ns entirely (COW rebuild without it): tables,
+// queues, and ghost all become unreachable. A concurrent Touch/Admit that
+// already loaded the old domain pointer mutates a detached structure —
+// harmless, collected with it.
+func (p *S3FIFO) DropDomain(ns uint32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	old := *p.domains.Load()
+	if _, ok := old[ns]; !ok {
+		return
+	}
+	next := make(map[uint32]*s3Domain, len(old))
+	for k, v := range old {
+		if k != ns {
+			next[k] = v
+		}
+	}
+	p.domains.Store(&next)
 }
 
 // ghostStats exposes (size, capacity) of a domain's ghost ring for the

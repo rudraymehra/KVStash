@@ -49,7 +49,7 @@ func TestS3FIFOScriptedTrace(t *testing.T) {
 	if len(v) != 1 || v[0].Key != c {
 		t.Fatalf("round 2: %+v, want exactly [c] (b must promote, not evict)", v)
 	}
-	if u := p.Usage(nil); len(u) != 1 || u[0].Bytes != 100 {
+	if u := p.Usage(0, nil); len(u) != 1 || u[0].Bytes != 100 {
 		t.Fatalf("usage after rounds: %+v, want ns7=100 (b resident in main)", u)
 	}
 
@@ -76,8 +76,12 @@ func TestS3FIFOScriptedTrace(t *testing.T) {
 	if len(v) != 1 || v[0].Key != b {
 		t.Fatalf("drain: %+v, want [b]", v)
 	}
-	if u := p.Usage(nil); len(u) != 0 {
-		t.Fatalf("usage after drain: %+v, want empty", u)
+	// Drained of RESIDENT bytes; the ghost footprint (a's small-eviction
+	// fingerprint) legitimately remains visible.
+	for _, u := range p.Usage(0, nil) {
+		if u.Bytes != 0 {
+			t.Fatalf("usage after drain: %+v, want zero resident bytes", u)
+		}
 	}
 }
 
@@ -89,7 +93,7 @@ func TestS3FIFORemoveUnlinks(t *testing.T) {
 	p.Admit(a, 50, 0)
 	p.Admit(b, 50, 0)
 	p.Remove(a)
-	if u := p.Usage(nil); len(u) != 1 || u[0].Bytes != 50 {
+	if u := p.Usage(0, nil); len(u) != 1 || u[0].Bytes != 50 {
 		t.Fatalf("usage after remove: %+v", u)
 	}
 	v := p.Victims(1, 1000, 0, nil)
@@ -129,7 +133,7 @@ func TestS3FIFODoubleAdmitIsNoop(t *testing.T) {
 	a := ek(2, 1)
 	p.Admit(a, 100, 0)
 	p.Admit(a, 100, 0)
-	if u := p.Usage(nil); len(u) != 1 || u[0].Bytes != 100 {
+	if u := p.Usage(0, nil); len(u) != 1 || u[0].Bytes != 100 {
 		t.Fatalf("double admit: %+v, want ns2=100 once", u)
 	}
 	if v := p.Victims(2, 1000, 0, nil); len(v) != 1 {
@@ -142,15 +146,29 @@ func TestS3FIFOPerTenantDomains(t *testing.T) {
 	p := NewS3FIFO(0)
 	p.Admit(ek(1, 1), 100, 0)
 	p.Admit(ek(2, 1), 100, 0)
-	if u := p.Usage(nil); len(u) != 2 {
+	if u := p.Usage(0, nil); len(u) != 2 {
 		t.Fatalf("usage domains: %+v", u)
 	}
 	v := p.Victims(1, 1000, 0, nil)
 	if len(v) != 1 || v[0].Key.NS != 1 {
 		t.Fatalf("victims ns1: %+v (must never name another tenant's block)", v)
 	}
-	if u := p.Usage(nil); len(u) != 1 || u[0].NS != 2 {
-		t.Fatalf("ns2 untouched by ns1 pressure: %+v", u)
+	// ns2's residency is untouched; ns1 keeps only its ghost footprint
+	// (ghost-only domains stay VISIBLE — that memory lives outside the
+	// arena budget and must be observable).
+	for _, u := range p.Usage(0, nil) {
+		switch u.NS {
+		case 1:
+			if u.Bytes != 0 || u.GhostBytes <= 0 {
+				t.Fatalf("ns1 after eviction: %+v, want zero resident + ghost-only", u)
+			}
+		case 2:
+			if u.Bytes != 100 {
+				t.Fatalf("ns2 touched by ns1 pressure: %+v", u)
+			}
+		default:
+			t.Fatalf("unknown domain in usage: %+v", u)
+		}
 	}
 }
 
@@ -245,5 +263,129 @@ func TestS3FIFOAdmitRemoveRace(t *testing.T) {
 			t.Fatalf("post-race bookkeeping: small=%d/%dB main=%d/%dB",
 				d.small.count, d.smallBytes, d.main.count, d.mainBytes)
 		}
+	}
+}
+
+// TestGhostShrinksAfterResidencyLeaves: mainHi is a high-watermark with
+// DECAY — a tenant whose data left must not hold its peak's ghost memory
+// forever (the sum-of-per-tenant-peaks leak). The decay is driven by Usage
+// ALONE: a departed idle tenant gets no Admit and no Victims call ever
+// again (the movers only ask a domain for victims under pressure aimed at
+// it), so ticking decay only from those two left the filed leak in place.
+func TestGhostShrinksAfterResidencyLeaves(t *testing.T) {
+	p := NewS3FIFO(1 << 20)
+	d := p.ensureDomain(9)
+
+	// Simulate a residency peak: mainHi high, ghost grown to match.
+	d.qmu.Lock()
+	d.ghost.push(1)
+	d.mainHi = 200_000
+	p.maybeGrowGhost(d)
+	peak := d.ghost.capacity()
+	d.qmu.Unlock()
+	if peak < 200_000 {
+		t.Fatalf("fixture: ghost capacity %d never reached the peak", peak)
+	}
+
+	// The tenant's data leaves (mainCount is already 0 — nothing resident).
+	// Epochs pass carried ONLY by Usage's now — ZERO Admit/Victims traffic
+	// to the domain, exactly the departed-tenant shape.
+	now := int64(1)
+	for i := 0; i < 40; i++ {
+		now += ghostDecayEpoch + 1
+		p.Usage(now, nil) // the movers' unconditional housekeeping tick
+	}
+	_, capacity := p.ghostStats(9)
+	if capacity >= peak {
+		t.Fatalf("ghost capacity %d never decayed from its %d peak after 40 idle epochs", capacity, peak)
+	}
+	if capacity != ghostFloor {
+		t.Fatalf("ghost capacity %d, want decay to the %d floor with zero residency", capacity, ghostFloor)
+	}
+}
+
+// TestGhostShrinkKeepsNewestAndDropsSet: shrink must keep the NEWEST
+// fingerprints and evict dropped ones from the membership set too.
+func TestGhostShrinkKeepsNewestAndDropsSet(t *testing.T) {
+	var g ghostRing
+	for i := 0; i < ghostFloor; i++ {
+		g.push(uint64(i))
+	}
+	g.grow(ghostFloor * 4)
+	for i := ghostFloor; i < ghostFloor*3; i++ {
+		g.push(uint64(i))
+	}
+	g.shrink(ghostFloor)
+	if g.capacity() != ghostFloor || g.size() != ghostFloor {
+		t.Fatalf("after shrink: cap=%d size=%d, want %d/%d", g.capacity(), g.size(), ghostFloor, ghostFloor)
+	}
+	if !g.contains(uint64(ghostFloor*3 - 1)) {
+		t.Fatal("shrink dropped the newest fingerprint")
+	}
+	if g.contains(uint64(ghostFloor)) {
+		t.Fatal("shrink left a dropped fingerprint in the membership set")
+	}
+	// The ring must still behave after the rebuild.
+	g.push(uint64(1 << 40))
+	if !g.contains(uint64(1 << 40)) {
+		t.Fatal("push after shrink lost the entry")
+	}
+}
+
+// TestDropDomainReleasesState: every registry with an Add needs a Remove —
+// a dropped tenant's tables, queues, and ghost must become unreachable.
+func TestDropDomainReleasesState(t *testing.T) {
+	p := NewS3FIFO(4096)
+	p.Admit(ek(3, 1), 100, 0)
+	p.Admit(ek(4, 1), 100, 0)
+
+	p.DropDomain(3)
+	if p.domain(3) != nil {
+		t.Fatal("dropped domain still reachable")
+	}
+	if p.domain(4) == nil {
+		t.Fatal("DropDomain removed a sibling tenant")
+	}
+	if v := p.Victims(3, 1000, 0, nil); len(v) != 0 {
+		t.Fatalf("dropped domain still yields victims: %+v", v)
+	}
+	usage := p.Usage(0, nil)
+	for _, u := range usage {
+		if u.NS == 3 {
+			t.Fatal("dropped domain still reports usage")
+		}
+	}
+	p.DropDomain(999) // unknown ns: no-op, no panic
+
+	lru := NewSampledLRU()
+	lru.Admit(ek(6, 1), 100, 0)
+	lru.DropDomain(6)
+	if v := lru.Victims(6, 1000, 0, nil); len(v) != 0 {
+		t.Fatal("sampled-lru dropped domain still yields victims")
+	}
+}
+
+// TestUsageReportsGhostBytes: ghost memory lives outside the arena budget —
+// it must be observable, including for a domain with zero resident bytes.
+func TestUsageReportsGhostBytes(t *testing.T) {
+	p := NewS3FIFO(4096)
+	a := ek(11, 1)
+	p.Admit(a, 100, 0)
+	if v := p.Victims(11, 100, 0, nil); len(v) != 1 {
+		t.Fatalf("fixture: eviction did not happen: %+v", v)
+	}
+	// The block is gone (zero resident bytes) but its fingerprint is
+	// ghosted — the ring's memory must still show up.
+	found := false
+	for _, u := range p.Usage(0, nil) {
+		if u.NS == 11 {
+			found = true
+			if u.GhostBytes <= 0 {
+				t.Fatalf("ghost bytes %d, want > 0 with a materialized ring", u.GhostBytes)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("domain with ghost-only memory invisible in Usage")
 	}
 }

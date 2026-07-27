@@ -20,7 +20,7 @@ func TestSampledLRUOrder(t *testing.T) {
 	if len(v) != 1 || v[0].Key != c {
 		t.Fatalf("second stalest: %+v, want [c]", v)
 	}
-	if u := p.Usage(nil); len(u) != 1 || u[0].Bytes != 100 {
+	if u := p.Usage(0, nil); len(u) != 1 || u[0].Bytes != 100 {
 		t.Fatalf("usage: %+v, want ns7=100 (only a left)", u)
 	}
 }
@@ -33,7 +33,7 @@ func TestSampledLRURemoveAndIsolation(t *testing.T) {
 	p.Admit(ek(1, 2), 60, 2)
 	p.Admit(ek(2, 1), 70, 3)
 	p.Remove(ek(1, 1))
-	if u := p.Usage(nil); len(u) != 2 {
+	if u := p.Usage(0, nil); len(u) != 2 {
 		t.Fatalf("usage domains: %+v", u)
 	}
 	v := p.Victims(1, 1000, 0, nil)
@@ -51,7 +51,7 @@ func TestSampledLRUDoubleAdmitIsNoop(t *testing.T) {
 	p := NewSampledLRU()
 	p.Admit(ek(3, 1), 100, 1)
 	p.Admit(ek(3, 1), 100, 2)
-	if u := p.Usage(nil); len(u) != 1 || u[0].Bytes != 100 {
+	if u := p.Usage(0, nil); len(u) != 1 || u[0].Bytes != 100 {
 		t.Fatalf("double admit: %+v", u)
 	}
 }

@@ -35,7 +35,7 @@ func TestPolicyRapidConsistency(t *testing.T) {
 						want[k.NS] += sz
 					}
 					got := make(map[uint32]int64)
-					for _, u := range p.Usage(nil) {
+					for _, u := range p.Usage(0, nil) {
 						got[u.NS] = u.Bytes
 					}
 					for ns, b := range want {

@@ -41,6 +41,10 @@ type Candidate struct {
 type DomainUsage struct {
 	NS    uint32
 	Bytes int64
+	// GhostBytes approximates the domain's ghost-ring footprint (ring slots
+	// plus membership-set overhead) — DRAM spent OUTSIDE the arena budget,
+	// previously invisible to every stats surface.
+	GhostBytes int64
 }
 
 // Policy is the pluggable eviction brain. All methods are safe for
@@ -64,8 +68,17 @@ type Policy interface {
 	Victims(ns uint32, need int64, now int64, dst []Candidate) []Candidate
 	// Usage appends per-domain resident bytes into dst (pressure
 	// attribution: the watermark splits an eviction batch across tenants
-	// proportionally to these numbers).
-	Usage(dst []DomainUsage) []DomainUsage
+	// proportionally to these numbers). Usage is also the policy's
+	// HOUSEKEEPING tick — the only method that runs unconditionally for
+	// EVERY domain on the movers' cadence — so time-based state (the
+	// S3-FIFO ghost decay) ticks here: Admit and Victims only run for
+	// domains with traffic, and an idle departed tenant has neither.
+	// now: unix nanos; 0 (clock-less callers) disables time-based work.
+	Usage(now int64, dst []DomainUsage) []DomainUsage
+	// DropDomain forgets tenant ns entirely — tables, queues, ghost.
+	// Every registry with an Add needs a Remove: without this, a deleted
+	// tenant's policy state leaks for process lifetime. Unknown ns no-ops.
+	DropDomain(ns uint32)
 	// Name reports the policy's config name.
 	Name() string
 }

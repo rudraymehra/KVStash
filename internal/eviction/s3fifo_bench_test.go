@@ -52,7 +52,7 @@ func BenchmarkVictimsWorstCaseQmuHold(b *testing.B) {
 				default:
 				}
 				t0 := time.Now()
-				dst = p.Usage(dst[:0])
+				dst = p.Usage(0, dst[:0])
 				if w := time.Since(t0).Nanoseconds(); w > maxWait.Load() {
 					maxWait.Store(w)
 				}
@@ -84,8 +84,12 @@ func TestVictimsChunkedScanIsComplete(t *testing.T) {
 	if len(got) != entries {
 		t.Fatalf("chunked scan expelled %d of %d entries", len(got), entries)
 	}
-	if u := p.Usage(nil); len(u) != 0 {
-		t.Fatalf("domain not drained: %v", u)
+	// Drained of resident bytes; ghost-only footprint stays visible by
+	// design (it is real memory outside the arena budget).
+	for _, u := range p.Usage(0, nil) {
+		if u.Bytes != 0 {
+			t.Fatalf("domain not drained: %v", u)
+		}
 	}
 }
 
@@ -126,7 +130,7 @@ func TestVictimsYieldRace(t *testing.T) {
 				return
 			default:
 			}
-			dst = p.Usage(dst[:0])
+			dst = p.Usage(0, dst[:0])
 			for _, u := range dst {
 				if u.Bytes < 0 {
 					panic("negative domain bytes")

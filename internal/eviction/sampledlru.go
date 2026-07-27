@@ -186,12 +186,31 @@ func (p *SampledLRU) sampleStalest(d *lruDomain) *lruEntry {
 	return best
 }
 
-// Usage reports each domain's resident bytes.
-func (p *SampledLRU) Usage(dst []DomainUsage) []DomainUsage {
+// Usage reports each domain's resident bytes (no ghost — sampled-LRU keeps
+// no evictee memory, so GhostBytes stays zero and the housekeeping tick has
+// nothing to do with now).
+func (p *SampledLRU) Usage(_ int64, dst []DomainUsage) []DomainUsage {
 	for ns, d := range *p.domains.Load() {
 		if b := d.bytes.Load(); b > 0 {
 			dst = append(dst, DomainUsage{NS: ns, Bytes: b})
 		}
 	}
 	return dst
+}
+
+// DropDomain forgets tenant ns entirely (COW rebuild without it).
+func (p *SampledLRU) DropDomain(ns uint32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	old := *p.domains.Load()
+	if _, ok := old[ns]; !ok {
+		return
+	}
+	next := make(map[uint32]*lruDomain, len(old))
+	for k, v := range old {
+		if k != ns {
+			next[k] = v
+		}
+	}
+	p.domains.Store(&next)
 }

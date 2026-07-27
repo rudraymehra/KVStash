@@ -49,7 +49,7 @@ func (t *Tiered) demotePass(wait bool) int {
 		return 0
 	}
 	now := t.now()
-	usages := t.pol.Usage(t.scUsages[:0])
+	usages := t.pol.Usage(now, t.scUsages[:0])
 	t.scUsages = usages[:0]
 	var totalBytes int64
 	for _, u := range usages {

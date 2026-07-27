@@ -328,7 +328,7 @@ func TestNoPhantomReadmit(t *testing.T) {
 	s.EvictNow()
 	s.EvictNow() // a second pass: the phantom must not still be circulating
 
-	usage := pol.Usage(nil)
+	usage := pol.Usage(0, nil)
 	var ns5 int64
 	for _, u := range usage {
 		if u.NS == 5 {

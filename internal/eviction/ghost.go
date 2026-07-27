@@ -71,7 +71,45 @@ func (g *ghostRing) grow(newCap int) {
 	// set is unchanged (same members).
 }
 
+// shrink rebuilds the ring at newCap, keeping the NEWEST entries and
+// rebuilding the membership set so dropped fingerprints actually leave it.
+// No-op if newCap ≥ current capacity; never shrinks below the floor.
+// High-watermark ratchets need decay: without shrink, total ghost memory is
+// the SUM of per-tenant peaks — bounded by tenant churn, not by the arena.
+func (g *ghostRing) shrink(newCap int) {
+	if newCap < ghostFloor {
+		newCap = ghostFloor
+	}
+	if g.ring == nil || newCap >= len(g.ring) {
+		return
+	}
+	keep := g.n
+	if keep > newCap {
+		keep = newCap
+	}
+	fresh := make([]uint64, newCap)
+	set := make(map[uint64]struct{}, keep)
+	start := g.n - keep // skip the oldest when over the new capacity
+	for i := 0; i < keep; i++ {
+		fp := g.ring[(g.head+start+i)%len(g.ring)]
+		fresh[i] = fp
+		set[fp] = struct{}{}
+	}
+	g.ring, g.set, g.head, g.n = fresh, set, 0, keep
+}
+
 // size reports live entries (the harness's ghost-bound invariant reads it).
 func (g *ghostRing) size() int { return g.n }
 
 func (g *ghostRing) capacity() int { return len(g.ring) }
+
+// ghostSetEntryBytes approximates one map[uint64]struct{} entry's footprint
+// (bucket share + overhead) for the observability estimate.
+const ghostSetEntryBytes = 48
+
+// bytes approximates the ring's total footprint: 8 B per ring slot
+// (capacity, not occupancy — the slice is allocated in full) plus the
+// membership set's live entries.
+func (g *ghostRing) bytes() int64 {
+	return int64(len(g.ring))*8 + int64(g.n)*ghostSetEntryBytes
+}

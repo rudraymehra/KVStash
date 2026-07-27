@@ -63,6 +63,10 @@ func (s *Store) StartEvictor(ctx context.Context, cfg EvictorConfig) (stop func(
 		defer close(ev.done)
 		t := time.NewTicker(ev.cfg.Interval)
 		defer t.Stop()
+		// houseUsages is this goroutine's own scratch: the housekeeping tick
+		// runs outside evictMu, so it must not share s.evUsages with a
+		// concurrent EvictNow's policy pass.
+		var houseUsages []eviction.DomainUsage
 		for {
 			coalesce := false
 			select {
@@ -72,6 +76,15 @@ func (s *Store) StartEvictor(ctx context.Context, cfg EvictorConfig) (stop func(
 				// The ticker is the ONE prober that bypasses the futile-pass
 				// cache: lease/TTL expiry is pure time — no event bumps the
 				// occupancy generation, so somebody must keep looking.
+				//
+				// It is also the policy's housekeeping cadence: Usage ticks
+				// time-based state (the S3-FIFO ghost decay) for EVERY
+				// domain. The pressure passes only call Usage above the
+				// watermark, so without this an idle daemon's departed
+				// tenants would hold their peak's ghost memory forever.
+				if p := s.policy; p != nil {
+					houseUsages = p.Usage(s.now(), houseUsages[:0])
+				}
 			case <-ev.kick:
 				coalesce = true // pressure nudges coalesce like EvictNow does
 			}
@@ -306,7 +319,7 @@ func (s *Store) policyPass(now int64, need int64) int64 {
 	if p == nil || need <= 0 {
 		return 0
 	}
-	usages := p.Usage(s.evUsages[:0])
+	usages := p.Usage(now, s.evUsages[:0])
 	s.evUsages = usages[:0]
 	var totalBytes int64
 	for _, u := range usages {
