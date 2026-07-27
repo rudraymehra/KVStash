@@ -126,7 +126,11 @@ BLOB_MAGIC = b"KVN1"
 # BLOB_VERSION lives in config.py (folded into the fingerprint there) and is
 # re-exported here for the codec's callers/tests.
 BLOB_PREFIX_LEN = 32
-_BLOB = struct.Struct("<4sBBHHII14x")  # magic ver dtype n_layers tokens bytes/layer total
+# v2 layout: one former pad byte is codec_id (13 pad bytes remain). The
+# version bump makes every pre-codec reader degrade v2 blobs to a clean miss
+# (decode rejects unknown versions), never a misread field — and the
+# fingerprint folds BLOB_VERSION, so the keyspaces fork too.
+_BLOB = struct.Struct("<4sBBHHIIB13x")  # magic ver dtype n_layers tokens bytes/layer total codec
 assert _BLOB.size == BLOB_PREFIX_LEN
 
 # Pinned dtype codes (same table as lmcache_kvblockd.meta — kept in sync by
@@ -137,6 +141,21 @@ DTYPE_CODES = {
     "float8_e4m3fn": 8, "float8_e5m2": 9,
 }
 CODE_DTYPES = {v: k for k, v in DTYPE_CODES.items()}
+
+# Blob body codecs (item 6 keystone — the FIELD ships before any serde).
+# The prefix always describes the DECODED layout; for codec != raw the wire's
+# per-blob body_len is the COMPRESSED size (client.py hands it to alloc), and
+# slab slot sizing switches from body_len to the codec's max_body_len so
+# fixed-ratio codecs keep the fixed-stride math — that switch lands WITH the
+# first serde, not before. Codec identity never enters key derivation
+# (namespaces are the tool for split fleets). Every alloc gate refuses a
+# codec this build is not configured to decode — a clean per-block miss,
+# never a corrupt scatter.
+CODEC_RAW = 0        # body = the paged block bytes, verbatim
+CODEC_FP8_CAST = 1   # RESERVED: on-GPU fp8-cast serde — ships only behind
+#                      the pre-registered lossy quality gate; until then any
+#                      fp8-cast blob is refused on load (per-block miss)
+CODEC_NAMES = {CODEC_RAW: "raw", CODEC_FP8_CAST: "fp8-cast"}
 
 # After a failed dial, further dial attempts short-circuit for this long —
 # callers degrade to a miss instantly instead of each eating a connect timeout.
@@ -188,24 +207,38 @@ class BlobError(ValueError):
 
 
 def encode_blob_prefix(dtype_name: str, n_layers: int, tokens_per_block: int,
-                       bytes_per_layer: int, total_len: int) -> bytes:
+                       bytes_per_layer: int, total_len: int,
+                       codec: int = CODEC_RAW) -> bytes:
     if dtype_name not in DTYPE_CODES:
         raise BlobError(f"unsupported dtype {dtype_name!r}")
+    if codec not in CODEC_NAMES:
+        # Refused at ENCODE time too: a blob tagged with a codec nothing
+        # defines would be undecodable everywhere, forever.
+        raise BlobError(f"unknown codec {codec}")
     return _BLOB.pack(BLOB_MAGIC, BLOB_VERSION, DTYPE_CODES[dtype_name],
-                      n_layers, tokens_per_block, bytes_per_layer, total_len)
+                      n_layers, tokens_per_block, bytes_per_layer, total_len,
+                      codec)
 
 
-def decode_blob_prefix(prefix: bytes) -> tuple[str, int, int, int, int]:
+def decode_blob_prefix(prefix: bytes) -> tuple[str, int, int, int, int, int]:
+    """(dtype, n_layers, tokens/block, bytes/layer, total, codec) — the
+    layout is always the DECODED one; a non-raw codec means the wire body is
+    the codec's compressed form of exactly that layout."""
     if len(prefix) < BLOB_PREFIX_LEN:
         raise BlobError("prefix too short")
-    magic, ver, dcode, n_layers, tpb, bpl, total = _BLOB.unpack(prefix[:BLOB_PREFIX_LEN])
+    magic, ver, dcode, n_layers, tpb, bpl, total, codec = _BLOB.unpack(
+        prefix[:BLOB_PREFIX_LEN])
     if magic != BLOB_MAGIC:
         raise BlobError(f"bad magic {magic!r}")
     if ver != BLOB_VERSION:
         raise BlobError(f"unknown blob version {ver}")
     if dcode not in CODE_DTYPES:
         raise BlobError(f"unknown dtype code {dcode}")
-    return CODE_DTYPES[dcode], n_layers, tpb, bpl, total
+    if codec not in CODEC_NAMES:
+        # An id from a future release: this build cannot know the body's
+        # encoding, so the block is a clean miss — never a guessed decode.
+        raise BlobError(f"unknown codec {codec}")
+    return CODE_DTYPES[dcode], n_layers, tpb, bpl, total, codec
 
 
 class _RateLimitedLog:
@@ -1375,13 +1408,16 @@ class KvblockdConnector(_Base):
 
         def alloc(idx, prefix, body_len):
             try:
-                d, n_layers, tpb, bpl, tot = decode_blob_prefix(prefix)
+                d, n_layers, tpb, bpl, tot, codec = decode_blob_prefix(prefix)
             except BlobError:
                 return None
-            if (d != dtype_name or n_layers != len(names) or tpb != self._block_size
+            if (codec != CODEC_RAW  # this build decodes only raw bodies —
+                    # a codec blob is a clean miss until its serde (and the
+                    # pre-registered quality gate) land
+                    or d != dtype_name or n_layers != len(names) or tpb != self._block_size
                     or bpl != bytes_per_layer or tot != total
                     or body_len != total - BLOB_PREFIX_LEN):
-                return None  # layout drift -> miss, never a corrupt scatter
+                return None  # codec/layout drift -> miss, never a corrupt scatter
             buf = torch.empty(body_len, dtype=torch.uint8)
             staged[idx] = buf
             return memoryview(buf.numpy())
@@ -1488,12 +1524,15 @@ class KvblockdConnector(_Base):
                 # here — thread-safe by construction. idx is 0-based within
                 # this batch_get_scatter call, so slots never exceed the pass.
                 try:
-                    d, n_layers, tpb, bpl, tot = decode_blob_prefix(prefix)
+                    d, n_layers, tpb, bpl, tot, codec = decode_blob_prefix(prefix)
                 except BlobError:
                     return None
-                if (d != dtype_name or n_layers != len(names) or tpb != self._block_size
+                # codec gate first: slot sizing below assumes the raw fixed
+                # stride (per-codec max_body_len sizing lands WITH a serde).
+                if (codec != CODEC_RAW
+                        or d != dtype_name or n_layers != len(names) or tpb != self._block_size
                         or bpl != bytes_per_layer or tot != total or blen != body_len):
-                    return None  # layout drift -> miss, never a corrupt scatter
+                    return None  # codec/layout drift -> miss, never a corrupt scatter
                 off = idx * body_len
                 return memoryview(slab_np[off:off + blen])
 
@@ -1629,12 +1668,15 @@ class KvblockdConnector(_Base):
                 # Client drain threads: slots disjoint by (half, pass-local
                 # idx), nothing else mutated — thread-safe by construction.
                 try:
-                    d, n_layers, tpb, bpl, tot = decode_blob_prefix(prefix)
+                    d, n_layers, tpb, bpl, tot, codec = decode_blob_prefix(prefix)
                 except BlobError:
                     return None
-                if (d != dtype_name or n_layers != len(names) or tpb != self._block_size
+                # codec gate first: half/slot strides assume the raw fixed
+                # body_len (per-codec max_body_len sizing lands WITH a serde).
+                if (codec != CODEC_RAW
+                        or d != dtype_name or n_layers != len(names) or tpb != self._block_size
                         or bpl != bytes_per_layer or tot != total or blen != body_len):
-                    return None  # layout drift -> miss, never a corrupt scatter
+                    return None  # codec/layout drift -> miss, never a corrupt scatter
                 off = half * half_off + idx * body_len
                 return memoryview(slab_np[off:off + blen])
 

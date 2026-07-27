@@ -447,13 +447,86 @@ def test_chunked_prefill_continuation_stores_later_chunks(daemon):
 def test_blob_prefix_codec():
     p = encode_blob_prefix("bfloat16", 12, 16, 4096, BLOB_PREFIX_LEN + 12 * 4096)
     assert len(p) == BLOB_PREFIX_LEN
-    assert decode_blob_prefix(p) == ("bfloat16", 12, 16, 4096, BLOB_PREFIX_LEN + 12 * 4096)
+    assert decode_blob_prefix(p) == ("bfloat16", 12, 16, 4096,
+                                     BLOB_PREFIX_LEN + 12 * 4096, conn_mod.CODEC_RAW)
     with pytest.raises(BlobError):
         decode_blob_prefix(b"XXXX" + p[4:])
     with pytest.raises(BlobError):
         encode_blob_prefix("complex64", 1, 1, 8, 40)
     assert align_to_block_size(9, 4) == 8
     assert align_to_block_size(8, 4) == 4  # last token always recomputed
+
+
+def test_blob_prefix_carries_codec_and_refuses_unknown():
+    """Item 6 keystone: one pad byte is now codec_id (0=raw, 1=fp8-cast
+    reserved, 2+ reserved). Known-but-reserved codecs round-trip through the
+    PREFIX (the alloc gates refuse them later); an UNKNOWN codec id fails the
+    decode itself — a clean miss, never a corrupt scatter."""
+    total = BLOB_PREFIX_LEN + 4 * 1024
+    p = encode_blob_prefix("float8_e4m3fn", 4, 16, 1024, total,
+                           codec=conn_mod.CODEC_FP8_CAST)
+    assert decode_blob_prefix(p) == ("float8_e4m3fn", 4, 16, 1024, total,
+                                     conn_mod.CODEC_FP8_CAST)
+    # Unknown codec id on the wire -> BlobError -> miss.
+    import struct as _struct
+
+    unknown = bytearray(p)
+    unknown[-14] = 7  # the codec byte (offset 18 of 32; 13 pad bytes follow)
+    with pytest.raises(BlobError, match="codec"):
+        decode_blob_prefix(bytes(unknown))
+    # Writing a codec nothing defines is refused at ENCODE time too.
+    with pytest.raises(BlobError, match="codec"):
+        encode_blob_prefix("bfloat16", 4, 16, 1024, total, codec=7)
+    # A pre-codec (version-1) prefix degrades to a clean miss: the version
+    # check fires before any field of the old layout can be misread.
+    v1 = _struct.pack("<4sBBHHII14x", b"KVN1", 1, 1, 4, 16, 1024, total)
+    with pytest.raises(BlobError, match="version"):
+        decode_blob_prefix(v1)
+
+
+def test_nonraw_codec_blob_is_a_miss_not_a_scatter(daemon):
+    """A stored blob declaring a codec this build cannot decode (fp8-cast is
+    reserved; its serde has not landed) must be refused at alloc — flagged
+    block, zero bytes scattered — even when every OTHER prefix field matches
+    the live engine perfectly. This is the refusal path that makes the codec
+    field safe to ship before the serde."""
+    from kvblockd.client import Client
+
+    from vllm_kvblockd.config import block_chain_keys, chain_seed
+
+    toks = list(range(200, 209))  # 9 tokens -> 2 loadable blocks at BLOCK=4
+    salt = "t-codec-miss"
+    conn = make_connector(daemon)
+    # Craft fp8-cast-tagged blobs under the EXACT keys the connector derives,
+    # with an otherwise perfect layout match (bf16, 2 layers, HID wide).
+    seed = chain_seed(conn._cfg.fingerprint, salt, [], "")
+    keys = block_chain_keys(seed, toks[:8], BLOCK)
+    bytes_per_layer = 2 * BLOCK * HID * 2  # one (2, BLOCK, HID) bf16 block
+    total = BLOB_PREFIX_LEN + len(LAYERS) * bytes_per_layer
+    prefix = encode_blob_prefix("bfloat16", len(LAYERS), BLOCK, bytes_per_layer,
+                                total, codec=conn_mod.CODEC_FP8_CAST)
+    cl = Client((daemon["host"], daemon["port"]), namespace=daemon["namespace"],
+                token=daemon["token"])
+    try:
+        for k in keys:
+            cl.put(k, [prefix, b"\x7f" * (total - BLOB_PREFIX_LEN)])
+    finally:
+        cl.close()
+
+    req = StubRequest("codec-miss", toks, salt)
+    n, is_async = conn.get_num_new_matched_tokens(req, 0)
+    assert (n, is_async) == (8, False)  # the daemon HAS the blocks — the
+    # refusal happens at load time, where the codec is visible
+    conn.update_state_after_alloc(req, None, n)
+    meta = conn.build_connector_meta(
+        StubSchedulerOutput([StubNewReq(req, [4, 5, 6])], {"codec-miss": 1}))
+    conn.bind_connector_metadata(meta)
+    kv = fresh_kv()
+    conn.start_load_kv(StubForwardContext(kv))
+    assert conn.get_block_ids_with_load_errors() == {4, 5}
+    for t in kv.values():
+        assert torch.count_nonzero(t) == 0  # nothing was written
+    conn.shutdown()
 
 
 def test_layout_drift_is_a_miss_not_a_scatter(daemon):
