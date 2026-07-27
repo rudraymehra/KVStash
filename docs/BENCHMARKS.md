@@ -203,6 +203,35 @@ the KV per token. Same physics every vendor's 100k-context headline runs
 on; stated here with the formula instead of hidden behind it. The same
 loopback and single-run disclosures apply as above.
 
+### The faster-GPU cells (measured 2026-07-27, NVIDIA A100-SXM4-80GB)
+
+Same harness, same gates, same models, HF Jobs `a100-large`. Published
+precisely because the multiple SHRINKS here: `speedup = prefill(L) /
+reload(L)`, prefill got ~3.4× faster on this GPU while reload is bound by
+KV bytes, not FLOPs. A vendor picking the slow-GPU/long-context corner can
+print any multiple it likes; both corners are on this page. Raw JSONL:
+`bench/results/rig-e/chart2-ttft-a100-{llama-run1,llama-baseline,qwen32k-run1,qwen-baseline}.jsonl`.
+Single run of n=5 reps per point (the n≥3 protocol above rides the next
+paid session); every warm rep passed the exact-count hit gate and is
+path-stamped `chunked-slab`.
+
+| model @ prefix | recompute (no connector)² | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
+|---|---|---|---|---|---|
+| Llama-8B @ 8k   | 650 ms   | 1,812 ms | **304 ms** | **2.1×** | 6.0× |
+| Llama-8B @ 16k  | 1,470 ms | 3,836 ms | **582 ms** | **2.5×** | 6.6× |
+| Qwen-7B @ 16k   | 1,355 ms | 2,818 ms | **300 ms** | **4.5×** | 9.4× |
+| Qwen-7B @ 32k   | 3,215 ms | 6,090 ms | **567 ms** | **5.7×** | 10.7× |
+
+These are the fastest absolute reloads we have measured (Qwen 16k prefix
+resident in 300 ms), and the smallest multiples — both statements are true
+and both are the point. Below ~4k on this GPU the multiple approaches 1×
+and reload stops being worth the trip (see "When NOT to use kvblockd").
+Operational disclosure: the first A100 Llama attempt aborted itself — this
+GPU misses fast enough that the write-behind queue's 1 GiB default
+overflowed and the populate gate refused to continue on `dropped=2890`
+rather than publish a silently-thinner warm set; the run above uses the
+now-configurable 4 GiB queue and recorded `dropped=0 failed=0`.
+
 ---
 
 ## When NOT to use kvblockd
