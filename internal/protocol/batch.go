@@ -58,6 +58,11 @@ func ErrorStatus(err error) Status {
 // included in payload_len, ignored on receive; already-aligned → no pad).
 func padTo8(n int) int { return (n + 7) &^ 7 }
 
+// padTo8u64 is padTo8 over uint64 — for peer-controlled counts, where the
+// int conversion would wrap on a 32-bit build (int(0xFFFFFFFF) = -1,
+// padTo8(-1) = 0) before the padding math runs.
+func padTo8u64(n uint64) uint64 { return (n + 7) &^ 7 }
+
 // appendPad8 zero-pads dst so the BODY REGION (unpadded bytes, not dst's total
 // length — dst may carry a prefix) reaches the next 8-byte multiple. Pads with
 // zeros, the §0 pad byte value.
@@ -198,11 +203,15 @@ func DecodeExistsResp(body []byte, expectBitmap bool) (ExistsResp, error) {
 		}
 		return ExistsResp{Preamble: p}, nil
 	}
-	want := PreambleSize + 8
+	// Count is peer-controlled: size the expected body in uint64 so the §0
+	// pad math can never wrap the int math on a 32-bit build and slip a
+	// short body past this check into a slice-bounds panic (the
+	// DecodeGetRespHeader defense, extended to its siblings).
+	want64 := uint64(PreambleSize + 8)
 	if expectBitmap {
-		want += padTo8(int(p.Count))
+		want64 += padTo8u64(uint64(p.Count))
 	}
-	if len(body) != want {
+	if uint64(len(body)) != want64 {
 		return ExistsResp{}, ErrBodyLength
 	}
 	r := ExistsResp{
@@ -210,7 +219,8 @@ func DecodeExistsResp(body []byte, expectBitmap bool) (ExistsResp, error) {
 		NConsecutive: binary.LittleEndian.Uint32(body[PreambleSize:]),
 	}
 	if expectBitmap {
-		r.PerKey = body[PreambleSize+8 : PreambleSize+8+int(p.Count)]
+		n := int(p.Count) //nolint:gosec // G115: fits int — PreambleSize+8+n ≤ len(body), checked above
+		r.PerKey = body[PreambleSize+8 : PreambleSize+8+n]
 	}
 	return r, nil
 }
@@ -241,10 +251,14 @@ func DecodeKeyStatusResp(body []byte) (Preamble, []byte, error) {
 		}
 		return p, nil, nil
 	}
-	if len(body) != PreambleSize+padTo8(int(p.Count)) {
+	// Count is peer-controlled: uint64 sizing, as in DecodeGetRespHeader and
+	// DecodeExistsResp — int(Count) on a 32-bit build can go negative, pad to
+	// 0, pass an 8-byte body, and panic the slice below.
+	if uint64(len(body)) != uint64(PreambleSize)+padTo8u64(uint64(p.Count)) {
 		return Preamble{}, nil, ErrBodyLength
 	}
-	return p, body[PreambleSize : PreambleSize+int(p.Count)], nil
+	n := int(p.Count) //nolint:gosec // G115: fits int — PreambleSize+n ≤ len(body), checked above
+	return p, body[PreambleSize : PreambleSize+n], nil
 }
 
 // ---------------------------------------------------------------------------

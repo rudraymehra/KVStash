@@ -577,6 +577,31 @@ func TestOKExistsIsFullBodied(t *testing.T) {
 	}
 }
 
+// TestPeerControlledCountCannotWrap32Bit pins the uint64 length sizing in
+// DecodeExistsResp and DecodeKeyStatusResp against Count=0xFFFFFFFF. On a
+// 32-bit build (linux/386, linux/arm) int(Count) is -1 and padTo8(-1) is 0,
+// so these exact bodies used to pass the length check and panic the slice
+// below it — a remote crash of any 32-bit client fed by a malicious or
+// corrupt server. DecodeGetRespHeader already documents and defends this
+// class; its siblings must too. On a 64-bit host the old math also rejected
+// these bodies, so this test passes vacuously here and bites only under
+// GOARCH=386/arm — which is also why FuzzParseBatch, run only on the 64-bit
+// dev host, structurally cannot find the wrap.
+func TestPeerControlledCountCannotWrap32Bit(t *testing.T) {
+	// Key-status: an 8-byte body claiming 2^32-1 status bytes.
+	kb := AppendPreamble(nil, StatusOK, 0xFFFFFFFF)
+	if _, _, err := DecodeKeyStatusResp(kb); !errors.Is(err, ErrBodyLength) {
+		t.Fatalf("key-status Count=0xFFFFFFFF: got %v, want ErrBodyLength", err)
+	}
+	// Exists: a 16-byte body (preamble + n_consecutive + reserved) claiming a
+	// 2^32-1-key bitmap.
+	eb := AppendPreamble(nil, StatusOK, 0xFFFFFFFF)
+	eb = append(eb, 0, 0, 0, 0, 0, 0, 0, 0)
+	if _, err := DecodeExistsResp(eb, true); !errors.Is(err, ErrBodyLength) {
+		t.Fatalf("exists Count=0xFFFFFFFF: got %v, want ErrBodyLength", err)
+	}
+}
+
 // TestShortBodyGuards pins every decoder's leading length guard with bodies
 // short enough that a removed guard would read (or panic) past the input, and
 // asserts error-path returns are zero-valued.
