@@ -30,7 +30,8 @@ type session struct {
 	lendBuf       []byte            // reusable Lend extent (see Lend for the safety invariant)
 
 	streamMu    sync.Mutex
-	streams     map[uint64]*putStream // by request_id
+	streams     map[uint64]*putStream // by request_id (total size cap: maxStreamEntries)
+	liveStreams int                   // non-tombstoned entries in streams (cap: maxLiveStreams) — maintained at insert/tombstone/delete so BEGIN never scans the map
 	stagedBytes int64                 // total live PUT staging on this conn (cap: maxStagedPerConn)
 }
 
@@ -201,10 +202,25 @@ func (s *session) writeResp(c *transport.Conn, h protocol.Header, body []byte) {
 	s.writeResp2(c, h, netBuffers(body), nil)
 }
 
+// reapTimeout is the PUT-stream inactivity timeout the reaper sweeps with. A
+// zero stream_timeout_ms (a hand-rolled config that skipped Load/Validate —
+// config.Validate floors the knob at 5s) falls back to the protocol default
+// instead of sweeping with timeout 0, which would tombstone EVERY live stream
+// on the first tick. Same never-run-degenerate posture as NewS3Compat's
+// deadlines and the transport's stall floor, the two other consumers of this
+// knob.
+func (s *session) reapTimeout() time.Duration {
+	ms := s.srv.cfg.StreamTimeoutMS
+	if ms == 0 {
+		ms = protocol.DefaultStreamTimeoutMS
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 // reaper tombstones PUT streams idle longer than the negotiated timeout (§5),
 // freeing their staging. It exits when the connection is done.
 func (s *session) reaper(c *transport.Conn) {
-	timeout := time.Duration(s.srv.cfg.StreamTimeoutMS) * time.Millisecond
+	timeout := s.reapTimeout()
 	tick := timeout / 4
 	if tick <= 0 {
 		tick = time.Second
@@ -239,11 +255,7 @@ func (s *session) sweepStreams(now time.Time, timeout time.Duration) {
 		case now.Sub(st.lastActive) > timeout:
 			// Idle live stream: free the staging extent AND the digest, then
 			// tombstone the id until it gets a terminal response or is reaped.
-			s.stagedBytes -= int64(len(st.buf))
-			st.buf = nil
-			st.digest = nil
-			st.tombstoned = true
-			st.tombstonedAt = now
+			s.tombstoneLive(st, now)
 		}
 	}
 }

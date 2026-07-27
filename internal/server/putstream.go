@@ -11,13 +11,16 @@ import (
 )
 
 // Per-connection PUT_STREAM resource bounds. BEGIN reserves NOTHING (staging
-// grows lazily as CHUNKs arrive), and both the live-stream count and the total
-// staged bytes are capped — so a client cannot pin server memory with cheap
-// BEGIN-only frames (a measured amplification: 4 KiB of BEGINs could otherwise
-// pin ~191 MiB). Excess is refused with ERR_BUSY (backpressure), not accepted.
+// grows lazily as CHUNKs arrive), and the live-stream count, the TOTAL stream
+// map size (live + lingering tombstones), and the total staged bytes are all
+// capped — every resource a peer can mint is counted and capped, so a client
+// cannot pin server memory with cheap BEGIN-only frames (a measured
+// amplification: 4 KiB of BEGINs could otherwise pin ~191 MiB). Excess is
+// refused with ERR_BUSY (backpressure), not accepted.
 const (
 	maxLiveStreams   = 256
-	maxStagedPerConn = 256 << 20 // 256 MiB of in-flight PUT staging per connection
+	maxStreamEntries = 4 * maxLiveStreams // stream-map bound incl. tombstones awaiting the reap grace
+	maxStagedPerConn = 256 << 20          // 256 MiB of in-flight PUT staging per connection
 )
 
 // writeResp2 queues a multi-slice response (the BATCH_GET one-writev shape).
@@ -52,18 +55,6 @@ func (s *session) handlePutStream(c *transport.Conn, h protocol.Header, body []b
 	}
 }
 
-// liveStreamCount returns the number of non-tombstoned streams. Caller holds
-// streamMu.
-func (s *session) liveStreamCount() int {
-	n := 0
-	for _, st := range s.streams {
-		if !st.tombstoned {
-			n++
-		}
-	}
-	return n
-}
-
 func (s *session) putBegin(c *transport.Conn, h protocol.Header, body []byte) {
 	b, err := protocol.DecodePutBegin(body)
 	s.consume(c, h, body)
@@ -89,15 +80,19 @@ func (s *session) putBegin(c *transport.Conn, h protocol.Header, body []byte) {
 		s.respondStatus(c, h, protocol.StatusErrMalformed)
 		return
 	}
-	// Write-once idempotent hit: the block is already sealed, so tell the
-	// client to stop and tombstone the id (optimistic chunks get discarded).
+	// The reject paths below insert NOTHING: §5 treats a request_id with no
+	// BEGIN exactly as tombstoned (optimistic CHUNKs discarded silently,
+	// COMMIT/ABORT → ERR_STALE_STREAM), so a physical tombstone here would buy
+	// no behavior — while letting BEGIN-rejects mint uncapped map entries at
+	// wire rate for the whole reap grace period (a measured DoS surface).
+
+	// Write-once idempotent hit: the block is already sealed — tell the
+	// client to stop.
 	if sealed {
-		s.tombstone(h.RequestID, h.Key)
 		s.respondStatus(c, h, protocol.StatusOKExists)
 		return
 	}
 	if b.TotalLen > s.limits.MaxBlobLen {
-		s.tombstone(h.RequestID, h.Key)
 		s.respondStatus(c, h, protocol.StatusErrTooLarge)
 		return
 	}
@@ -112,16 +107,18 @@ func (s *session) putBegin(c *transport.Conn, h protocol.Header, body []byte) {
 		beginOK = qc.CanStore(b.TotalLen)
 	}
 	if !beginOK {
-		s.tombstone(h.RequestID, h.Key)
 		s.respondStatus(c, h, protocol.StatusErrQuotaBytes)
 		return
 	}
-	if s.liveStreamCount() >= maxLiveStreams {
-		// Too many concurrent streams on this connection: backpressure, don't
-		// allocate. No tombstone (the id was never accepted).
+	if s.liveStreams >= maxLiveStreams || len(s.streams) >= maxStreamEntries {
+		// Too many concurrent streams — or a map full of tombstones awaiting
+		// the reap grace — on this connection: backpressure, don't allocate.
+		// The map-size check keeps the insert below from growing the table
+		// past its bound (accepted BEGINs are the only inserts).
 		s.respondStatus(c, h, protocol.StatusErrBusy)
 		return
 	}
+	s.liveStreams++
 	s.streams[h.RequestID] = &putStream{
 		ns:         s.ns,
 		key:        h.Key,
@@ -151,11 +148,11 @@ func (s *session) putChunk(c *transport.Conn, h protocol.Header, body []byte) {
 		// (§3.4) — an idle client cannot pin staging with free empty frames.
 	case st.received+h.PayloadLen > st.totalLen:
 		// Overflow beyond the declared length → tombstone; COMMIT will fail.
-		s.tombstoneLive(st)
+		s.tombstoneLive(st, nowFn())
 	case s.stagedBytes+int64(h.PayloadLen) > maxStagedPerConn:
 		// Per-connection staging cap reached: tombstone this stream rather than
 		// grow unbounded (the COMMIT then fails with ERR_STALE_STREAM).
-		s.tombstoneLive(st)
+		s.tombstoneLive(st, nowFn())
 	default:
 		if st.buf == nil {
 			// First real chunk: reserve EXACTLY total_len (no append slack to
@@ -206,6 +203,7 @@ func (s *session) putCommit(c *transport.Conn, h protocol.Header, body []byte) {
 	}
 	// Take the stream out of the table under the lock; validate/commit outside.
 	delete(s.streams, h.RequestID)
+	s.liveStreams--
 	s.stagedBytes -= int64(len(st.buf))
 	buf, totalLen := st.buf, st.totalLen
 	s.streamMu.Unlock()
@@ -259,6 +257,9 @@ func (s *session) putAbort(c *transport.Conn, h protocol.Header, body []byte) {
 	if ok {
 		s.stagedBytes -= int64(len(st.buf))
 		delete(s.streams, h.RequestID)
+		if !st.tombstoned {
+			s.liveStreams--
+		}
 	}
 	s.streamMu.Unlock()
 	if !ok || st.tombstoned {
@@ -268,24 +269,20 @@ func (s *session) putAbort(c *transport.Conn, h protocol.Header, body []byte) {
 	s.respondStatus(c, h, protocol.StatusOK)
 }
 
-// tombstone records a request_id whose stream must not stage bytes (OK_EXISTS,
-// too-large, or over-cap). Caller holds streamMu.
-func (s *session) tombstone(id uint64, key [32]byte) {
-	s.streams[id] = &putStream{ns: s.ns, key: key, tombstoned: true, tombstonedAt: nowFn()}
-}
-
-// tombstoneLive converts an existing live stream to a tombstone, releasing
-// BOTH heavy resources it may hold: the staging extent (counted in stagedBytes)
-// and the ~1.2 KiB xxh3 digest. Dropping the digest matters — a tombstone
-// lingers for the reap grace period and is uncounted by every cap, so keeping
-// the Hasher would let cheap overflow/over-cap chunks pin heap unboundedly.
+// tombstoneLive converts an existing live stream to a tombstone (the ONLY way
+// tombstones are minted — BEGIN rejects insert nothing), releasing BOTH heavy
+// resources it may hold: the staging extent (counted in stagedBytes) and the
+// ~1.2 KiB xxh3 digest. Dropping the digest matters — a tombstone lingers for
+// the reap grace period and is uncounted by the live cap, so keeping the
+// Hasher would let cheap overflow/over-cap chunks pin heap unboundedly.
 // Caller holds streamMu.
-func (s *session) tombstoneLive(st *putStream) {
+func (s *session) tombstoneLive(st *putStream, now time.Time) {
 	s.stagedBytes -= int64(len(st.buf))
 	st.buf = nil
 	st.digest = nil
 	st.tombstoned = true
-	st.tombstonedAt = nowFn()
+	st.tombstonedAt = now
+	s.liveStreams--
 }
 
 // nowFn is time.Now, indirected so tests can pin stream timing.
