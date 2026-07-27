@@ -162,3 +162,54 @@ def test_client_expired_deadline_is_all_misses(daemon):
         assert cl.batch_get_scatter([key], 0, alloc) == [p.Status.OK]
     finally:
         cl.close()
+
+
+class _CountingSock:
+    """recv_into in fixed chunks; counts settimeout re-arms."""
+
+    def __init__(self, n, chunk, op_timeout=5.0):
+        self.left = n
+        self.chunk = chunk
+        self.settimeouts = 0
+        self._t = op_timeout
+
+    def gettimeout(self):
+        return self._t
+
+    def settimeout(self, t):
+        self.settimeouts += 1
+        self._t = t
+
+    def recv_into(self, view, n):
+        take = min(self.chunk, n, self.left)
+        view[:take] = bytes(take)
+        self.left -= take
+        return take
+
+
+def _counting_conn(sock):
+    limits = SimpleNamespace(max_batch_keys=64, max_frame_len=1 << 20,
+                             max_blob_len=1 << 20, initial_credit=0, features=0)
+    return _Conn(sock, limits, namespace_id=1, verify=False)
+
+
+def test_recv_rearm_skipped_while_budget_slack():
+    """With a finite op timeout and a far deadline the hot loop must not
+    re-arm the socket at all — the clamp binds only in the endgame. (The
+    per-iteration deadline CHECK still runs; the trickle test above proves
+    the endgame path.)"""
+    sock = _CountingSock(n=1024, chunk=64)
+    conn = _counting_conn(sock)
+    conn._deadline = time.monotonic() + 3600.0
+    conn._recv_into(memoryview(bytearray(1024)))
+    assert sock.settimeouts == 0
+
+
+def test_recv_rearm_every_iteration_when_blocking():
+    """No steady-state op timeout (blocking socket): the deadline is the ONLY
+    bound, so every recv must be clamped."""
+    sock = _CountingSock(n=256, chunk=64, op_timeout=None)
+    conn = _counting_conn(sock)
+    conn._deadline = time.monotonic() + 3600.0
+    conn._recv_into(memoryview(bytearray(256)))
+    assert sock.settimeouts == 4

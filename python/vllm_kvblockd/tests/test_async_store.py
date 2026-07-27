@@ -500,3 +500,21 @@ def test_sync_flag_bit_identical(daemon):
     assert vals_sync == vals_async
     sync_conn.shutdown()
     async_conn.shutdown()
+
+
+def test_drain_parks_while_a_load_is_inflight(daemon):
+    """Load-priority gate: with a load in flight the kvb-store drain parks
+    (bounded by the ceiling) instead of contending for the wire; releasing
+    the gate drains promptly and the flush contract is untouched."""
+    conn = make_conn(daemon)
+    with conn._sq_cond:
+        conn._loads_inflight += 1
+    assert conn._sq_enqueue(b"\x11" * 32, bytearray(b"x" * 64))
+    time.sleep(0.1)  # well inside _DRAIN_GATE_CEILING_S
+    with conn._sq_cond:
+        assert len(conn._sq) == 1  # parked, not popped
+    with conn._sq_cond:
+        conn._loads_inflight -= 1
+        conn._sq_cond.notify_all()
+    assert conn._store_flush(5.0) == 0
+    conn.shutdown()

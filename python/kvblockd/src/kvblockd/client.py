@@ -26,6 +26,9 @@ logger = logging.getLogger("kvblockd.client")
 
 _MAX_SCRATCH = 1 << 20  # reused metadata-read buffer cap (mirrors Go maxReadReuse)
 _MAX_GET_FANOUT = 4     # batch_get_scatter shard ceiling (one pooled conn each)
+# Vectored send: header + body in one syscall with no payload copy. Absent
+# only on platforms without sendmsg (Windows); the join fallback stays.
+_HAS_SENDMSG = hasattr(socket.socket, "sendmsg")
 
 
 class Limits:
@@ -69,12 +72,53 @@ class _Conn:
 
     # --- framing ---
     def _send_frame(self, hdr: p.Header, bufs=()):
-        payload = b"".join(bytes(b) for b in bufs)
-        hdr.payload_len = len(payload)
+        """Send one frame. The vectored path hands the kernel the header and
+        the caller's buffers as one iovec list — a 0.4–2.5MB blob is never
+        duplicated under the GIL (the old join built a full payload copy per
+        PUT_CHUNK on the store path) and header+body coalesce into one
+        segment. The kernel may accept fewer bytes than offered, so resume
+        by advancing through the iovec list — and because a Python resume
+        loop would otherwise grant each sendmsg a FRESH op-timeout window
+        (sendall bounds the WHOLE operation in C; a peer draining a few
+        bytes per window would extend one frame forever), the loop arms one
+        whole-frame send deadline: op_timeout from entry, clamped by any
+        armed per-call deadline, enforced before every sendmsg and restored
+        after (mirroring _recv_into / batch_get_scatter)."""
+        views = [memoryview(b).cast("B") for b in bufs if len(b)]
+        hdr.payload_len = sum(v.nbytes for v in views)
         try:
-            self._sock.sendall(hdr.pack())
-            if payload:
-                self._sock.sendall(payload)
+            if not _HAS_SENDMSG:
+                payload = b"".join(views)
+                self._sock.sendall(hdr.pack())
+                if payload:
+                    self._sock.sendall(payload)
+                return
+            deadline = self._deadline
+            if self._op_timeout is not None:
+                send_by = time.monotonic() + self._op_timeout
+                deadline = send_by if deadline is None else min(deadline, send_by)
+            pending = [memoryview(hdr.pack())] + views
+            clamped = False
+            try:
+                while pending:
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise ConnectionLost("send deadline exceeded (conn evicted)")
+                        self._sock.settimeout(remaining)
+                        clamped = True
+                    sent = self._sock.sendmsg(pending)
+                    while pending and sent >= len(pending[0]):
+                        sent -= len(pending[0])
+                        pending.pop(0)
+                    if sent:
+                        pending[0] = pending[0][sent:]
+            finally:
+                if clamped:
+                    try:
+                        self._sock.settimeout(self._op_timeout)
+                    except OSError:
+                        pass  # dead socket: the conn is being evicted regardless
         except OSError as e:
             raise ConnectionLost(f"send: {e}") from e
 
@@ -87,16 +131,25 @@ class _Conn:
         got = 0
         n = len(view)
         deadline = self._deadline
+        op_timeout = self._op_timeout
         while got < n:
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise ConnectionLost("recv deadline exceeded (conn evicted)")
-                try:
-                    self._sock.settimeout(remaining if self._op_timeout is None
-                                          else min(self._op_timeout, remaining))
-                except OSError as e:
-                    raise ConnectionLost(f"settimeout: {e}") from e
+                # Re-arm the socket only when the remaining budget actually
+                # binds. With a finite op timeout the clamp is a no-op for
+                # the whole healthy life of a load (remaining >> op_timeout),
+                # and remaining decreases monotonically within an armed call,
+                # so once it binds it binds every iteration after — skipping
+                # the no-op re-arms keeps this hot loop at one clock read per
+                # recv. The per-iteration deadline CHECK above (the trickle
+                # armor) is unconditional either way.
+                if op_timeout is None or remaining < op_timeout:
+                    try:
+                        self._sock.settimeout(remaining)
+                    except OSError as e:
+                        raise ConnectionLost(f"settimeout: {e}") from e
             try:
                 r = self._sock.recv_into(view[got:], n - got)
             except OSError as e:

@@ -139,6 +139,11 @@ CODE_DTYPES = {v: k for k, v in DTYPE_CODES.items()}
 # After a failed dial, further dial attempts short-circuit for this long —
 # callers degrade to a miss instantly instead of each eating a connect timeout.
 _REDIAL_BACKOFF_S = 5.0
+# Load-priority drain gate: while the engine is actively pulling KV, the
+# kvb-store drain parks (bounded) so store traffic never contends with a
+# latency-path load for the wire or the GIL. The ceiling guarantees a
+# wedged counter can only ever DELAY the drain, never stop it.
+_DRAIN_GATE_CEILING_S = 0.25
 
 # Chunked H2D scatter: blocks per chunk and the GPU scratch depth. One chunk
 # = one non_blocking H2D of a contiguous pinned-slab region + one index_copy_
@@ -405,6 +410,9 @@ class KvblockdConnector(_Base):
         self.dropped_puts = 0
         self.dropped_put_bytes = 0
         self.failed_puts = 0
+        # Loads currently pulling KV (guarded by _sq_cond like all queue
+        # state); the drain's load-priority gate parks on it.
+        self._loads_inflight = 0
 
     # ------------------------------------------------------------------
     # client plumbing (lazy: import/instantiate must succeed with no daemon)
@@ -611,7 +619,7 @@ class KvblockdConnector(_Base):
         meta = KvblockdConnectorMetadata()
         try:
             self._build_meta_into(meta, scheduler_output)
-        except Exception as e:  # noqa: BLE001 — never raise: an empty meta = a no-op step
+        except Exception as e:  # noqa: BLE001 — never raise: last-resort boundary; per-request failures are flagged inside
             self._log.maybe("meta", "build_connector_meta failed (no-op step)", e)
         return meta
 
@@ -619,46 +627,10 @@ class KvblockdConnector(_Base):
         num_scheduled = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
 
         for new_req in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
-            rid = new_req.req_id
-            token_ids = list(new_req.prompt_token_ids or [])
-            aligned = align_to_block_size(len(token_ids), self._block_size)
-            if aligned <= 0:
-                self._need_load_blocks.pop(rid, None)
-                continue
-            load_start, n_load = self._need_load_blocks.pop(rid, (0, 0))
-            # Store only blocks FULLY computed after this step — under chunked
-            # prefill later chunks arrive via scheduled_cached_reqs below.
-            computed = int(getattr(new_req, "num_computed_tokens", 0) or 0)
-            done = min(aligned, computed + int(num_scheduled.get(rid, 0)))
-            store_end = done // self._block_size
-            request = self._inflight.get(rid)
-            salt = getattr(request, "cache_salt", None) if request is not None else None
-            # Strict .identifier: a repr()-derived id differs per process, so
-            # it can never round-trip as a key — failing the step (caught by
-            # build_connector_meta -> no-op) beats minting a nondeterministic
-            # keyspace. v0.25 mm features always carry .identifier.
-            mm_ids = [f.identifier for f in (new_req.mm_features or [])]
-            block_ids = list(new_req.block_ids[0])
-            self._blocks[rid] = list(block_ids)
-            # Blocks below load_start are the local prefix-cache hit and
-            # blocks below load_start+n_load were just fetched — when a load
-            # happened, the daemon's consecutive prefix proved all of them
-            # present, so storing starts after the loaded range.
-            store_start = load_start + n_load
-            meta.requests.append(
-                KvbReqMeta(
-                    req_id=rid,
-                    token_ids=token_ids[:aligned],
-                    cache_salt=salt,
-                    mm_ids=mm_ids,
-                    lora_name=self._lora_name(request) if request is not None else "",
-                    block_ids=block_ids,
-                    load_start_block=load_start,
-                    num_load_blocks=n_load,
-                    store_start_block=store_start,
-                    store_end_block=max(store_end, store_start),
-                )
-            )
+            try:
+                self._build_new_req_meta(meta, new_req, num_scheduled)
+            except Exception as e:  # noqa: BLE001 — one bad request must not kill the step
+                self._flag_failed_req(meta, getattr(new_req, "req_id", None), new_req, e)
 
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if cached is not None:
@@ -668,70 +640,174 @@ class KvblockdConnector(_Base):
         # (preempted before running) stays queued for the resumed path; if the
         # request is gone entirely, request_finished prunes it.
 
+    def _build_new_req_meta(self, meta, new_req, num_scheduled) -> None:
+        rid = new_req.req_id
+        token_ids = list(new_req.prompt_token_ids or [])
+        aligned = align_to_block_size(len(token_ids), self._block_size)
+        # PEEK the load promise; it is consumed only after its row (or its
+        # flag-only stand-in) is in the meta — any exception in between must
+        # leave it recoverable by _flag_failed_req.
+        load_start, n_load = self._need_load_blocks.get(rid, (0, 0))
+        if aligned <= 0:
+            if n_load > 0:  # a promise with no storable prefix: flag, never drop
+                if self._flag_only_row(meta, rid, load_start, n_load,
+                                       self._known_block_ids(rid, new_req)):
+                    self._need_load_blocks.pop(rid, None)
+            else:
+                self._need_load_blocks.pop(rid, None)
+            return
+        # Store only blocks FULLY computed after this step — under chunked
+        # prefill later chunks arrive via scheduled_cached_reqs below.
+        computed = int(getattr(new_req, "num_computed_tokens", 0) or 0)
+        done = min(aligned, computed + int(num_scheduled.get(rid, 0)))
+        store_end = done // self._block_size
+        request = self._inflight.get(rid)
+        salt = getattr(request, "cache_salt", None) if request is not None else None
+        # Strict .identifier: a repr()-derived id differs per process, so
+        # it can never round-trip as a key — failing THIS request (caught by
+        # the per-request armor, which flags the promised range) beats
+        # minting a nondeterministic keyspace. v0.25 mm features always
+        # carry .identifier.
+        mm_ids = [f.identifier for f in (new_req.mm_features or [])]
+        block_ids = list(new_req.block_ids[0])
+        self._blocks[rid] = list(block_ids)
+        # Blocks below load_start are the local prefix-cache hit and
+        # blocks below load_start+n_load were just fetched — when a load
+        # happened, the daemon's consecutive prefix proved all of them
+        # present, so storing starts after the loaded range.
+        store_start = load_start + n_load
+        meta.requests.append(
+            KvbReqMeta(
+                req_id=rid,
+                token_ids=token_ids[:aligned],
+                cache_salt=salt,
+                mm_ids=mm_ids,
+                lora_name=self._lora_name(request) if request is not None else "",
+                block_ids=block_ids,
+                load_start_block=load_start,
+                num_load_blocks=n_load,
+                store_start_block=store_start,
+                store_end_block=max(store_end, store_start),
+            )
+        )
+        self._need_load_blocks.pop(rid, None)  # promise delivered — consume it
+
+    def _flag_failed_req(self, meta, rid, new_req, err) -> None:
+        """Per-request meta build failed. The other requests still get their
+        rows, and a recorded load promise MUST surface: the scheduler already
+        counted those blocks computed, so an unfilled, unflagged block is
+        silent garbage attention (this file's own worker-side invariant).
+        The promise is PEEKED here and consumed only if a flag row actually
+        landed — with no known block ids the promise stays queued so a later
+        step that carries ids can still emit the load (or flag) row."""
+        if rid is None:
+            self._log.maybe("meta-req", "kvblockd meta build failed (no req_id)", err)
+            return
+        load_start, n_load = self._need_load_blocks.get(rid, (0, 0))
+        self._log.maybe(
+            "meta-req",
+            f"kvblockd meta build failed req={rid}"
+            + (" — flagging the promised load range" if n_load > 0 else ""),
+            err,
+        )
+        if n_load > 0:
+            if self._flag_only_row(meta, rid, load_start, n_load,
+                                   self._known_block_ids(rid, new_req)):
+                self._need_load_blocks.pop(rid, None)  # consumed WITH the row
+
+    def _known_block_ids(self, rid, new_req=None) -> list[int] | None:
+        bids = self._blocks.get(rid)
+        if bids:
+            return bids
+        if new_req is not None:
+            try:
+                return list(new_req.block_ids[0])
+            except Exception:  # noqa: BLE001 — shape churn here may be exactly what failed the build
+                return None
+        return None
+
+    def _flag_only_row(self, meta, rid, load_start, n_load, block_ids) -> bool:
+        """Emit a row whose ONLY job is to surface a promised-but-unbuildable
+        load range: empty token_ids derive zero keys, so the worker's
+        no-derivable-key armor flags every promised bid for recompute, and
+        the empty store range keeps wait_for_save away from it. Returns True
+        when the row landed (the caller may consume the promise); False when
+        no physical ids are known — the caller must KEEP the promise."""
+        if n_load <= 0:
+            return True
+        if not block_ids:
+            # Nothing to hand to get_block_ids_with_load_errors — disclose
+            # and keep the promise; vanishing silently is the one forbidden
+            # outcome.
+            self._log.maybe("meta-req",
+                            f"promised load range has no known block ids yet req={rid}")
+            return False
+        meta.requests.append(
+            KvbReqMeta(
+                req_id=rid,
+                token_ids=[],
+                cache_salt=None,
+                mm_ids=[],
+                lora_name="",
+                block_ids=list(block_ids),
+                load_start_block=load_start,
+                num_load_blocks=n_load,
+                store_start_block=load_start + n_load,
+                store_end_block=load_start + n_load,
+            )
+        )
+        return True
+
     def _build_cached_meta(self, meta, cached, num_scheduled) -> None:
         req_ids = list(getattr(cached, "req_ids", []) or [])
         resumed = getattr(cached, "resumed_req_ids", set()) or set()
         computed_list = getattr(cached, "num_computed_tokens", []) or []
         new_block_ids = getattr(cached, "new_block_ids", []) or []
         for i, rid in enumerate(req_ids):
-            request = self._inflight.get(rid)
-            if request is None:
-                continue
-            computed = int(computed_list[i]) if i < len(computed_list) else 0
-            scheduled = int(num_scheduled.get(rid, 0))
-            all_tokens = list(getattr(request, "all_token_ids", None) or [])
-            n_prompt = int(getattr(request, "num_prompt_tokens", len(all_tokens)) or 0)
-            aligned = align_to_block_size(n_prompt, self._block_size)
-            if aligned <= 0:
-                continue
-            # Keep the accumulated block list current: for a resumed request
-            # new_block_ids IS the full list (the preempted blocks were
-            # freed); otherwise it appends. Accumulate only from a tracked
-            # base — extending an unseen request would misindex every block.
-            blocks_i = new_block_ids[i] if i < len(new_block_ids) else None
-            if rid in resumed:
-                if blocks_i is not None:
-                    self._blocks[rid] = list(blocks_i[0])
-                else:  # pre-preemption list is stale (those blocks were freed)
-                    self._blocks.pop(rid, None)
-            elif blocks_i is not None and rid in self._blocks:
-                self._blocks[rid].extend(blocks_i[0])
-            block_ids = self._blocks.get(rid)
-            done = min(aligned, computed + scheduled)
-            if rid in resumed and rid in self._need_load_blocks:
-                load_start, n_load = self._need_load_blocks.pop(rid)
-                if block_ids is None:
-                    continue
-                # Blocks computed during the resume step itself still need a
-                # store; everything at/below the loaded range is present.
-                store_start = max(load_start + n_load, computed // self._block_size)
-                meta.requests.append(
-                    KvbReqMeta(
-                        req_id=rid,
-                        token_ids=all_tokens[:aligned],
-                        cache_salt=getattr(request, "cache_salt", None),
-                        mm_ids=self._mm_ids(request),
-                        lora_name=self._lora_name(request),
-                        block_ids=list(block_ids),
-                        load_start_block=load_start,
-                        num_load_blocks=n_load,
-                        store_start_block=store_start,
-                        store_end_block=max(done // self._block_size, store_start),
-                    )
-                )
-                continue
-            # Chunked-prefill continuation: store the blocks this step completes.
-            if computed >= aligned:
-                continue  # prompt fully covered (decode steps store nothing)
-            store_start = computed // self._block_size
-            store_end = done // self._block_size
-            if store_end <= store_start:
-                continue
-            # A store row needs physical ids up to store_end; a shorter list
-            # means tracking gapped (e.g. connector restarted mid-request) —
-            # skip rather than guess (a smaller cache, never a wrong byte).
-            if not block_ids or len(block_ids) < store_end:
-                continue
+            try:
+                self._build_cached_req_meta(meta, rid, i, resumed, computed_list,
+                                            new_block_ids, num_scheduled)
+            except Exception as e:  # noqa: BLE001 — one bad request must not kill the step
+                self._flag_failed_req(meta, rid, None, e)
+
+    def _build_cached_req_meta(self, meta, rid, i, resumed, computed_list,
+                               new_block_ids, num_scheduled) -> None:
+        request = self._inflight.get(rid)
+        if request is None:
+            return
+        computed = int(computed_list[i]) if i < len(computed_list) else 0
+        scheduled = int(num_scheduled.get(rid, 0))
+        all_tokens = list(getattr(request, "all_token_ids", None) or [])
+        n_prompt = int(getattr(request, "num_prompt_tokens", len(all_tokens)) or 0)
+        aligned = align_to_block_size(n_prompt, self._block_size)
+        if aligned <= 0:
+            return
+        # Keep the accumulated block list current: for a resumed request
+        # new_block_ids IS the full list (the preempted blocks were
+        # freed); otherwise it appends. Accumulate only from a tracked
+        # base — extending an unseen request would misindex every block.
+        blocks_i = new_block_ids[i] if i < len(new_block_ids) else None
+        if rid in resumed:
+            if blocks_i is not None:
+                self._blocks[rid] = list(blocks_i[0])
+            else:  # pre-preemption list is stale (those blocks were freed)
+                self._blocks.pop(rid, None)
+        elif blocks_i is not None and rid in self._blocks:
+            self._blocks[rid].extend(blocks_i[0])
+        block_ids = self._blocks.get(rid)
+        done = min(aligned, computed + scheduled)
+        if rid in resumed and rid in self._need_load_blocks:
+            if block_ids is None:
+                # No physical ids this step: KEEP the promise queued (the
+                # request must surface with blocks before it can run) and
+                # disclose — popping here would drop it silently.
+                self._log.maybe("meta-req",
+                                f"resumed load promise kept — no block ids yet req={rid}")
+                return
+            load_start, n_load = self._need_load_blocks[rid]  # peek; consumed below
+            # Blocks computed during the resume step itself still need a
+            # store; everything at/below the loaded range is present.
+            store_start = max(load_start + n_load, computed // self._block_size)
             meta.requests.append(
                 KvbReqMeta(
                     req_id=rid,
@@ -740,12 +816,48 @@ class KvblockdConnector(_Base):
                     mm_ids=self._mm_ids(request),
                     lora_name=self._lora_name(request),
                     block_ids=list(block_ids),
-                    load_start_block=0,
-                    num_load_blocks=0,
+                    load_start_block=load_start,
+                    num_load_blocks=n_load,
                     store_start_block=store_start,
-                    store_end_block=store_end,
+                    store_end_block=max(done // self._block_size, store_start),
                 )
             )
+            self._need_load_blocks.pop(rid, None)  # promise delivered — consume it
+            return
+        # Chunked-prefill continuation: store the blocks this step completes.
+        if rid in self._need_load_blocks:
+            # An unconsumed load promise means some counted-computed blocks
+            # were never fetched OR flagged — storing them would publish the
+            # garbage cache-wide under content-chained keys. Skip (a smaller
+            # cache, never a wrong byte); the promise stays queued.
+            self._log.maybe("meta-req",
+                            f"store skipped under a pending load promise req={rid}")
+            return
+        if computed >= aligned:
+            return  # prompt fully covered (decode steps store nothing)
+        store_start = computed // self._block_size
+        store_end = done // self._block_size
+        if store_end <= store_start:
+            return
+        # A store row needs physical ids up to store_end; a shorter list
+        # means tracking gapped (e.g. connector restarted mid-request) —
+        # skip rather than guess (a smaller cache, never a wrong byte).
+        if not block_ids or len(block_ids) < store_end:
+            return
+        meta.requests.append(
+            KvbReqMeta(
+                req_id=rid,
+                token_ids=all_tokens[:aligned],
+                cache_salt=getattr(request, "cache_salt", None),
+                mm_ids=self._mm_ids(request),
+                lora_name=self._lora_name(request),
+                block_ids=list(block_ids),
+                load_start_block=0,
+                num_load_blocks=0,
+                store_start_block=store_start,
+                store_end_block=store_end,
+            )
+        )
 
     def request_finished(self, request, block_ids):
         rid = getattr(request, "request_id", None)
@@ -872,14 +984,25 @@ class KvblockdConnector(_Base):
         except Exception:  # noqa: BLE001 — never-raise boundary: missing metadata = nothing to load this step
             return
         requests = getattr(metadata, "requests", None) or []
-        for req in requests:
-            if req.num_load_blocks > 0:
+        loads = [req for req in requests if req.num_load_blocks > 0]
+        if not loads:
+            return
+        # Raise the load-priority gate for the whole pull: the kvb-store
+        # drain parks (bounded) instead of contending for the wire/GIL.
+        with self._sq_cond:
+            self._loads_inflight += 1
+        try:
+            for req in loads:
                 try:
                     self._load_one(req)
                 except Exception as e:  # noqa: BLE001 — never raise; blocks flagged as errors
                     self._log.maybe("load", f"kvblockd load failed req={req.req_id}", e)
                     self._drop_client(e)
                     self._load_errors.update(self._load_range_ids(req))
+        finally:
+            with self._sq_cond:
+                self._loads_inflight -= 1
+                self._sq_cond.notify_all()
 
     def _load_one(self, req: KvbReqMeta) -> None:
         names, dtype_name, bytes_per_layer = self._layout()
@@ -1372,6 +1495,19 @@ class KvblockdConnector(_Base):
             with self._sq_cond:
                 while not self._sq and not self._store_stop:
                     self._sq_cond.wait()
+                # Load-priority gate: a load is actively pulling KV, so park
+                # (bounded by the ceiling) before spending wire/GIL on a
+                # store. Shutdown flags cut the park short — a flush is
+                # never held hostage to the gate.
+                if (self._loads_inflight > 0 and not self._store_stop
+                        and not self._store_abort):
+                    park_until = time.monotonic() + _DRAIN_GATE_CEILING_S
+                    while (self._loads_inflight > 0 and not self._store_stop
+                           and not self._store_abort):
+                        left = park_until - time.monotonic()
+                        if left <= 0:
+                            break
+                        self._sq_cond.wait(left)
                 if self._store_abort or (not self._sq and self._store_stop):
                     return
                 key, buf = self._sq.popleft()

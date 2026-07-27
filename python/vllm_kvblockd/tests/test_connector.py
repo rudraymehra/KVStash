@@ -485,3 +485,109 @@ def test_dtype_codes_match_lmcache_adapter():
     (python/lmcache_kvblockd/src/lmcache_kvblockd/meta.py)."""
     lm_meta = pytest.importorskip("lmcache_kvblockd.meta")
     assert conn_mod.DTYPE_CODES == lm_meta.DTYPE_CODES
+
+
+class _BadMMFeature:
+    """No .identifier — the strict access raises (the shape-churn case)."""
+
+
+def test_meta_failure_flags_promised_load_range(daemon):
+    """Promise armor: a per-request meta-build failure AFTER a load promise
+    must surface the promised bids via get_block_ids_with_load_errors — the
+    scheduler counted those blocks computed, so an unflagged drop would be
+    silent garbage attention. Injected failure: strict mm .identifier."""
+    conn = make_connector(daemon)
+    req = StubRequest("r-flag", list(range(100, 100 + 2 * BLOCK)), cache_salt="s-flag")
+    conn.update_state_after_alloc(req, None, 2 * BLOCK)  # promise 2 blocks
+    new_req = StubNewReq(req, [3, 5])
+    new_req.mm_features = [_BadMMFeature()]  # .identifier raises mid-build
+    meta = conn.build_connector_meta(
+        StubSchedulerOutput([new_req], {req.request_id: 0}))
+    assert len(meta.requests) == 1
+    row = meta.requests[0]
+    assert row.token_ids == [] and row.num_load_blocks == 2
+    assert row.store_end_block == row.store_start_block  # flag-only: no store
+    assert req.request_id not in conn._need_load_blocks  # consumed, not leaked
+    conn.bind_connector_metadata(meta)
+    conn.start_load_kv(StubForwardContext(fresh_kv()))
+    assert conn.get_block_ids_with_load_errors() == {3, 5}
+    conn.shutdown()
+
+
+def test_one_bad_request_does_not_kill_the_step(daemon):
+    """Per-request isolation: a request whose meta build raises must not cost
+    the OTHER requests their rows (the old boundary no-opped the whole step)."""
+    conn = make_connector(daemon)
+    n_tok = 2 * BLOCK + 1  # +1: the last token is never storable
+    bad = StubRequest("r-bad", list(range(n_tok)), cache_salt="s-bad")
+    good = StubRequest("r-good", list(range(n_tok)), cache_salt="s-good")
+    conn.update_state_after_alloc(bad, None, 0)
+    conn.update_state_after_alloc(good, None, 0)
+    bad_new = StubNewReq(bad, [0, 1])
+    bad_new.mm_features = [_BadMMFeature()]
+    good_new = StubNewReq(good, [2, 3])
+    meta = conn.build_connector_meta(StubSchedulerOutput(
+        [bad_new, good_new], {"r-bad": n_tok, "r-good": n_tok}))
+    # The bad request held no promise -> no row; the good row is intact.
+    assert [r.req_id for r in meta.requests] == ["r-good"]
+    assert meta.requests[0].store_end_block == 2
+    conn.shutdown()
+
+
+def test_resumed_promise_survives_missing_block_ids(daemon):
+    """A resumed step that carries no block ids must KEEP the load promise
+    queued (the old path popped it and dropped it silently); the next step
+    that does carry ids emits the load row and consumes the promise."""
+    conn = make_connector(daemon)
+    req = StubRequest("r-res", list(range(200, 200 + 2 * BLOCK)), cache_salt="s-res")
+    conn.update_state_after_alloc(req, None, 2 * BLOCK)
+    cached = StubCachedReqs(["r-res"], [0], [None], resumed=["r-res"])
+    meta = conn.build_connector_meta(StubSchedulerOutput([], {}, cached=cached))
+    assert meta.requests == []
+    assert conn._need_load_blocks.get("r-res") == (0, 2)  # promise kept
+    cached2 = StubCachedReqs(["r-res"], [0], [([4, 6],)], resumed=["r-res"])
+    meta2 = conn.build_connector_meta(
+        StubSchedulerOutput([], {"r-res": 2 * BLOCK}, cached=cached2))
+    assert len(meta2.requests) == 1
+    assert meta2.requests[0].num_load_blocks == 2
+    assert meta2.requests[0].block_ids == [4, 6]
+    assert "r-res" not in conn._need_load_blocks  # consumed with the row
+    conn.shutdown()
+
+
+def test_failed_cached_step_keeps_unflaggable_promise(daemon):
+    """Ladder HIGH: a cached-step failure with NO derivable block ids must
+    KEEP the promise (the first fix popped it and lost the bids forever);
+    the next step that carries real ids emits the load row and consumes it."""
+    conn = make_connector(daemon)
+    req = StubRequest("r-churn", list(range(300, 300 + 2 * BLOCK + 1)),
+                      cache_salt="s-churn")
+    conn.update_state_after_alloc(req, None, 2 * BLOCK)
+    bad = StubCachedReqs(["r-churn"], [0], [42], resumed=["r-churn"])  # unsubscriptable
+    meta = conn.build_connector_meta(StubSchedulerOutput([], {}, cached=bad))
+    assert meta.requests == []  # nothing flaggable this step...
+    assert conn._need_load_blocks.get("r-churn") == (0, 2)  # ...promise survives
+    ok = StubCachedReqs(["r-churn"], [0], [([4, 6],)], resumed=["r-churn"])
+    meta2 = conn.build_connector_meta(
+        StubSchedulerOutput([], {"r-churn": 2 * BLOCK + 1}, cached=ok))
+    assert len(meta2.requests) == 1
+    assert meta2.requests[0].num_load_blocks == 2
+    assert "r-churn" not in conn._need_load_blocks
+    conn.shutdown()
+
+
+def test_pending_promise_blocks_continuation_store(daemon):
+    """A request still carrying an unconsumed load promise must not store its
+    blocks from a continuation step: some counted-computed blocks were never
+    fetched, and content-chained keys would publish them cache-wide."""
+    conn = make_connector(daemon)
+    req = StubRequest("r-poison", list(range(400, 400 + 2 * BLOCK + 1)),
+                      cache_salt="s-poison")
+    conn.update_state_after_alloc(req, None, 2 * BLOCK)  # promise, never consumed
+    conn._blocks["r-poison"] = [0, 1, 2]  # ids known: only the guard can stop the row
+    cont = StubCachedReqs(["r-poison"], [0], [None])  # NOT resumed: continuation path
+    meta = conn.build_connector_meta(
+        StubSchedulerOutput([], {"r-poison": 2 * BLOCK + 1}, cached=cont))
+    assert meta.requests == []
+    assert conn._need_load_blocks.get("r-poison") == (0, 2)  # still queued
+    conn.shutdown()
