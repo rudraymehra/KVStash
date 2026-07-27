@@ -88,3 +88,121 @@ func TestTransferMovesBetweenTiersAndNeverFails(t *testing.T) {
 		t.Fatalf("over-ratio thousandths: %d, want 8000", got)
 	}
 }
+
+// TestSetQuotaTakesEffectWithoutReload: a limit update must be ONE phase —
+// the old SetQuota-then-Reload protocol silently left the ENFORCED limit
+// stale forever when a call site forgot the second half (customer-visible
+// ERR_QUOTA_BYTES despite a raised quota; a cut that never enforced).
+func TestSetQuotaTakesEffectWithoutReload(t *testing.T) {
+	r := NewRegistry("a", 1, "tok")
+	if !r.SetQuota("a", TierDRAM, 100) {
+		t.Fatal("SetQuota")
+	}
+	q := NewQuotas(r)
+	if err := q.Charge(1, TierDRAM, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Charge(1, TierDRAM, 50); err == nil {
+		t.Fatal("over-quota charge admitted")
+	}
+
+	// Raise — NO Reload call anywhere.
+	if !r.SetQuota("a", TierDRAM, 200) {
+		t.Fatal("SetQuota raise")
+	}
+	if err := q.Charge(1, TierDRAM, 50); err != nil {
+		t.Fatalf("raised quota not enforced without Reload: %v", err)
+	}
+
+	// Cut — usage (150) is now over the 10-byte limit; nothing new admits.
+	if !r.SetQuota("a", TierDRAM, 10) {
+		t.Fatal("SetQuota cut")
+	}
+	if err := q.Charge(1, TierDRAM, 5); err == nil {
+		t.Fatal("quota cut not enforced without Reload")
+	}
+}
+
+// TestSetQuotaInsideFirstTouchWindowIsNotLost: domain() snapshots the
+// registry BEFORE publishing the nsUsage entry into q.by. A SetQuota landing
+// in that window notifies reloadNS against a map with no entry to refresh —
+// without the post-publish re-read, the cut below would be silently lost and
+// the entry would enforce the stale pre-cut limit until the next SetQuota.
+func TestSetQuotaInsideFirstTouchWindowIsNotLost(t *testing.T) {
+	r := NewRegistry("a", 1, "tok")
+	if !r.SetQuota("a", TierDRAM, 1000) {
+		t.Fatal("SetQuota")
+	}
+	q := NewQuotas(r)
+
+	firstTouchHookForTest = func() {
+		firstTouchHookForTest = nil // the hook's own SetQuota charges nothing — fire once
+		if !r.SetQuota("a", TierDRAM, 10) {
+			t.Error("SetQuota inside the window")
+		}
+	}
+	defer func() { firstTouchHookForTest = nil }()
+
+	// First touch: mints the domain with the hook's SetQuota landing between
+	// the registry snapshot and the q.by publish.
+	if err := q.Charge(1, TierDRAM, 5); err != nil {
+		t.Fatal(err)
+	}
+	if got := q.Limit(1, TierDRAM); got != 10 {
+		t.Fatalf("enforced limit %d after an in-window SetQuota, want 10 — the cut was lost", got)
+	}
+	if err := q.Charge(1, TierDRAM, 100); err == nil {
+		t.Fatal("charge over the in-window quota cut admitted — stale limit enforced")
+	}
+}
+
+// TestReadAccessorsDoNotInsert: the read-only accessors must never mint a
+// usage domain — a stats path iterating stale ids (or any unvalidated id)
+// would otherwise grow q.by without bound, one write lock per miss.
+func TestReadAccessorsDoNotInsert(t *testing.T) {
+	r := NewRegistry("a", 1, "tok")
+	if !r.SetQuota("a", TierDRAM, 100) {
+		t.Fatal("SetQuota")
+	}
+	q := NewQuotas(r)
+
+	_ = q.Usage(1, TierDRAM)
+	_ = q.OverRatio(1, TierDRAM)
+	_ = q.WouldExceed(1, TierDRAM, 10)
+	_ = q.Usage(999, TierS3) // unseen id — the stale-scan shape
+	_ = q.Limit(999, TierNVMe)
+	if got := q.Limit(1, TierDRAM); got != 100 {
+		t.Fatalf("Limit(uncharged ns) = %d, want 100 from the registry", got)
+	}
+	if !q.WouldExceed(1, TierDRAM, 150) {
+		t.Fatal("WouldExceed ignored the configured limit before first Charge")
+	}
+	if q.WouldExceed(1, TierDRAM, 50) {
+		t.Fatal("WouldExceed false positive under the limit")
+	}
+
+	q.mu.RLock()
+	n := len(q.by)
+	q.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("read-only accessors inserted %d map entries", n)
+	}
+}
+
+// TestLookupReturnsDetachedCopy pins the API contract: mutating a Lookup
+// result must never write through into registry state (the aliased-pointer
+// race QuotaSnapshot exists to prevent).
+func TestLookupReturnsDetachedCopy(t *testing.T) {
+	r := NewRegistry("a", 1, "tok")
+	if !r.SetQuota("a", TierDRAM, 100) {
+		t.Fatal("SetQuota")
+	}
+	ns, ok := r.Lookup(1)
+	if !ok {
+		t.Fatal("lookup")
+	}
+	ns.Quota[TierDRAM] = 999_999
+	if snap, _ := r.QuotaSnapshot(1); snap[TierDRAM] != 100 {
+		t.Fatalf("Lookup handed out registry-owned state: quota now %d", snap[TierDRAM])
+	}
+}

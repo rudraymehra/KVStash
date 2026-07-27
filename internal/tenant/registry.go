@@ -65,6 +65,21 @@ type Registry struct {
 	mu     sync.RWMutex
 	byName map[string]*Namespace
 	byID   map[uint32]*Namespace
+	// quotaChanged is the accountant's re-snapshot hook: SetQuota invokes it
+	// (AFTER releasing r.mu — the leaf rule) so a limit update is ONE phase.
+	// The old two-phase SetQuota-then-Reload protocol let any call site that
+	// forgot the second call leave enforced limits stale forever.
+	quotaChanged func(id uint32)
+}
+
+// NamespaceView is the read surface Each exposes: identity + limits copied
+// by value under the registry lock — no TokenHash for arbitrary callbacks
+// to alias, no pointer into registry-owned mutable state to race SetQuota.
+type NamespaceView struct {
+	ID       uint32
+	Name     string
+	Quota    [tierCount]int64
+	PinQuota int64
 }
 
 // regFile is the on-disk schema (namespaces.yaml). `token` (plaintext) is
@@ -150,19 +165,36 @@ func (r *Registry) Add(ns *Namespace) error {
 	return nil
 }
 
-// SetQuota updates one tier quota (admin socket). Returns false for an
-// unknown namespace.
+// OnQuotaChange registers the single listener SetQuota notifies (the
+// accountant re-snapshots that namespace's limits). NewQuotas wires it;
+// nothing else should.
+func (r *Registry) OnQuotaChange(fn func(id uint32)) {
+	r.mu.Lock()
+	r.quotaChanged = fn
+	r.mu.Unlock()
+}
+
+// SetQuota updates one tier quota (admin socket) and notifies the
+// accountant — enforcement follows in the same call, no Reload to forget.
+// Returns false for an unknown namespace.
 func (r *Registry) SetQuota(name string, tier Tier, bytes int64) bool {
 	if tier < 0 || tier >= tierCount {
 		return false
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	ns, ok := r.byName[name]
 	if !ok {
+		r.mu.Unlock()
 		return false
 	}
 	ns.Quota[tier] = bytes
+	id, notify := ns.ID, r.quotaChanged
+	r.mu.Unlock()
+	// Notify with r.mu released: the listener re-reads through QuotaSnapshot
+	// (r.mu is a LEAF — re-entry under the write lock would self-deadlock).
+	if notify != nil {
+		notify(id)
+	}
 	return true
 }
 
@@ -186,12 +218,16 @@ func (r *Registry) Authenticate(name string, token []byte) (id uint32, ok bool) 
 	return ns.ID, true
 }
 
-// Lookup returns the namespace for an id (quota wiring, per-tenant metrics).
-func (r *Registry) Lookup(id uint32) (*Namespace, bool) {
+// Lookup returns the namespace for an id, BY VALUE: a caller keeping the
+// result can never race SetQuota's locked write through an aliased Quota
+// array (the shortcut QuotaSnapshot exists to prevent).
+func (r *Registry) Lookup(id uint32) (Namespace, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	ns, ok := r.byID[id]
-	return ns, ok
+	if ns, ok := r.byID[id]; ok {
+		return *ns, true
+	}
+	return Namespace{}, false
 }
 
 // QuotaSnapshot copies the namespace's quota triple under the registry lock —
@@ -241,11 +277,11 @@ func (r *Registry) PinQuotaFor(id uint32) int64 {
 }
 
 // Each calls fn for every namespace in unspecified order (metrics labels,
-// admin listing).
-func (r *Registry) Each(fn func(*Namespace)) {
+// admin listing). The callback receives a detached copy — see NamespaceView.
+func (r *Registry) Each(fn func(NamespaceView)) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, ns := range r.byID {
-		fn(ns)
+		fn(NamespaceView{ID: ns.ID, Name: ns.Name, Quota: ns.Quota, PinQuota: ns.PinQuota})
 	}
 }

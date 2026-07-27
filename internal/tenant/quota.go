@@ -35,22 +35,84 @@ type Quotas struct {
 	mu  sync.RWMutex
 	reg *Registry
 	by  map[uint32]*nsUsage
+	// limitMu makes every registry-read→limit-store pair atomic against the
+	// others (reloadNS, Reload, domain's post-publish refresh). Without it a
+	// refresher could read a pre-SetQuota snapshot, lose the CPU, and store
+	// it AFTER the notification hook stored the newer limits — a stale
+	// enforced limit until the next SetQuota. LOCK ORDER: limitMu → reg.mu;
+	// never taken while holding q.mu or reg.mu.
+	limitMu sync.Mutex
 }
+
+// firstTouchHookForTest runs between domain()'s pre-publish registry
+// snapshot and the q.by publish (nil in production) — the deterministic
+// handle for landing a SetQuota inside the first-touch window.
+var firstTouchHookForTest func()
 
 type nsUsage struct {
 	used [tierCount]atomic.Int64
-	// limit: 0 = unlimited; snapshot at first touch, refreshed by SetQuota
-	// via Reload. Atomic — Reload's stores race Charge/WouldExceed's bare
-	// reads (no q.mu on the hot path).
+	// limit: 0 = unlimited; snapshot at first touch, refreshed by the
+	// SetQuota notification hook (reloadNS). Atomic — those stores race
+	// Charge/WouldExceed's bare reads (no q.mu on the hot path).
 	limit [tierCount]atomic.Int64
 }
 
-// NewQuotas builds the accountant over a registry. Namespaces added to the
+// NewQuotas builds the accountant over a registry and registers itself for
+// quota-change notifications — SetQuota alone updates enforcement, no
+// separate Reload for a call site to forget. Namespaces added to the
 // registry later are picked up lazily on first Charge.
 func NewQuotas(reg *Registry) *Quotas {
-	return &Quotas{reg: reg, by: make(map[uint32]*nsUsage)}
+	q := &Quotas{reg: reg, by: make(map[uint32]*nsUsage)}
+	if reg != nil {
+		reg.OnQuotaChange(q.reloadNS)
+	}
+	return q
 }
 
+// reloadNS re-snapshots one namespace's limits (the SetQuota hook). An id
+// never charged has no domain — domain() snapshots fresh limits at first
+// touch (and re-reads after publishing; see the interleaving note there),
+// so there is nothing to refresh.
+func (q *Quotas) reloadNS(ns uint32) {
+	if u := q.peek(ns); u != nil {
+		q.refreshLimits(ns, u)
+	}
+}
+
+// refreshLimits re-reads ns's configured limits from the registry into u,
+// atomically with respect to every other refresher (limitMu): the LAST
+// refresher to run stored a value read from the registry AFTER every earlier
+// store's read, so the cached limits converge on the registry's latest value
+// in every interleaving. The registry read happens INSIDE limitMu, which is
+// why the lock order limitMu → reg.mu must stay acyclic (nothing takes
+// limitMu under reg.mu — SetQuota releases reg.mu before notifying).
+func (q *Quotas) refreshLimits(ns uint32, u *nsUsage) {
+	if q.reg == nil {
+		return
+	}
+	q.limitMu.Lock()
+	defer q.limitMu.Unlock()
+	if l, found := q.reg.QuotaSnapshot(ns); found {
+		for t := range l {
+			u.limit[t].Store(l[t])
+		}
+	}
+}
+
+// peek returns the namespace's usage domain WITHOUT allocating one, or nil.
+// Read-only accessors go through this: a read path that grows the map (and
+// takes the write lock) for any id it is merely asked about lets a stats
+// scan or stale-id caller inflate q.by without bound.
+func (q *Quotas) peek(ns uint32) *nsUsage {
+	q.mu.RLock()
+	u := q.by[ns]
+	q.mu.RUnlock()
+	return u
+}
+
+// domain returns the usage domain, allocating on first touch. Only the
+// accounting verbs (Charge/Refund/Seed/Transfer — paths that provably
+// follow a HELLO-validated namespace) may call it.
 func (q *Quotas) domain(ns uint32) *nsUsage {
 	q.mu.RLock()
 	u, ok := q.by[ns]
@@ -68,9 +130,12 @@ func (q *Quotas) domain(ns uint32) *nsUsage {
 			limits = l
 		}
 	}
+	if h := firstTouchHookForTest; h != nil {
+		h()
+	}
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	if u, ok = q.by[ns]; ok {
+		q.mu.Unlock()
 		return u
 	}
 	u = &nsUsage{}
@@ -78,13 +143,28 @@ func (q *Quotas) domain(ns uint32) *nsUsage {
 		u.limit[t].Store(limits[t])
 	}
 	q.by[ns] = u
+	q.mu.Unlock()
+	// First-touch TOCTOU: the snapshot above ran BEFORE this entry was
+	// visible in q.by, so a SetQuota landing in that window notified
+	// reloadNS against a map that did not yet contain ns — its new limit
+	// reached the registry but not this entry, and nothing would ever
+	// refresh it (stale enforcement until the next SetQuota). Re-read AFTER
+	// publication with q.mu released (the leaf rule): a SetQuota that landed
+	// before the publish is picked up by this read, and one landing after it
+	// finds the entry via reloadNS's peek — refreshLimits' limitMu orders
+	// the two read+store pairs, so both interleavings converge on the
+	// registry's latest value.
+	q.refreshLimits(ns, u)
 	return u
 }
 
-// Reload re-snapshots limits from the registry (admin SetQuota path). The
+// Reload re-snapshots every known namespace's limits from the registry.
+// SetQuota refreshes its own namespace through the notification hook, so
+// this is a belt for bulk registry changes, not a required second phase. The
 // map snapshot releases q.mu before any registry read (the leaf rule);
-// nsUsage pointers are stable once published, so the limit stores need no
-// lock of their own.
+// nsUsage pointers are stable once published, and each per-namespace
+// read+store funnels through refreshLimits so bulk reloads order with
+// concurrent SetQuota hooks instead of racing them.
 func (q *Quotas) Reload() {
 	if q.reg == nil {
 		return
@@ -96,11 +176,7 @@ func (q *Quotas) Reload() {
 	}
 	q.mu.RUnlock()
 	for ns, u := range snap {
-		if l, found := q.reg.QuotaSnapshot(ns); found {
-			for t := range l {
-				u.limit[t].Store(l[t])
-			}
-		}
+		q.refreshLimits(ns, u)
 	}
 }
 
@@ -183,9 +259,14 @@ func (q *Quotas) WouldExceed(ns uint32, tier Tier, n int64) bool {
 	if n <= 0 || tier < 0 || tier >= tierCount {
 		return false
 	}
-	u := q.domain(ns)
-	limit := u.limit[tier].Load()
-	return limit > 0 && u.used[tier].Load()+n > limit
+	if u := q.peek(ns); u != nil {
+		limit := u.limit[tier].Load()
+		return limit > 0 && u.used[tier].Load()+n > limit
+	}
+	// Nothing charged yet: usage is zero, but the CONFIGURED limit still
+	// binds — read it from the registry without minting a domain.
+	limit := q.registryLimit(ns, tier)
+	return limit > 0 && n > limit
 }
 
 // Usage reports the current bytes charged to (ns, tier).
@@ -193,21 +274,46 @@ func (q *Quotas) Usage(ns uint32, tier Tier) int64 {
 	if tier < 0 || tier >= tierCount {
 		return 0
 	}
-	return q.domain(ns).used[tier].Load()
+	if u := q.peek(ns); u != nil {
+		return u.used[tier].Load()
+	}
+	return 0
 }
 
-// Limit reports the configured quota (0 = unlimited).
+// Limit reports the configured quota (0 = unlimited). For a namespace that
+// has never been charged it answers from the registry directly.
 func (q *Quotas) Limit(ns uint32, tier Tier) int64 {
 	if tier < 0 || tier >= tierCount {
 		return 0
 	}
-	return q.domain(ns).limit[tier].Load()
+	if u := q.peek(ns); u != nil {
+		return u.limit[tier].Load()
+	}
+	return q.registryLimit(ns, tier)
+}
+
+// registryLimit reads one configured limit without touching q.by (uncharged
+// namespaces stay unallocated). LOCK ORDER: takes only reg.mu (a leaf).
+func (q *Quotas) registryLimit(ns uint32, tier Tier) int64 {
+	if q.reg == nil {
+		return 0
+	}
+	if l, found := q.reg.QuotaSnapshot(ns); found {
+		return l[tier]
+	}
+	return 0
 }
 
 // OverRatio reports usage/quota as thousandths (0 when unlimited) — the
 // evictor's over-quota-first ordering key, integer to stay allocation-free.
 func (q *Quotas) OverRatio(ns uint32, tier Tier) int64 {
-	u := q.domain(ns)
+	if tier < 0 || tier >= tierCount {
+		return 0
+	}
+	u := q.peek(ns)
+	if u == nil {
+		return 0 // never charged — nothing to be over
+	}
 	limit := u.limit[tier].Load()
 	if limit <= 0 {
 		return 0

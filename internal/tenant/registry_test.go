@@ -125,7 +125,7 @@ func TestSetQuotaAndEach(t *testing.T) {
 		t.Fatal("SetQuota on unknown ns succeeded")
 	}
 	seen := 0
-	r.Each(func(ns *Namespace) {
+	r.Each(func(ns NamespaceView) {
 		seen++
 		if ns.Quota[TierNVMe] != 42 {
 			t.Fatalf("quota not applied: %+v", ns.Quota)

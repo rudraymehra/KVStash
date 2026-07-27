@@ -130,12 +130,12 @@ func (a *AdminServer) handleSetQuota(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tier must be dram|nvme|s3", http.StatusBadRequest)
 		return
 	}
+	// SetQuota is one-phase: the registry notifies the accountant itself
+	// (the old SetQuota-then-Reload pairing left limits stale forever when
+	// a call site forgot the second half).
 	if !a.reg.SetQuota(req.Name, tier, req.Bytes) {
 		http.Error(w, "unknown namespace", http.StatusNotFound)
 		return
-	}
-	if a.q != nil {
-		a.q.Reload()
 	}
 	writeJSON(w, map[string]any{
 		"ok":   true,
@@ -157,7 +157,7 @@ func (a *AdminServer) handleList(w http.ResponseWriter, _ *http.Request) {
 	// registry lock and the accountant's are lock-graph LEAVES — q.Usage
 	// under reg.Each once deadlocked this listing against a concurrent
 	// quota-set (Reload holds the accountant lock and reads the registry).
-	a.reg.Each(func(ns *tenant.Namespace) {
+	a.reg.Each(func(ns tenant.NamespaceView) {
 		r := row{
 			Name: ns.Name, ID: ns.ID, PinCap: ns.PinQuota,
 			Quota: make(map[string]int64, 3), Usage: make(map[string]int64, 3),
