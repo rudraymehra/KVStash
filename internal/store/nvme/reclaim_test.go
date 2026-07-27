@@ -2,7 +2,6 @@ package nvme
 
 import (
 	"context"
-
 	"testing"
 	"time"
 )

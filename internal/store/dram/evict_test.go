@@ -583,12 +583,12 @@ func TestCanStoreMatchesAlloc(t *testing.T) {
 		if got := s.CanStore(uint32(tc.units << 12)); got != tc.want { //nolint:gosec // G115: tiny test sizes
 			t.Fatalf("CanStore(%d units) = %v, want %v", tc.units, got, tc.want)
 		}
-		st := s.Put(1, evKey(byte(0x80+tc.units)), bytes.Repeat([]byte{1}, tc.units<<12), 42)
+		st := s.Put(1, evKey(byte(0x80+tc.units)), bytes.Repeat([]byte{1}, tc.units<<12), 42) //nolint:gosec // G115: tiny test sizes
 		if ok := st == protocol.StatusOK; ok != tc.want {
 			t.Fatalf("Alloc-backed Put(%d units) ok=%v disagrees with CanStore=%v (st=%s)", tc.units, ok, tc.want, st)
 		}
 		if tc.want { // undo the successful put so the second case sees the same hole
-			if st := s.Delete(1, evKey(byte(0x80+tc.units)), true); st != protocol.StatusOK {
+			if st := s.Delete(1, evKey(byte(0x80+tc.units)), true); st != protocol.StatusOK { //nolint:gosec // G115: tiny test sizes
 				t.Fatal(st)
 			}
 		}

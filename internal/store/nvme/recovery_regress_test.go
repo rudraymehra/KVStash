@@ -1,9 +1,8 @@
 package nvme
 
 import (
-	"context"
-
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"testing"
