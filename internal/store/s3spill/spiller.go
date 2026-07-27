@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -23,10 +22,18 @@ type Spiller struct {
 	wg     sync.WaitGroup
 	cancel context.CancelFunc
 
+	// closeMu is read-held across DemoteSegment's closed-check+send and
+	// write-held across Close's flag+cancel, so a send can never slip past
+	// the worker's final drain (the Volume.Append lifecycle contract).
+	// Uncontended in steady state.
+	closeMu sync.RWMutex
+	closed  atomic.Bool
+
 	spilled   atomic.Uint64 // segments landed on S3
 	dropped   atomic.Uint64 // enqueue overflows (counter — never silent)
 	putErrors atomic.Uint64 // failed uploads (the segment stays local-only)
 	inflight  atomic.Int64  // enqueued-but-not-yet-acked (Flush waits on this)
+	idle      chan struct{} // 1-buffered notify: pulsed on each inflight drain to zero
 }
 
 type spillReq struct {
@@ -48,6 +55,7 @@ func NewSpiller(api S3API, cfg Config, queueDepth int) *Spiller {
 		cfg:    cfg.withDefaults(),
 		queue:  make(chan spillReq, queueDepth),
 		cancel: cancel,
+		idle:   make(chan struct{}, 1),
 	}
 	sp.wg.Add(1)
 	go sp.loop(ctx)
@@ -55,16 +63,37 @@ func NewSpiller(api S3API, cfg Config, queueDepth int) *Spiller {
 }
 
 // DemoteSegment enqueues one sealed segment for upload. Returns false when
-// the queue is full — counted, never blocking; the seal pipeline retries a
-// dropped segment on its next pass (the segment is still local).
+// the queue is full or the spiller is closed — counted / refused, never
+// blocking; the seal pipeline retries a dropped segment on its next pass
+// (the segment is still local).
 func (sp *Spiller) DemoteSegment(segID uint64, size int64, open func() (io.ReadSeekCloser, error), onUp func(uint64, bool)) bool {
+	sp.closeMu.RLock()
+	defer sp.closeMu.RUnlock()
+	if sp.closed.Load() {
+		return false // dead queue: nothing would ever answer onUp
+	}
+	// Increment BEFORE the send so the counter always LEADS the queue:
+	// Flush can never observe zero while a request it must wait for is
+	// queued but uncounted.
+	sp.inflight.Add(1)
 	select {
 	case sp.queue <- spillReq{segID: segID, size: size, open: open, onUp: onUp}:
-		sp.inflight.Add(1) // paired with the decrement after onUp in loop()
 		return true
 	default:
 		sp.dropped.Add(1)
+		sp.decInflight()
 		return false
+	}
+}
+
+// decInflight retires one request from the barrier counter and pulses the
+// idle channel on the drain to zero so Flush wakes without polling.
+func (sp *Spiller) decInflight() {
+	if sp.inflight.Add(-1) == 0 {
+		select {
+		case sp.idle <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -72,19 +101,24 @@ func (sp *Spiller) DemoteSegment(segID uint64, size int64, open func() (io.ReadS
 // onUp callback has run (inflight drains to zero), or ctx expires (returns
 // false). It is the graceful-drain primitive a caller uses before it depends
 // on the tier flags being settled — and the deterministic handle the tests
-// use instead of racing a wall clock against the async worker. Poll-based:
-// the worker is single-threaded and this is a cold-path barrier, not the
-// hot path.
+// use instead of racing a wall clock against the async worker.
 func (sp *Spiller) Flush(ctx context.Context) bool {
-	for sp.inflight.Load() > 0 {
+	for {
+		if sp.inflight.Load() == 0 {
+			// Re-pulse for any sibling Flush parked on the same notify;
+			// a stale pulse just costs the next waiter one re-check.
+			select {
+			case sp.idle <- struct{}{}:
+			default:
+			}
+			return true
+		}
 		select {
 		case <-ctx.Done():
 			return false
-		default:
-			runtime.Gosched()
+		case <-sp.idle:
 		}
 	}
-	return true
 }
 
 // Drop deletes a segment's S3 object (reclaim retired it everywhere).
@@ -109,7 +143,12 @@ func (sp *Spiller) Stats() (spilled, dropped, putErrors uint64) {
 // is lost — the segments were local-only copies all along and the next
 // process's spill pass re-enqueues them.
 func (sp *Spiller) Close() {
-	sp.cancel()
+	sp.closeMu.Lock()
+	already := sp.closed.Swap(true)
+	if !already {
+		sp.cancel()
+	}
+	sp.closeMu.Unlock()
 	sp.wg.Wait()
 }
 
@@ -122,18 +161,19 @@ func (sp *Spiller) loop(ctx context.Context) {
 			if req.onUp != nil {
 				req.onUp(req.segID, ok)
 			}
-			sp.inflight.Add(-1)
+			sp.decInflight()
 		case <-ctx.Done():
 			// Drain-with-callbacks: every queued request gets its answer
 			// (false) — abandoned callbacks once leaked arena refs in the
-			// NVMe writer; same contract here.
+			// NVMe writer; same contract here. Close's write lock ordered
+			// every producer send before this drain, so nothing trails it.
 			for {
 				select {
 				case req := <-sp.queue:
 					if req.onUp != nil {
 						req.onUp(req.segID, false)
 					}
-					sp.inflight.Add(-1)
+					sp.decInflight()
 				default:
 					return
 				}

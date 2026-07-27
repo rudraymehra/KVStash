@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -53,6 +54,8 @@ type Restorer struct {
 
 	mu       sync.Mutex
 	inflight map[uint64]*restoreCall
+	closed   bool           // set by Close under mu — no new downloads spawn after
+	wg       sync.WaitGroup // tracks detached downloads; Close drains it
 
 	rangedGets atomic.Uint64 // cold per-block reads served
 	restores   atomic.Uint64 // whole-segment downloads completed
@@ -86,6 +89,14 @@ func (r *Restorer) ReadRange(ctx context.Context, segID uint64, off, n int64, ds
 		return classifyNotFound(err)
 	}
 	defer drainClose(out.Body)
+	// A Range-ignoring endpoint (some proxies and compat targets) answers
+	// 200 + the WHOLE object; ReadFull would then silently hand back the
+	// segment's first n bytes as [off, off+n). Verify the response window
+	// before reading — one loud error beats a checksum-error storm plus a
+	// whole-segment drain per read.
+	if err := verifyRange(out, off, n); err != nil {
+		return fmt.Errorf("s3spill: ranged read seg %d: %w", segID, err)
+	}
 	if _, err := io.ReadFull(out.Body, dst); err != nil {
 		return fmt.Errorf("s3spill: ranged read seg %d: %w", segID, err)
 	}
@@ -97,8 +108,18 @@ func (r *Restorer) ReadRange(ctx context.Context, segID uint64, off, n int64, ds
 // writes it back into a local NVMe volume). Singleflight per segment:
 // concurrent callers coalesce onto one download and share its verdict.
 // sink is only invoked on the winning call.
+//
+// ctx cancels the WAIT, not the work: the shared download runs detached (an
+// impatient winner must not poison coalesced followers), so this can return
+// ctx.Err() with the download AND sink still running — a retry coalesces
+// onto that same running download, and Close is the barrier that drains
+// whatever is still detached at shutdown.
 func (r *Restorer) RestoreSegment(ctx context.Context, segID uint64, sink func(io.Reader) error) error {
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return fmt.Errorf("s3spill: restore seg %d: restorer closed", segID)
+	}
 	if c, ok := r.inflight[segID]; ok {
 		r.mu.Unlock()
 		select {
@@ -110,19 +131,54 @@ func (r *Restorer) RestoreSegment(ctx context.Context, segID uint64, sink func(i
 	}
 	c := &restoreCall{done: make(chan struct{})}
 	r.inflight[segID] = c
+	// The Add happens under mu, mutually exclusive with Close's closed flip:
+	// any download that got past the closed check is counted before Close
+	// starts waiting, so Add can never race the Wait.
+	r.wg.Add(1)
 	r.mu.Unlock()
 
-	c.err = r.download(ctx, segID, sink)
-	close(c.done)
+	// The download is SHARED state: it runs detached from the winner's ctx
+	// (an impatient winner must not poison every coalesced follower), and
+	// its close(done)+map-delete are deferred with panic recovery — a
+	// panicking caller-supplied sink must surface as this call's error,
+	// never wedge the segment's restores until process restart.
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				c.err = fmt.Errorf("s3spill: restore seg %d: sink panic: %v", segID, p)
+			}
+			close(c.done)
+			r.mu.Lock()
+			delete(r.inflight, segID)
+			r.mu.Unlock()
+			r.wg.Done()
+		}()
+		c.err = r.download(context.WithoutCancel(ctx), segID, sink)
+	}()
+	select {
+	case <-c.done:
+		return c.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
+// Close refuses new restores and BLOCKS until every detached download —
+// including ones whose RestoreSegment callers gave up long ago — has
+// finished. It is the shutdown barrier that keeps a detached sink (writing
+// into an NVMe volume) from outliving the store teardown: callers stop
+// issuing restores first (the tiered store's loops are already down when
+// the cleanup stack reaches this), then Close drains the stragglers. The
+// download's own 4×OpTimeout deadline bounds the wait.
+func (r *Restorer) Close() {
 	r.mu.Lock()
-	delete(r.inflight, segID)
+	r.closed = true
 	r.mu.Unlock()
-	return c.err
+	r.wg.Wait()
 }
 
 func (r *Restorer) download(ctx context.Context, segID uint64, sink func(io.Reader) error) error {
-	ctx, cancel := context.WithTimeout(ctx, 4*r.cfg.OpTimeout) // whole segments are big
+	ctx, cancel := context.WithTimeout(ctx, 4*r.cfg.OpTimeout) // whole segments are big; sole deadline once detached
 	defer cancel()
 	key := segKey(r.cfg.NodeID, segID)
 	out, err := r.api.GetObject(ctx, &s3.GetObjectInput{Bucket: &r.cfg.Bucket, Key: &key})
@@ -134,6 +190,23 @@ func (r *Restorer) download(ctx context.Context, segID uint64, sink func(io.Read
 		return err
 	}
 	r.restores.Add(1)
+	return nil
+}
+
+// verifyRange asserts a GetObject response actually honors the requested
+// [off, off+n) window: a well-behaved 206 carries "bytes off-(off+n-1)/…"
+// in Content-Range; absent that header, Content-Length must equal n.
+func verifyRange(out *s3.GetObjectOutput, off, n int64) error {
+	if cr := out.ContentRange; cr != nil {
+		want := fmt.Sprintf("bytes %d-%d/", off, off+n-1)
+		if !strings.HasPrefix(*cr, want) {
+			return fmt.Errorf("endpoint returned range %q, want %q", *cr, want+"*")
+		}
+		return nil
+	}
+	if out.ContentLength == nil || *out.ContentLength != n {
+		return fmt.Errorf("endpoint ignored Range (no Content-Range, Content-Length %v != %d)", out.ContentLength, n)
+	}
 	return nil
 }
 

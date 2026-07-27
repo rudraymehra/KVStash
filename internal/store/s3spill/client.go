@@ -50,11 +50,39 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
+// validate rejects the shapes that only fail LATER, badly: an empty or
+// key-unsafe NodeID silently collides two nodes' segment keys in a shared
+// bucket (node B restores node A's segment — a baffling fleet-wide
+// self-heal wipe, not corruption), and an empty Region against real AWS
+// fails deep inside the SDK at the first call instead of at startup.
+func (c Config) validate() error {
+	if c.Bucket == "" {
+		return fmt.Errorf("s3spill: bucket required")
+	}
+	if c.NodeID == "" {
+		return fmt.Errorf("s3spill: node_id required (blank ids collide segment keys across nodes sharing a bucket)")
+	}
+	for _, r := range c.NodeID {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '_', r == '-':
+		default:
+			return fmt.Errorf("s3spill: node_id %q: %q not key-safe (allowed: [A-Za-z0-9._-])", c.NodeID, r)
+		}
+	}
+	if c.Region == "" && c.EndpointOverride == "" {
+		return fmt.Errorf("s3spill: region required when no endpoint override is set")
+	}
+	return nil
+}
+
 // NewClient builds the real SDK client from ambient credentials (env,
 // shared config, IMDS) — no credentials ever live in kvblockd config files.
+// It is the production construction funnel, so config shape is enforced
+// here: fail at startup, never at first spill.
 func NewClient(ctx context.Context, cfg Config) (S3API, error) {
-	if cfg.Bucket == "" {
-		return nil, fmt.Errorf("s3spill: bucket required")
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
 	if err != nil {
