@@ -241,6 +241,30 @@ class KvblockdConnectorMetadata(_MetaBase):
     requests: list[KvbReqMeta] = field(default_factory=list)
 
 
+@dataclass
+class _StagePlan:
+    """One request's gathered-store staging, enqueue DEFERRED until after the
+    device sync (wait_for_save). items rows are mutable [j, key, buf, slot_id]
+    — slot_id is nulled as ownership moves (queue / free list / rebuild), so
+    cleanup at any exit frees each slot exactly once. names/bytes_per_layer/
+    block_ids/prefix ride along so a failed sync can rebuild the blobs from
+    the still-valid paged memory."""
+
+    req_id: str
+    total: int
+    end: int
+    items: list[list]  # [j, key, bytearray | memoryview, slot_id | None]
+    dev: object
+    names: list[str]
+    bytes_per_layer: int
+    block_ids: list[int]
+    prefix: bytes
+    # items[:sent] have SETTLED accounting (enqueued, or refused-and-counted
+    # by the tail-skip); _abandon_plan counts exactly items[sent:] — the
+    # blocks a mid-plan raise would otherwise lose with dropped_puts=0.
+    sent: int = 0
+
+
 class _LookupResolver:
     """Off-thread BATCH_EXISTS for the flag-gated async lookup. The scheduler
     thread posts PLAIN DATA ONLY — (rid, aligned token ids, cache_salt, mm
@@ -387,7 +411,7 @@ class KvblockdConnector(_Base):
         # FIFO preserves per-request block order, so a partial delivery is a
         # usable consecutive prefix under the prefix-chain keys. All queue
         # state (deque, byte gauges, public counters) is guarded by _sq_cond.
-        self._sq: deque[tuple[bytes, bytearray]] = deque()
+        self._sq: deque[tuple[bytes, bytearray | memoryview, int | None]] = deque()
         self._sq_cond = threading.Condition()
         self._sq_bytes = 0            # bytes currently queued
         self._sq_inflight = 0         # blocks popped, put() not finished
@@ -413,6 +437,42 @@ class KvblockdConnector(_Base):
         # Loads currently pulling KV (guarded by _sq_cond like all queue
         # state); the drain's load-priority gate parks on it.
         self._loads_inflight = 0
+        # Episode arm for the drain's load-priority gate (under _sq_cond —
+        # armed by the drain, cleared on episode edges): the gate parks ONCE
+        # per raised episode, not once per pop — N queued blobs under one
+        # raised gate cost one ceiling total, never N ceilings. Episodes are
+        # EDGE-TRIGGERED: start_load_kv clears the arm on the 0->1 transition
+        # of _loads_inflight, because the drain only samples the counter
+        # between puts — an episode that begins while the drain is inside
+        # put() must not inherit the previous episode's expired arm.
+        self._drain_park_until: float | None = None
+
+        # Pinned store-slot pool (CUDA gathered-store fast path): one pinned
+        # tensor cut into `total`-stride slots (32B prefix + body), leased at
+        # stage time, released when the slot's blob leaves the queue for good.
+        # Separate from the LOAD slab on purpose: a slot's lifetime crosses
+        # into the drain thread, while the load slab's contract ends at its
+        # trailing stream synchronize. Slot ownership walk: ALLOCATED (stager
+        # frees on a mid-fill failure) -> QUEUED (stager frees on enqueue
+        # refusal; shutdown walks _sq and frees before clear()) -> INFLIGHT
+        # (ONLY the drain's reconcile block frees — the memoryview sits in
+        # _send_frame's iovec, and reusing it mid-sendmsg would publish
+        # garbage under a content-chained key; a requeue keeps the lease).
+        # Invariant under _sq_cond: free + staging + queued + inflight ==
+        # total slots, single-free at every exit.
+        self._store_slab = None           # 1-D pinned uint8 torch tensor
+        self._store_slab_np = None        # numpy view (memoryview source)
+        self._store_slot_stride = 0       # bytes per slot (== blob total)
+        self._store_slot_free: list[int] = []   # free slot ids, under _sq_cond
+        self._store_slots_total = 0
+        self._store_slab_disabled = False  # first-alloc failure -> permanent
+        self._store_gather_fails = 0      # consecutive gather-path failures
+        self._store_gather_disabled = False  # latched after _SCRATCH_MAX_FAILS
+        # Store-path attribution, one-shot (+ one switch line) — deliberately
+        # NOT _note_path: the bench greps "kvblockd load path:" and a store
+        # stamp would consume that one-shot.
+        self._reported_store_path = None
+        self._store_path_switch_logged = False
 
     # ------------------------------------------------------------------
     # client plumbing (lazy: import/instantiate must succeed with no daemon)
@@ -898,39 +958,67 @@ class KvblockdConnector(_Base):
         self._maybe_prewarm()
 
     def _maybe_prewarm(self) -> None:
-        """One eager pinned-slab allocation at the FIRST CUDA layout capture
-        (not the first load): cudaHostAlloc of a multi-GiB slab takes hundreds
-        of ms, and paying it lazily buries the stall inside the first measured
-        load. Sized min(staging cap, kvblockd_prewarm_bytes). Failure falls
-        back to the EXISTING lazy path untouched (_slab_disabled stays False —
-        _slab_reserve owns that latch), never fatal. The measured duration is
-        published at WARNING (INFO is dropped in engine-core) so the bench can
-        attribute the one-time cost."""
-        if self._prewarm_done or self._slab is not None or self._slab_disabled:
+        """One eager pinned-allocation pass at the FIRST CUDA layout capture
+        (not the first load/store): cudaHostAlloc of a multi-GiB region takes
+        hundreds of ms, and paying it lazily buries the stall inside the
+        first measured load — or, for the store pool, inside the first
+        measured wait_for_save. Load slab sized min(staging cap,
+        kvblockd_prewarm_bytes); store pool sized by _store_pool_ready
+        exactly as its lazy path would (the blob stride is computable from
+        the captured layout). Each part fails back to its EXISTING lazy path
+        (_slab_reserve owns the load-slab latch, _store_pool_ready owns the
+        pool latch), never fatal, and never blocks the other part. Measured
+        durations are published at WARNING (INFO is dropped in engine-core)
+        so the bench can attribute the one-time cost."""
+        if self._prewarm_done:
+            return
+        names = sorted(self._layer_kv)
+        if not names:
             return
         try:
-            names = sorted(self._layer_kv)
-            if not names:
-                return
-            dev = self._layer_kv[names[0]].device
-            if not self._slab_path_ok(dev):
-                # CPU backend: the slab never pays here — and the paged
+            if not self._slab_path_ok(self._layer_kv[names[0]].device):
+                # CPU backend: neither pool ever pays here — and the paged
                 # tensors' device never changes mid-run, so LATCH instead of
                 # re-walking the layer map on every single capture.
                 self._prewarm_done = True
                 return
-            self._prewarm_done = True  # one attempt per connector lifetime
-            want = min(self._staging_bytes, self._cfg.prewarm_bytes)
-            if want <= 0:
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: an unreadable device means no prewarm; lazy paths keep serving
+            self._log.maybe("slab", "prewarm device probe failed — lazy paths keep serving", e)
+            return
+        self._prewarm_done = True  # one attempt per connector lifetime
+        if self._slab is None and not self._slab_disabled:
+            try:
+                want = min(self._staging_bytes, self._cfg.prewarm_bytes)
+                if want > 0:
+                    t0 = time.monotonic()
+                    slab = self._alloc_pinned(want)
+                    slab_np = slab.numpy()
+                    self._slab, self._slab_np = slab, slab_np
+                    logger.warning("kvblockd pinned prewarm: %d bytes in %.0f ms",
+                                   want, (time.monotonic() - t0) * 1e3)
+            except Exception as e:  # noqa: BLE001 — never-raise boundary: a failed prewarm keeps the lazy slab path
+                self._log.maybe("slab", "pinned prewarm failed — lazy slab path keeps serving", e)
+        # Store pool: the same stall class (~1 GiB pinned at auto-size
+        # defaults, ON TOP of the load slab above — budget both on a
+        # RAM-tight rig), paid eagerly here so the first CUDA wait_for_save
+        # is not the one measured step that eats it. _store_pool_ready owns
+        # sizing, the explicitly-off case, and the failure latch; only the
+        # duration line is added here.
+        if not self._cfg.async_store or self._store_slab is not None:
+            return
+        try:
+            lnames, _dtype, bytes_per_layer = self._layout()
+            if not lnames:
                 return
+            total = BLOB_PREFIX_LEN + bytes_per_layer * len(lnames)
             t0 = time.monotonic()
-            slab = self._alloc_pinned(want)
-            slab_np = slab.numpy()
-            self._slab, self._slab_np = slab, slab_np
-            logger.warning("kvblockd pinned prewarm: %d bytes in %.0f ms",
-                           want, (time.monotonic() - t0) * 1e3)
-        except Exception as e:  # noqa: BLE001 — never-raise boundary: a failed prewarm keeps the lazy slab path
-            self._log.maybe("slab", "pinned prewarm failed — lazy slab path keeps serving", e)
+            if self._store_pool_ready(total):
+                logger.warning("kvblockd pinned store-pool prewarm: %d bytes in %.0f ms",
+                               int(self._store_slab.numel()),
+                               (time.monotonic() - t0) * 1e3)
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: a failed pool prewarm keeps the lazy pool path
+            self._log.maybe("store-slab",
+                            "store-pool prewarm failed — lazy pool path keeps serving", e)
 
     def _layout(self):
         """(sorted layer names, dtype_name, bytes_per_layer_block) of the LIVE
@@ -990,6 +1078,13 @@ class KvblockdConnector(_Base):
         # drain parks (bounded) instead of contending for the wire/GIL.
         with self._sq_cond:
             self._loads_inflight += 1
+            if self._loads_inflight == 1:
+                # Episode edge: clear the arm so the drain parks a fresh
+                # ceiling for THIS episode. The drain cannot own this reset —
+                # it only samples the counter between puts, so a gate that
+                # drops and re-raises inside one put() would otherwise keep
+                # the previous episode's expired arm and park zero.
+                self._drain_park_until = None
         try:
             for req in loads:
                 try:
@@ -1365,36 +1460,83 @@ class KvblockdConnector(_Base):
         the vLLM base contract only protects the paged buffer until this call
         returns, and on CPU _block_bytes hands back an ALIASING view of paged
         memory — then a background thread drains the copies over TCP. With the
-        flag off this is the original synchronous put loop, byte-identical."""
+        flag off this is the original synchronous put loop, byte-identical.
+
+        CUDA paged tensors take the gathered-store fast path when available:
+        _stage_one issues batched gathers + async D2H into pinned slots and
+        returns a deferred-enqueue plan; ONE device sync covers every plan
+        BEFORE any enqueue and before this call returns. The sync is a
+        correctness invariant, not tuning — a torn D2H is a wrong byte
+        published cache-wide under a content-chained key, never a miss."""
         try:
             metadata = self._get_connector_metadata()
         except Exception:  # noqa: BLE001 — never-raise boundary: missing metadata = nothing to store this step
             return
         requests = getattr(metadata, "requests", None) or []
+        plans: list[_StagePlan] = []
         for req in requests:
             if req.store_end_block > req.store_start_block:
                 try:
                     if self._cfg.async_store:
-                        self._stage_one(req)
+                        plan = self._stage_one(req)
+                        if plan is not None:
+                            plans.append(plan)
                     else:
                         self._store_one(req)
                 except Exception as e:  # noqa: BLE001 — never raise: a lost store is a future miss
                     self._log.maybe("store", f"kvblockd store failed req={req.req_id}", e)
                     self._drop_client(e)
+        if not plans:
+            return
+        try:
+            if self._store_sync(plans[0].dev):
+                self._store_gather_fails = 0  # consecutive-failure counter
+                torn = False
+            else:
+                # Nothing D2H'd is provably complete. Paged memory is still
+                # valid (we have not returned), so rebuild every slot-backed
+                # blob through the bytearray path and release the slots.
+                self._store_gather_fail("gathered-store device sync failed", None)
+                torn = True
+            for plan in plans:
+                # Per-plan armor: one plan's raise (e.g. a sick device inside
+                # the rebuild's host copies) must not discard the OTHER
+                # plans' staged blobs, and whatever THIS plan never handed to
+                # _sq_enqueue is counted where it is lost — the disclosure
+                # counters are the accounting of record.
+                try:
+                    if torn:
+                        self._rebuild_plan(plan)
+                    self._finish_stage(plan)
+                except Exception as e:  # noqa: BLE001 — never raise: the plan degrades to counted drops
+                    self._log.maybe("store",
+                                    f"gathered-store finish failed req={plan.req_id}", e)
+                    self._abandon_plan(plan)
+        except Exception as e:  # noqa: BLE001 — never raise: last-resort boundary (per-plan failures were handled above)
+            self._log.maybe("store", "gathered-store finish failed", e)
+            for plan in plans:
+                self._abandon_plan(plan)
 
     # ------------------------------------------------------------------
     # write-behind store queue (kvblockd_async_store)
     # ------------------------------------------------------------------
-    def _stage_one(self, req: KvbReqMeta) -> None:
-        """Copy every store-range block into ONE owned bytearray per block
+    def _stage_one(self, req: KvbReqMeta) -> _StagePlan | None:
+        """Copy every store-range block into ONE owned buffer per block
         (32B layout prefix + all layers, exactly the blob _store_one streams)
         and enqueue it. The copies MUST happen inside wait_for_save: after it
         returns the scheduler may reuse the paged blocks, and _block_bytes is
         zero-copy on CPU — draining the view later would stream whatever the
-        engine wrote over it (silent corruption armor, not an optimization)."""
+        engine wrote over it (silent corruption armor, not an optimization).
+
+        CUDA paged tensors with a live slot pool stage through batched
+        gathers + async D2H instead of layers x blocks synchronous copies;
+        that path DEFERS the enqueues behind wait_for_save's single device
+        sync and returns the plan. Everything else (and every gather-path
+        failure — paged memory is still valid here) runs the original inline
+        bytearray loop and returns None."""
         names, dtype_name, bytes_per_layer = self._layout()
         if not names:
-            return
+            return None
         total = BLOB_PREFIX_LEN + bytes_per_layer * len(names)
         prefix = encode_blob_prefix(dtype_name, len(names), self._block_size,
                                     bytes_per_layer, total)
@@ -1414,15 +1556,20 @@ class KvblockdConnector(_Base):
                     self.dropped_puts += skipped
                     self.dropped_put_bytes += skipped * total
             end = hole
+        if end <= req.store_start_block:
+            return None
+        dev = self._layer_kv[names[0]].device
+        if (self._slab_path_ok(dev) and not self._store_gather_disabled
+                and self._store_pool_ready(total)):
+            plan = self._stage_gather(req, names, bytes_per_layer, total,
+                                      prefix, keys, end)
+            if plan is not None:
+                self._note_store_path("gathered-slots")
+                return plan
+        self._note_store_path("bytearray")
         for j in range(req.store_start_block, end):
-            bid = req.block_ids[j]
-            buf = bytearray(total)
-            buf[:BLOB_PREFIX_LEN] = prefix
-            dst = np.frombuffer(buf, dtype=np.uint8)  # writable view of buf
-            for li, name in enumerate(names):
-                src = self._block_bytes(self._layer_kv[name][bid])
-                dst[BLOB_PREFIX_LEN + li * bytes_per_layer:
-                    BLOB_PREFIX_LEN + (li + 1) * bytes_per_layer] = src  # copies
+            buf = self._build_block_blob(req.block_ids[j], names,
+                                         bytes_per_layer, prefix, total)
             if not self._sq_enqueue(keys[j], buf):
                 # TAIL-SKIP: block keys are a prefix chain, so once block j is
                 # missing every later block of THIS request is unreachable by
@@ -1436,12 +1583,281 @@ class KvblockdConnector(_Base):
                     with self._sq_cond:
                         self.dropped_puts += skipped
                         self.dropped_put_bytes += skipped * total
-                return
+                return None
+        return None
 
-    def _sq_enqueue(self, key: bytes, buf: bytearray) -> bool:
-        """Enqueue one owned blob. NEVER blocks and NEVER raises: past the
-        byte budget (or during shutdown) the block is dropped and counted —
-        a lost store is a future miss, an engine stall is an incident."""
+    def _build_block_blob(self, bid: int, names, bytes_per_layer: int,
+                          prefix: bytes, total: int) -> bytearray:
+        """One owned blob for physical block bid — the original per-block
+        copy loop, byte-for-byte (the gather path's fallback oracle)."""
+        buf = bytearray(total)
+        buf[:BLOB_PREFIX_LEN] = prefix
+        dst = np.frombuffer(buf, dtype=np.uint8)  # writable view of buf
+        for li, name in enumerate(names):
+            src = self._block_bytes(self._layer_kv[name][bid])
+            dst[BLOB_PREFIX_LEN + li * bytes_per_layer:
+                BLOB_PREFIX_LEN + (li + 1) * bytes_per_layer] = src  # copies
+        return buf
+
+    # ------------------------------------------------------------------
+    # gathered-store fast path (CUDA paged tensors, pinned slot pool)
+    # ------------------------------------------------------------------
+    def _store_pool_ready(self, total: int) -> bool:
+        """Whether store slots of exactly this stride can be leased; allocates
+        the pool at the first CUDA layout capture (_maybe_prewarm) or, if
+        that never ran, lazily on the first CUDA store. Stride is fixed at
+        first allocation — a layout change mid-run simply stops matching and
+        the bytearray path serves (never realloc: queued slots reference the
+        old tensor). Auto-size (config unset) = queue byte budget + 2 slots
+        (1 in flight + 1 staging while the queue sits at budget). Enqueues
+        are DEFERRED behind the device sync, so a lease can be denied while
+        the queue still has room; denial is congestion, not failure — the
+        block degrades to an IDENTICAL bytearray blob (same bytes, same
+        accounting), never a drop. Never raises."""
+        if self._store_slab_disabled or total <= 0:
+            return False
+        if self._store_slab is not None:
+            return total == self._store_slot_stride
+        cfg_bytes = self._cfg.store_staging_bytes
+        if cfg_bytes is not None and cfg_bytes <= 0:
+            return False  # explicitly off: not a failure, no latch
+        if cfg_bytes is None:
+            n_slots = self._cfg.store_queue_bytes // total + 2
+        else:
+            n_slots = cfg_bytes // total
+        if n_slots <= 0:
+            self._store_slab_disabled = True  # can never fit one blob
+            self._log.maybe("store-slab",
+                            f"kvblockd_store_staging_bytes={cfg_bytes} holds no "
+                            f"{total}-byte slot — bytearray staging keeps serving")
+            return False
+        try:
+            slab = self._alloc_pinned(n_slots * total)
+            slab_np = slab.numpy()
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: pin failure degrades to bytearray staging
+            self._store_slab_disabled = True
+            self._log.maybe("store-slab",
+                            "pinned store-slot pool allocation failed — "
+                            "bytearray staging keeps serving", e)
+            return False
+        self._store_slab, self._store_slab_np = slab, slab_np
+        self._store_slot_stride = total
+        with self._sq_cond:
+            self._store_slots_total = n_slots
+            self._store_slot_free = list(range(n_slots))
+        return True
+
+    def _store_slot_lease(self) -> int | None:
+        with self._sq_cond:
+            if self._store_slot_free:
+                return self._store_slot_free.pop()
+        return None
+
+    def _store_gather_fail(self, msg: str, exc: BaseException | None) -> None:
+        """Consecutive gather-path failure accounting (mirrors the load side's
+        _scratch_fails / _SCRATCH_MAX_FAILS latch). Slot-pool EXHAUSTION never
+        lands here — congestion falls back per block without counting."""
+        self._store_gather_fails += 1
+        if self._store_gather_fails >= _SCRATCH_MAX_FAILS:
+            self._store_gather_disabled = True
+            self._log.maybe(
+                "store-gather",
+                f"{msg} {self._store_gather_fails}x in a row — latched OFF for "
+                "this connector's lifetime (bytearray staging)", exc)
+        else:
+            self._log.maybe("store-gather", f"{msg} — bytearray fallback", exc)
+
+    def _note_store_path(self, path: str) -> None:
+        """Store-side twin of _note_path (same WARNING rationale), on its own
+        state so the load stamp's one-shot is never consumed by a store."""
+        if self._reported_store_path is None:
+            self._reported_store_path = path
+            logger.warning("kvblockd store path: %s", path)
+        elif path != self._reported_store_path and not self._store_path_switch_logged:
+            self._store_path_switch_logged = True
+            logger.warning("kvblockd store path: %s (switched from %s mid-run)",
+                           path, self._reported_store_path)
+
+    def _stage_gather(self, req: KvbReqMeta, names, bytes_per_layer: int,
+                      total: int, prefix: bytes, keys, end: int) -> _StagePlan | None:
+        """Batched gather staging: per chunk one index_select per layer into
+        the (shared) GPU scratch — the exact inverse of the load's
+        index_copy_ — then one async D2H per slot into its pinned body
+        (prefix gaps break slab contiguity, so per-slot it is). The 32B
+        prefix is CPU-stamped at lease time. Same-stream ordering makes each
+        chunk's D2H precede the next chunk's gather overwrite for free; the
+        blobs are only provably complete after wait_for_save's device sync,
+        which is why every enqueue is deferred into the returned plan.
+        A slot-pool dry spell mid-request is congestion, not failure: that
+        block takes an inline bytearray (slot None) and keeps its place in
+        the request's enqueue order. Returns None on failure (counted toward
+        the latch) with every leased slot freed — paged memory is still
+        valid, so the caller's bytearray loop rebuilds everything."""
+        torch = _torch()
+        n_layers = len(names)
+        dev = self._layer_kv[names[0]].device
+        try:
+            paged_u8 = {}
+            for name in names:
+                t = self._layer_kv[name]
+                # view, NEVER reshape: reshape would silently COPY a
+                # non-contiguous paged tensor and the gather would read a
+                # temporary (the load path's refuter-verified BLOCKER class);
+                # view aliases or raises, and the raise lands here.
+                paged_u8[name] = t.view(torch.uint8).view(t.shape[0], -1)
+            scratch = self._scratch_ring(dev, n_layers, bytes_per_layer)[0]
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: setup failure degrades to bytearray staging
+            self._store_gather_fail("gathered-store setup failed", e)
+            return None
+        items: list[list] = []                 # [j, key, buf, slot_id]
+        gathered: list[tuple[int, int]] = []   # (items index, slot id)
+        try:
+            for j in range(req.store_start_block, end):
+                slot = self._store_slot_lease()
+                if slot is None:
+                    items.append([j, keys[j],
+                                  self._build_block_blob(req.block_ids[j], names,
+                                                         bytes_per_layer, prefix,
+                                                         total), None])
+                    continue
+                base = slot * total
+                mv = memoryview(self._store_slab_np[base:base + total])
+                mv[:BLOB_PREFIX_LEN] = prefix
+                items.append([j, keys[j], mv, slot])
+                gathered.append((len(items) - 1, slot))
+            for c0 in range(0, len(gathered), _SCATTER_CHUNK):
+                chunk = gathered[c0:c0 + _SCATTER_CHUNK]
+                nblk = len(chunk)
+                idx = torch.tensor([req.block_ids[items[i][0]] for i, _ in chunk],
+                                   dtype=torch.long, device=dev)
+                for li, name in enumerate(names):
+                    # No index_select(out=): strided-view out= is
+                    # version-fragile; the assignment form is not.
+                    scratch[:nblk, li] = paged_u8[name].index_select(0, idx)
+                for ci, (_i, slot) in enumerate(chunk):
+                    body = self._store_slab[slot * total + BLOB_PREFIX_LEN:
+                                            (slot + 1) * total]
+                    body.view(n_layers, bytes_per_layer).copy_(
+                        scratch[ci], non_blocking=True)
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: mid-fill failure frees the leases and degrades
+            try:
+                # A D2H may still be in flight into these slots: sync before
+                # returning them, or a re-lease could race the tail of it.
+                self._store_sync(dev)
+            except Exception:  # noqa: BLE001, S110 — best effort; the slots are being abandoned either way
+                pass
+            with self._sq_cond:
+                for _i, slot in gathered:
+                    self._store_slot_free.append(slot)
+            self._store_gather_fail("gathered-store staging failed", e)
+            return None
+        return _StagePlan(req_id=req.req_id, total=total, end=end, items=items,
+                          dev=dev, names=names, bytes_per_layer=bytes_per_layer,
+                          block_ids=list(req.block_ids), prefix=prefix)
+
+    def _store_sync(self, dev) -> bool:
+        """ONE event recorded after the last issued D2H, synchronized — the
+        gathered blobs are complete-or-rebuilt before any enqueue and before
+        wait_for_save returns (the paged buffer is only stable until then).
+        No-op off-CUDA (the CPU test seam). Returns False on failure — the
+        caller must treat every gathered blob as torn."""
+        if getattr(dev, "type", "") != "cuda":
+            return True
+        torch = _torch()
+        try:
+            ev = torch.cuda.Event()
+            ev.record(torch.cuda.current_stream(dev))
+            ev.synchronize()
+            return True
+        except Exception as e:  # noqa: BLE001 — never-raise boundary: an unfinished stream means nothing is provably staged
+            self._log.maybe("store-gather", "gathered-store device sync failed", e)
+            return False
+
+    def _rebuild_plan(self, plan: _StagePlan) -> None:
+        """Device sync failed: every slot-backed blob in the plan is possibly
+        torn. Paged memory is still valid (wait_for_save has not returned),
+        so rebuild each through the bytearray path and free its slot —
+        identical bytes, identical accounting, just no overlap won."""
+        for it in plan.items:
+            j, _key, _buf, slot = it
+            if slot is None:
+                continue
+            it[2] = self._build_block_blob(plan.block_ids[j], plan.names,
+                                           plan.bytes_per_layer, plan.prefix,
+                                           plan.total)
+            it[3] = None
+            with self._sq_cond:
+                self._store_slot_free.append(slot)
+
+    def _finish_stage(self, plan: _StagePlan) -> None:
+        """Deferred enqueue of one synced plan, in block order — the same
+        tail-skip contract as the inline loop (the refused block itself is
+        counted by _sq_enqueue; the unreachable tail is counted here). Slot
+        ownership moves to the queue tuple on enqueue (it[3] nulled), so
+        every slot has exactly one owner at every exit. plan.sent advances
+        only once _sq_enqueue RETURNS (it never raises — its own contract —
+        and settles the item's accounting whether it accepts or refuses), so
+        a raise anywhere leaves _abandon_plan counting exactly the items
+        never handed over, with their leases still marked in it[3]."""
+        for i, it in enumerate(plan.items):
+            j, key, buf, slot = it
+            ok = self._sq_enqueue(key, buf, slot)
+            # Settled: on True the queue tuple owns the lease; on False the
+            # refusal branch below frees it. Either way the item has left
+            # the abandonable window.
+            it[3] = None
+            plan.sent = i + 1
+            if ok:
+                continue
+            with self._sq_cond:
+                if slot is not None:  # refused: the lease never reached the queue
+                    self._store_slot_free.append(slot)
+                for tail in plan.items[i + 1:]:
+                    if tail[3] is not None:
+                        self._store_slot_free.append(tail[3])
+                        tail[3] = None
+            self._store_holes[plan.req_id] = j  # j < any prior hole (end is capped)
+            skipped = plan.end - j - 1
+            if skipped > 0:
+                with self._sq_cond:
+                    self.dropped_puts += skipped
+                    self.dropped_put_bytes += skipped * plan.total
+            plan.sent = len(plan.items)  # tail fully counted here — not abandonable
+            return
+
+    def _abandon_plan(self, plan: _StagePlan) -> None:
+        """A raise abandoned this plan before every item reached _sq_enqueue:
+        the unsent items are lost HERE, so they are counted HERE — a vanished
+        block with dropped_puts=0 breaks the disclosure contract the bench
+        rigs grep — the prefix hole is recorded so later steps of the request
+        tail-skip past it, and the leases come home only AFTER a best-effort
+        device sync (a D2H may still be in flight into these slots; same
+        rationale as _stage_gather's own mid-fill failure path). Idempotent:
+        a second call finds sent == len(items) and counts nothing."""
+        lost = plan.items[plan.sent:]
+        plan.sent = len(plan.items)
+        if not lost:
+            return
+        try:
+            self._store_sync(plan.dev)
+        except Exception:  # noqa: BLE001, S110 — best effort; the slots are being abandoned either way
+            pass
+        with self._sq_cond:
+            for it in lost:
+                if it[3] is not None:
+                    self._store_slot_free.append(it[3])
+                    it[3] = None
+            self.dropped_puts += len(lost)
+            self.dropped_put_bytes += len(lost) * plan.total
+        self._store_holes[plan.req_id] = lost[0][0]  # j < any prior hole (end is capped)
+
+    def _sq_enqueue(self, key: bytes, buf: bytearray | memoryview,
+                    slot_id: int | None = None) -> bool:
+        """Enqueue one owned blob (slot_id set when buf is a pinned store
+        slot: the queue tuple then owns the lease). NEVER blocks and NEVER
+        raises: past the byte budget (or during shutdown) the block is
+        dropped and counted — the CALLER frees a refused slot — a lost store
+        is a future miss, an engine stall is an incident."""
         n = len(buf)
         with self._sq_cond:
             if self._store_stop or self._sq_bytes + n > self._cfg.store_queue_bytes:
@@ -1450,7 +1866,7 @@ class KvblockdConnector(_Base):
                 dropped, failed, dbytes = (self.dropped_puts, self.failed_puts,
                                            self.dropped_put_bytes)
             else:
-                self._sq.append((key, buf))
+                self._sq.append((key, buf, slot_id))
                 self._sq_bytes += n
                 self._sq_cond.notify_all()
                 dropped = None
@@ -1465,7 +1881,10 @@ class KvblockdConnector(_Base):
                 f"failed={failed} dropped_bytes={dbytes}",
             )
             return False
-        self._store_thread_start()
+        try:
+            self._store_thread_start()
+        except Exception as e:  # noqa: BLE001 — the never-raises contract must survive thread exhaustion: the blob IS queued, a later enqueue restarts the drain and shutdown counts any remainder
+            self._log.maybe("store", "kvb-store drain thread start failed", e)
         return True
 
     def _store_thread_start(self) -> None:
@@ -1489,27 +1908,37 @@ class KvblockdConnector(_Base):
         failures count immediately. Either way the client is dropped with the
         same breaker discipline as loads and the thread NEVER dies to an op
         error, so delivery resumes after a redial. OK_EXISTS = dedup, fine."""
-        retry_of: bytearray | None = None  # the buf that already failed once
+        retry_of: bytearray | memoryview | None = None  # the buf that already failed once
         while True:
             with self._sq_cond:
                 while not self._sq and not self._store_stop:
                     self._sq_cond.wait()
                 # Load-priority gate: a load is actively pulling KV, so park
                 # (bounded by the ceiling) before spending wire/GIL on a
-                # store. Shutdown flags cut the park short — a flush is
-                # never held hostage to the gate.
-                if (self._loads_inflight > 0 and not self._store_stop
-                        and not self._store_abort):
-                    park_until = time.monotonic() + _DRAIN_GATE_CEILING_S
-                    while (self._loads_inflight > 0 and not self._store_stop
-                           and not self._store_abort):
-                        left = park_until - time.monotonic()
-                        if left <= 0:
-                            break
-                        self._sq_cond.wait(left)
+                # store. The ceiling is armed ONCE per raised episode — N
+                # queued blobs under one wedged gate cost one ceiling total,
+                # never N — and episodes are edge-triggered: start_load_kv
+                # clears the arm on the 0->1 load transition (this thread
+                # only samples the counter between puts, so it can miss an
+                # entire gate-down/gate-up flip inside one put). Shutdown
+                # flags cut the park short (they are in the predicate and
+                # notify_all'd) — a flush is never held hostage to the gate.
+                while (self._loads_inflight > 0 and not self._store_stop
+                       and not self._store_abort):
+                    if self._drain_park_until is None:
+                        # Armed INSIDE the loop: an episode edge can clear
+                        # the arm mid-wait, and that new episode is owed its
+                        # own fresh ceiling.
+                        self._drain_park_until = time.monotonic() + _DRAIN_GATE_CEILING_S
+                    left = self._drain_park_until - time.monotonic()
+                    if left <= 0:
+                        break
+                    self._sq_cond.wait(left)
+                if self._loads_inflight == 0:
+                    self._drain_park_until = None  # episode over cleanly
                 if self._store_abort or (not self._sq and self._store_stop):
                     return
-                key, buf = self._sq.popleft()
+                key, buf, slot_id = self._sq.popleft()
                 n = len(buf)
                 self._sq_bytes -= n
                 self._sq_inflight += 1
@@ -1530,18 +1959,24 @@ class KvblockdConnector(_Base):
                 counted_dropped = self._sq_inflight_counted > 0
                 if counted_dropped:
                     self._sq_inflight_counted -= 1
+                requeued = False
                 if err is None:
                     retry_of = None
                     if counted_dropped:  # delivered after all: un-count it
                         self.dropped_puts -= 1
                         self.dropped_put_bytes -= n
                 elif requeue and not self._store_abort:
-                    self._sq.appendleft((key, buf))
+                    self._sq.appendleft((key, buf, slot_id))  # keeps the lease
                     self._sq_bytes += n
                     retry_of = buf
+                    requeued = True
                 elif not counted_dropped:  # dropped-at-shutdown is not ALSO failed
                     retry_of = None
                     self.failed_puts += 1
+                # THE inflight free point (delivered or terminal): the put has
+                # returned, so the memoryview is out of _send_frame's iovec.
+                if slot_id is not None and not requeued:
+                    self._store_slot_free.append(slot_id)
                 self._sq_cond.notify_all()
             if err is None:
                 continue
@@ -1596,6 +2031,13 @@ class KvblockdConnector(_Base):
                 # many were counted so the drain thread can reconcile
                 # (delivered -> un-count; failed -> not ALSO failed_puts).
                 self._sq_inflight_counted = self._sq_inflight
+            # QUEUED slots come home before the clear (their puts never
+            # started, so no iovec can reference them); an INFLIGHT slot is
+            # NEVER freed here — only the drain's reconcile block may, once
+            # the put has returned (else a wedged sendmsg still reads it).
+            for _k, _b, sid in self._sq:
+                if sid is not None:
+                    self._store_slot_free.append(sid)
             self._sq.clear()
             self._sq_bytes = 0
             self._sq_cond.notify_all()

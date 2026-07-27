@@ -160,6 +160,7 @@ def test_load_deadline_abandons_remaining_slab_passes():
     conn = KvblockdConnector(cfg, role="scheduler", kv_cache_config=None)
     conn._slab_path_ok = lambda dev: True  # force the pass-based slab lane on CPU
     conn._alloc_pinned = lambda n: _torch.empty(n, dtype=_torch.uint8)
+    conn._cfg.store_staging_bytes = 0  # load test: skip the store-pool prewarm
 
     class SlowClient:
         calls = 0

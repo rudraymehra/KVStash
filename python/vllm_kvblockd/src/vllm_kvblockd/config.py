@@ -179,6 +179,7 @@ class AdapterConfig:
         "staging_bytes",
         "store_flush_timeout_s",
         "store_queue_bytes",
+        "store_staging_bytes",
         "streams",
         "token",
         "tokenizer",
@@ -227,6 +228,16 @@ class AdapterConfig:
         # request) is dropped and counted in the connector's dropped_puts /
         # dropped_put_bytes counters.
         c.store_queue_bytes = int(get_extra_config(ktc, "kvblockd_store_queue_bytes", 1 << 30))
+        # Pinned staging pool for the CUDA gathered-store fast path. 0 (or
+        # negative) disables the pool; UNSET auto-sizes it to the queue byte
+        # budget plus two slots of headroom (~1 GiB of pinned host RAM at
+        # the default queue budget, allocated at the first CUDA layout
+        # capture and held for the run, ON TOP of the load slab's prewarm —
+        # budget both on a RAM-tight rig). A denied lease is congestion, not
+        # failure: the block degrades to an IDENTICAL bytearray blob (same
+        # bytes, same accounting). An explicit value overrides the auto-size.
+        ssb = get_extra_config(ktc, "kvblockd_store_staging_bytes", None)
+        c.store_staging_bytes = int(ssb) if ssb not in (None, "") else None
         # shutdown() waits at most this long for the queue to flush; whatever
         # is still undelivered is counted dropped and disclosed.
         c.store_flush_timeout_s = float(

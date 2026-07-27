@@ -50,6 +50,9 @@ def plain_alloc(n):
 def force_slab(conn) -> None:
     conn._slab_path_ok = lambda dev: True
     conn._alloc_pinned = plain_alloc
+    # LOAD-path tests only: keep the (now capture-time) store-pool prewarm
+    # from auto-sizing ~1 GiB per connector. 0 = explicitly off, no latch.
+    conn._cfg.store_staging_bytes = 0
 
 
 def big_kv(num_paged_blocks: int):
