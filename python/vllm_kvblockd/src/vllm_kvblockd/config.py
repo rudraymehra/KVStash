@@ -211,11 +211,14 @@ class AdapterConfig:
         # cap drain through it in cap-sized passes. <=0 disables the slab
         # (per-block loads only).
         c.staging_bytes = int(get_extra_config(ktc, "kvblockd_staging_bytes", 2 * 2**30))
-        # Eager pinned-slab pre-warm size, applied at the FIRST CUDA layout
-        # capture (min'ed against the staging cap; the cap is the default).
-        # cudaHostAlloc of gigabytes takes hundreds of ms — paying it at
-        # capture time instead of inside the first measured load, and saying
-        # so in the log, keeps the first-request stall out of the warm arm.
+        # Eager pinned-slab pre-warm CEILING, applied at the FIRST CUDA layout
+        # capture (default: the staging cap). cudaHostAlloc of gigabytes takes
+        # hundreds of ms — paying it at capture time instead of inside the
+        # first measured load, and saying so in the log, keeps the
+        # first-request stall out of the warm arm. The EFFECTIVE pin is
+        # min(this, what the pipelined load path can ever reserve: two
+        # 256MiB-capped slab halves, ~512MiB at defaults) — the prewarm never
+        # pins bytes no load will touch, and this knob can only shrink it.
         c.prewarm_bytes = int(get_extra_config(ktc, "kvblockd_prewarm_bytes", c.staging_bytes))
         c.op_timeout = float(get_extra_config(ktc, "kvblockd_op_timeout_s", 10.0))
         c.connect_timeout = float(get_extra_config(ktc, "kvblockd_connect_timeout_s", 5.0))

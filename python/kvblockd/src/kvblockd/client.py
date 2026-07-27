@@ -544,8 +544,20 @@ class Client:
         # With so_rcvbuf=None this is the autotune starting size.
         self.granted_rcvbuf = c.granted_rcvbuf
         self._pool.checkin(c)
+        # Persistent drain workers for batch_get_scatter (created AFTER the
+        # prime so a failed dial never leaks threads): a per-call executor
+        # paid thread spawn + teardown on every load, on the latency path.
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_MAX_GET_FANOUT, self._streams),
+            thread_name_prefix="kvb-get")
 
     def close(self):
+        # Executor BEFORE the pool: Pool.close only closes IDLE conns, so a
+        # shard mid-drain keeps its checked-out conn (recvs stay bounded by
+        # op_timeout) and its checkin lands on the closed pool, which closes
+        # the conn. wait=False keeps close() from blocking on an in-flight
+        # drain — the workers exit as soon as their shard settles.
+        self._executor.shutdown(wait=False)
         self._pool.close()
 
     def _run(self, fn):
@@ -616,17 +628,28 @@ class Client:
         bounds = self._shard_bounds(n, nshards)
         statuses = [p.Status.NOT_FOUND] * n
         errs = []
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=nshards, thread_name_prefix="kvb-get") as ex:
-            futs = [(s, ex.submit(self._scatter_shard, keys[s:e], prefix_len, alloc, s,
-                                  deadline))
-                    for s, e in bounds]
-            for s, fut in futs:
-                try:
-                    part = fut.result()
-                    statuses[s:s + len(part)] = part
-                except Exception as exc:  # noqa: BLE001 — joined below; connection deaths were already downgraded to misses in _scatter_shard, so anything here is a real protocol/caller error
-                    errs.append(exc)
+        futs = []
+        try:
+            for s, e in bounds:
+                futs.append((s, self._executor.submit(self._scatter_shard, keys[s:e],
+                                                      prefix_len, alloc, s, deadline)))
+        except RuntimeError as exc:
+            # Executor shut down == client closed: surface the same eviction-
+            # class error the pool raises, so callers degrade to misses. But
+            # NEVER settle with live writers: a shard already submitted keeps
+            # its checked-out conn (Pool.close only closes idle ones) and
+            # keeps writing caller-owned memoryviews via alloc; a raise that
+            # returns first would let the caller re-map those bytes under a
+            # later call while the orphan still writes them. Join the shards
+            # — each is bounded by op_timeout/deadline, so the join is too.
+            concurrent.futures.wait([f for _, f in futs])
+            raise ConnectionLost(f"client closed: {exc}") from exc
+        for s, fut in futs:
+            try:
+                part = fut.result()
+                statuses[s:s + len(part)] = part
+            except Exception as exc:  # noqa: BLE001 — joined below; connection deaths were already downgraded to misses in _scatter_shard, so anything here is a real protocol/caller error
+                errs.append(exc)
         if errs:
             raise errs[0]
         return statuses

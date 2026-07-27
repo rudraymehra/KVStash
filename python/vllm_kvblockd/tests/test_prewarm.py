@@ -52,6 +52,45 @@ def test_prewarm_at_first_cuda_capture(caplog):
     conn.shutdown()
 
 
+def test_prewarm_pins_pipeline_reserve_not_staging_cap():
+    """RED-PROOF (R4): under the DEFAULT 2GiB staging cap the load path only
+    ever reserves two 256MiB-capped slab halves — prewarming the whole cap
+    pinned ~1.5GiB that no load would touch, on top of the ~1GiB store pool.
+    The prewarm must pin exactly the pipeline reserve (2*half_blocks*body)."""
+    conn = make_conn(kvblockd_store_staging_bytes=0)  # default staging: 2GiB
+    conn._slab_path_ok = lambda dev: True
+    allocs = []
+
+    def fake_pin(n):
+        allocs.append(n)
+        return torch.empty(8, dtype=torch.uint8)  # size probe only
+
+    conn._alloc_pinned = fake_pin
+    conn._capture_layers(StubForwardContext(fresh_kv()))
+    body = 256  # fresh_kv: 2 layers x 128B per block
+    half_blocks = (256 << 20) // body  # min(cap/2=1GiB, 256MiB) // body
+    assert allocs == [2 * half_blocks * body]  # 512MiB — the pipeline reserve
+    assert allocs[0] < conn._staging_bytes     # never the whole 2GiB cap
+    conn.shutdown()
+
+
+def test_prewarm_bytes_still_bounds_the_pin():
+    """kvblockd_prewarm_bytes stays the explicit override: it can shrink the
+    pin below the pipeline reserve (it never grows past it)."""
+    conn = make_conn(kvblockd_prewarm_bytes=1 << 20, kvblockd_store_staging_bytes=0)
+    conn._slab_path_ok = lambda dev: True
+    allocs = []
+
+    def fake_pin(n):
+        allocs.append(n)
+        return torch.empty(8, dtype=torch.uint8)
+
+    conn._alloc_pinned = fake_pin
+    conn._capture_layers(StubForwardContext(fresh_kv()))
+    assert allocs == [1 << 20]
+    conn.shutdown()
+
+
 def test_prewarm_failure_keeps_lazy_path():
     """cudaHostAlloc failing at prewarm must NOT latch the slab off — the
     lazy _slab_reserve path (with its own failure policy) keeps serving."""

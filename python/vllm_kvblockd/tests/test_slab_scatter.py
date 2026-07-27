@@ -483,9 +483,11 @@ def test_scratch_failure_counter_resets_on_success():
 
 # ------------------------------------------------------------ path indicator
 
-def test_load_path_logged_once_and_switch_logged_once(daemon, caplog):
-    """Exactly one machine-readable 'kvblockd load path:' INFO line on the
-    first completed load; one more (once) if the path degrades mid-run."""
+def test_load_path_logged_once_and_each_switch_logged(daemon, caplog):
+    """Exactly one machine-readable 'kvblockd load path:' line on the first
+    completed load; one more per DISTINCT mid-run switch (the bench takes the
+    LAST match, so a switch back must re-log or the attribution goes stale);
+    steady state logs nothing."""
     toks = list(range(430, 439))
     salt = "t-path"
     conn1 = make_connector(daemon)
@@ -504,16 +506,26 @@ def test_load_path_logged_once_and_switch_logged_once(daemon, caplog):
 
     with caplog.at_level(logging.INFO, logger="vllm_kvblockd"):
         run_step(conn2, StubRequest("pth-load-1", toks, salt), [2, 3], fresh_kv())
-        assert path_lines() == ["kvblockd load path: chunked-slab"]
+        assert path_lines() == ["kvblockd load path: pipelined-slab"]
         run_step(conn2, StubRequest("pth-load-2", toks, salt), [4, 5], fresh_kv())
         assert len(path_lines()) == 1  # steady state: no repeat
-        conn2._chunked_disabled = True  # e.g. the 3-failure latch tripped
+        conn2._pipeline_disabled = True   # e.g. the 3-failure latch tripped
+        conn2._chunked_disabled = True    # ...and the scatter ring's too
         run_step(conn2, StubRequest("pth-load-3", toks, salt), [6, 7], fresh_kv())
         run_step(conn2, StubRequest("pth-load-4", toks, salt), [0, 1], fresh_kv())
         assert path_lines() == [
-            "kvblockd load path: chunked-slab",
-            "kvblockd load path: per-block (switched from chunked-slab mid-run)",
+            "kvblockd load path: pipelined-slab",
+            "kvblockd load path: per-block (switched from pipelined-slab mid-run)",
         ]
+        # A switch BACK is logged too — the last match must always name the
+        # path serving the tail (this line is the red-proof for the old
+        # one-shot switch flag).
+        conn2._pipeline_disabled = False
+        conn2._chunked_disabled = False
+        run_step(conn2, StubRequest("pth-load-5", toks, salt), [2, 3], fresh_kv())
+        assert path_lines()[-1] == \
+            "kvblockd load path: pipelined-slab (switched from per-block mid-run)"
+        assert len(path_lines()) == 3
     conn2.shutdown()
 
 
