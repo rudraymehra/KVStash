@@ -355,3 +355,89 @@ def test_multi_gpu_refused_at_boot():
 
     with pytest.raises(ValueError, match="world_size=2.*rank"):
         AdapterConfig.from_vllm_config(VC())
+
+
+def _vc_extra(**extra):
+    """Stub VllmConfig whose extra config carries the quick-perf knobs."""
+
+    class KTC:
+        kv_connector_extra_config: ClassVar[dict] = {"kvblockd_token": "t", **extra}
+
+        def get_from_extra_config(self, key, default):
+            return self.kv_connector_extra_config.get(key, default)
+
+    class VC:
+        kv_transfer_config = KTC()
+        cache_config = type("C", (), {"block_size": 16, "cache_dtype": "auto"})()
+        model_config = type("M", (), {"model": "m", "dtype": "torch.bfloat16"})()
+        parallel_config = type("P", (), {"world_size": 1})()
+
+    return VC()
+
+
+def test_get_fanout_knob_parses_and_validates():
+    """kvblockd_get_fanout: unset = None (the client keeps today's clamped
+    default of 4); explicit values are range-checked at BOOT — 8 is the hard
+    stop (iperf: no gain past 8 flows) and the fan-out may never exceed the
+    pool (each shard needs its own pooled connection)."""
+    assert AdapterConfig.from_vllm_config(_vc_extra()).get_fanout is None
+    cfg = AdapterConfig.from_vllm_config(
+        _vc_extra(kvblockd_get_fanout=8, kvblockd_streams=8))
+    assert cfg.get_fanout == 8 and cfg.streams == 8
+    with pytest.raises(ValueError, match="out of range"):
+        AdapterConfig.from_vllm_config(
+            _vc_extra(kvblockd_get_fanout=9, kvblockd_streams=16))
+    with pytest.raises(ValueError, match="out of range"):
+        AdapterConfig.from_vllm_config(_vc_extra(kvblockd_get_fanout=0))
+    with pytest.raises(ValueError, match="kvblockd_streams"):
+        AdapterConfig.from_vllm_config(_vc_extra(kvblockd_get_fanout=8))  # streams=4
+
+
+def test_admission_gate_knobs_default_inert():
+    """Item 12 ships INERT: every gate knob defaults to off/flat-compat —
+    today's behavior until the short-prefix sweep locates a negative region."""
+    cfg = AdapterConfig.from_vllm_config(_vc_extra())
+    assert cfg.min_hit_tokens == 0
+    assert cfg.recompute_ms_per_token == 0.0
+    assert cfg.load_deadline_per_block_s == 0.0
+    assert cfg.load_deadline_cap_s == 0.0
+    cfg = AdapterConfig.from_vllm_config(_vc_extra(
+        kvblockd_min_hit_tokens=512,
+        kvblockd_load_deadline_per_block_s=0.05,
+        kvblockd_load_deadline_cap_s=60.0,
+    ))
+    assert cfg.min_hit_tokens == 512
+    assert cfg.load_deadline_per_block_s == 0.05
+    assert cfg.load_deadline_cap_s == 60.0
+    for bad in ({"kvblockd_min_hit_tokens": -1},
+                {"kvblockd_recompute_ms_per_token": -0.1},
+                {"kvblockd_load_deadline_per_block_s": -1.0}):
+        with pytest.raises(ValueError, match="must be >= 0"):
+            AdapterConfig.from_vllm_config(_vc_extra(**bad))
+
+
+def test_recompute_knob_refused_until_plumbed_cross_role():
+    """kvblockd_recompute_ms_per_token: the load-throughput EMA it needs is
+    worker-role-only and the gate is scheduler-role-only (separate objects/
+    processes in vLLM), so a nonzero value would silently admit every hit —
+    the parse refuses it LOUDLY instead. Explicit 0 stays accepted (inert)."""
+    with pytest.raises(ValueError, match="not yet plumbed cross-role"):
+        AdapterConfig.from_vllm_config(
+            _vc_extra(kvblockd_recompute_ms_per_token=0.25))
+    cfg = AdapterConfig.from_vllm_config(
+        _vc_extra(kvblockd_recompute_ms_per_token=0))
+    assert cfg.recompute_ms_per_token == 0.0
+
+
+def test_store_dedupe_knobs_parse():
+    """Item 8 ships INERT: keys default 0 (today's self-healing re-put —
+    a nonzero default would leave an acked-then-evicted block missing for
+    up to the TTL); the multi-turn arm enables it explicitly."""
+    cfg = AdapterConfig.from_vllm_config(_vc_extra())
+    assert cfg.store_dedupe_keys == 0
+    assert cfg.store_dedupe_ttl_s == 30.0
+    cfg = AdapterConfig.from_vllm_config(_vc_extra(
+        kvblockd_store_dedupe_keys=4096, kvblockd_store_dedupe_ttl_s=5.0))
+    assert cfg.store_dedupe_keys == 4096 and cfg.store_dedupe_ttl_s == 5.0
+    with pytest.raises(ValueError, match="must be >= 0"):
+        AdapterConfig.from_vllm_config(_vc_extra(kvblockd_store_dedupe_keys=-1))

@@ -165,18 +165,25 @@ class AdapterConfig:
         "connect_timeout",
         "dtype",
         "fingerprint",
+        "get_fanout",
         "host",
         "kv_cache_dtype",
+        "load_deadline_cap_s",
+        "load_deadline_per_block_s",
         "load_deadline_s",
         "lookup_timeout_s",
+        "min_hit_tokens",
         "model_name",
         "namespace",
         "op_timeout",
         "port",
         "prewarm_bytes",
+        "recompute_ms_per_token",
         "revision",
         "so_rcvbuf",
         "staging_bytes",
+        "store_dedupe_keys",
+        "store_dedupe_ttl_s",
         "store_flush_timeout_s",
         "store_queue_bytes",
         "store_staging_bytes",
@@ -200,6 +207,28 @@ class AdapterConfig:
         )
         c.streams = int(get_extra_config(ktc, "kvblockd_streams", 4))
         c.verify = bool(get_extra_config(ktc, "kvblockd_verify", True))
+        # GET fan-out: shards per batch_get_scatter, one pooled connection
+        # each. UNSET = today's behavior — the client clamps its built-in
+        # default of 4 to the pool size. An explicit value lifts the per-flow
+        # TCP ceiling on real-NIC rigs (~10 Gbps/flow in an AWS placement
+        # group); iperf shows diminishing returns past 8 flows, so 8 is the
+        # hard stop. Must not exceed kvblockd_streams (each shard needs its
+        # own pooled conn or shards serialize on checkout) — refused at boot,
+        # loudly, rather than silently measuring the pool ceiling.
+        gf = get_extra_config(ktc, "kvblockd_get_fanout", None)
+        if gf in (None, ""):
+            c.get_fanout = None
+        else:
+            c.get_fanout = int(gf)
+            if not 1 <= c.get_fanout <= 8:
+                raise ValueError(
+                    f"kvblockd_get_fanout={c.get_fanout} out of range [1, 8] "
+                    "(iperf shows no gain past 8 flows)")
+            if c.get_fanout > c.streams:
+                raise ValueError(
+                    f"kvblockd_get_fanout={c.get_fanout} > kvblockd_streams="
+                    f"{c.streams}: each GET shard drains on its own pooled "
+                    "connection — raise kvblockd_streams to match")
         # OPT-IN SO_RCVBUF override (bytes). None/unset = leave kernel
         # receive-window autotuning alone (setting SO_RCVBUF disables it and
         # clamps at the non-netns-writable net.core.rmem_max — see the
@@ -260,6 +289,69 @@ class AdapterConfig:
         # forever; past this deadline the load abandons its remaining shards,
         # flags the unfilled block ids, and degrades to a miss. <=0 disables.
         c.load_deadline_s = float(get_extra_config(ktc, "kvblockd_load_deadline_s", 30.0))
+        # Token-scaled deadline arithmetic: the armed budget is
+        #   min(cap, load_deadline_s + per_block_s * n_load_blocks)
+        # so a 4-block load is not granted the same wall clock as a 400-block
+        # one. per_block_s=0 (the default) is flat-compat — the budget is
+        # exactly load_deadline_s, today's behavior. cap<=0 = uncapped.
+        c.load_deadline_per_block_s = float(
+            get_extra_config(ktc, "kvblockd_load_deadline_per_block_s", 0.0))
+        if c.load_deadline_per_block_s < 0:
+            raise ValueError("kvblockd_load_deadline_per_block_s must be >= 0, got "
+                             f"{c.load_deadline_per_block_s}")
+        c.load_deadline_cap_s = float(
+            get_extra_config(ktc, "kvblockd_load_deadline_cap_s", 0.0))
+        # Never-lose-to-recompute admission gate, shipped INERT (default 0 =
+        # off): an external hit smaller than this many tokens is answered as
+        # a full miss — the whole hit is refused, NEVER truncated to the
+        # threshold (causal attention makes the TAIL the expensive end, so a
+        # truncated head-hit would keep the costly part as recompute anyway).
+        # Activate only after a short-prefix sweep locates a real negative
+        # region on the target GPU class.
+        c.min_hit_tokens = int(get_extra_config(ktc, "kvblockd_min_hit_tokens", 0))
+        if c.min_hit_tokens < 0:
+            raise ValueError(
+                f"kvblockd_min_hit_tokens must be >= 0, got {c.min_hit_tokens}")
+        # Cost-crossover estimator coefficient — parsed but REFUSED when
+        # nonzero: the throughput EMA it needs is measured only by the
+        # WORKER-role connector (_load_one), while the gate runs on the
+        # SCHEDULER-role instance, and vLLM constructs the two roles as
+        # separate objects/processes with no worker->scheduler channel in
+        # this connector yet. Accepting the knob would silently admit every
+        # hit forever — a dead knob is refused loudly, never shipped quiet.
+        # kvblockd_min_hit_tokens above is the shipped gate (config-only,
+        # works cross-role). Un-refuse only WITH the cross-role plumbing.
+        c.recompute_ms_per_token = float(
+            get_extra_config(ktc, "kvblockd_recompute_ms_per_token", 0.0))
+        if c.recompute_ms_per_token < 0:
+            raise ValueError("kvblockd_recompute_ms_per_token must be >= 0, got "
+                             f"{c.recompute_ms_per_token}")
+        if c.recompute_ms_per_token > 0:
+            raise ValueError(
+                "kvblockd_recompute_ms_per_token is not yet plumbed cross-role: "
+                "the load-throughput EMA lives in the worker-role connector and "
+                "the admission gate runs in the scheduler-role connector, so a "
+                "nonzero value would silently admit every hit. Use "
+                "kvblockd_min_hit_tokens instead.")
+        # Client-side store dedupe: a bounded LRU of keys the daemon recently
+        # ACKED (OK/OK_EXISTS out of the drain thread's puts). _stage_one
+        # skips re-staging a leading run of acked keys — a request re-served
+        # by vLLM's LOCAL prefix cache stops paying copy + queue budget just
+        # to collect OK_EXISTS. ADVISORY by design: the daemon evicts
+        # (S3-FIFO/TTL), so presence proven at ack time decays — the TTL
+        # bounds how long we trust an ack, and a wrongly-skipped re-store is
+        # a future miss bounded by that window, never a wrong byte.
+        # Ships INERT (default 0 = off = today's self-healing re-put; ttl<=0
+        # also disables): under a nonzero default an acked-then-EVICTED block
+        # would stay missing for up to the TTL instead of being re-stored by
+        # the next turn's put. Enable explicitly (e.g. 4096) for the
+        # multi-turn arm.
+        c.store_dedupe_keys = int(get_extra_config(ktc, "kvblockd_store_dedupe_keys", 0))
+        if c.store_dedupe_keys < 0:
+            raise ValueError(
+                f"kvblockd_store_dedupe_keys must be >= 0, got {c.store_dedupe_keys}")
+        c.store_dedupe_ttl_s = float(
+            get_extra_config(ktc, "kvblockd_store_dedupe_ttl_s", 30.0))
 
         cache = getattr(vllm_config, "cache_config", None)
         c.block_size = int(getattr(cache, "block_size", 16) or 16)

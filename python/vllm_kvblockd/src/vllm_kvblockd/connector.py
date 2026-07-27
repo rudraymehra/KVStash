@@ -229,6 +229,50 @@ class _RateLimitedLog:
             logger.warning("%s: %s", msg, exc)
 
 
+class _AckedKeyLRU:
+    """Bounded TTL'd set of keys the daemon recently ACKED (OK/OK_EXISTS).
+    Populated ONLY by the kvb-store drain thread on put verdicts — an ack is
+    the daemon saying "present", so a false positive is impossible; a false
+    negative (capacity/TTL eviction here) just costs today's re-put. ADVISORY
+    by construction: the daemon evicts (S3-FIFO/TTL), so an entry's ack-time
+    truth decays — the TTL bounds how long it is trusted, and it is NEVER
+    refreshed on a hit (a hit adds no new evidence of daemon-side presence;
+    only a fresh ack does). Write-once keys make content staleness
+    impossible: the worst wrong answer is a skipped re-store after a daemon
+    eviction — a future miss bounded by the window, never a wrong byte.
+    Thread-safe: hit() runs on the engine thread, add() on the drain thread."""
+
+    def __init__(self, cap: int, ttl_s: float):
+        self._cap = cap
+        self._ttl = ttl_s
+        self._lock = threading.Lock()
+        self._entries: dict[bytes, float] = {}  # key -> ack time (insertion-ordered)
+
+    def add(self, key: bytes) -> None:
+        with self._lock:
+            self._entries.pop(key, None)  # re-ack refreshes both TTL and recency
+            self._entries[key] = time.monotonic()
+            while len(self._entries) > self._cap:
+                self._entries.pop(next(iter(self._entries)))  # oldest ack out
+
+    def hit(self, key: bytes) -> bool:
+        with self._lock:
+            t = self._entries.get(key)
+            if t is None:
+                return False
+            if time.monotonic() - t > self._ttl:
+                self._entries.pop(key, None)  # expired: past acks prove nothing now
+                return False
+            return True
+
+    def clear(self) -> None:
+        """Forget every ack at once — for the moment a connection-class
+        failure proves them ALL stale (a daemon restart empties the store,
+        so pre-outage acks would suppress the self-healing re-put)."""
+        with self._lock:
+            self._entries.clear()
+
+
 def align_to_block_size(num_tokens: int, block_size: int) -> int:
     """Largest reusable token count: for an n-token prompt vLLM must compute
     at least the last token itself, so only ((n-1)//B)*B tokens are loadable
@@ -399,6 +443,18 @@ class KvblockdConnector(_Base):
         # Worker-side state.
         self._layer_kv: dict[str, object] = {}        # layer_name -> paged KV tensor
         self._load_errors: set[int] = set()
+        # Cost-crossover estimator inputs (kvblockd_recompute_ms_per_token):
+        # EMA of observed load throughput (bytes/s over whole _load_one
+        # calls) and the live layout's blob bytes per token. Written by the
+        # WORKER-role instance's load path, read by the SCHEDULER-role
+        # instance's gate — and vLLM always constructs those as separate
+        # objects/processes, so the gate's EMA is None in every real
+        # deployment. The config parse therefore REFUSES the knob when
+        # nonzero (see config.py) until a worker->scheduler channel carries
+        # the EMA across; the machinery stays because it is that future
+        # plumbing's evidence source.
+        self._load_bps_ema: float | None = None
+        self._load_bytes_per_token = 0.0
 
         # Pinned staging slab (CUDA loads only): lazily allocated on the first
         # CUDA-device load, grown geometrically UP TO the configured cap
@@ -467,6 +523,14 @@ class KvblockdConnector(_Base):
         self.dropped_puts = 0
         self.dropped_put_bytes = 0
         self.failed_puts = 0
+        self.deduped_puts = 0  # blocks skipped by the acked-key store dedupe
+        # Acked-key store dedupe (kvblockd_store_dedupe_keys): drain-thread
+        # acks in, _stage_one leading-run skips out. None = disabled (knob 0
+        # or TTL<=0) — every path then behaves exactly as before the LRU.
+        self._acked_keys: _AckedKeyLRU | None = None
+        if self._cfg.store_dedupe_keys > 0 and self._cfg.store_dedupe_ttl_s > 0:
+            self._acked_keys = _AckedKeyLRU(self._cfg.store_dedupe_keys,
+                                            self._cfg.store_dedupe_ttl_s)
         # Loads currently pulling KV (guarded by _sq_cond like all queue
         # state); the drain's load-priority gate parks on it.
         self._loads_inflight = 0
@@ -527,6 +591,7 @@ class KvblockdConnector(_Base):
                         namespace=self._cfg.namespace,
                         token=self._cfg.token,
                         streams=self._cfg.streams,
+                        get_fanout=self._cfg.get_fanout,
                         connect_timeout=self._cfg.connect_timeout,
                         op_timeout=self._cfg.op_timeout,
                         verify=self._cfg.verify,
@@ -552,6 +617,12 @@ class KvblockdConnector(_Base):
             if client is None:
                 return  # dial failure/suppression: _ensure already armed it
             self._next_dial = time.monotonic() + _REDIAL_BACKOFF_S
+        # Every entry in the ack LRU was proven against the connection that
+        # just died; the daemon behind the redial may have restarted with an
+        # EMPTY store, and a trusted stale ack suppresses the self-healing
+        # re-put for up to the TTL. Connection loss marks them ALL stale.
+        if self._acked_keys is not None:
+            self._acked_keys.clear()
         client.close()
 
     def shutdown(self):
@@ -619,8 +690,59 @@ class KvblockdConnector(_Base):
             return self._lookup_async(rid, request, num_computed_tokens)
         return self._lookup_sync(request, num_computed_tokens)
 
+    def _load_ms_per_token(self) -> float | None:
+        """Measured load cost in ms/token from the throughput EMA, or None
+        while nothing has been measured (the gate then admits)."""
+        ema = self._load_bps_ema
+        bpt = self._load_bytes_per_token
+        if not ema or bpt <= 0:
+            return None
+        return bpt / ema * 1000.0
+
+    def _observe_load(self, ok_blocks: int, total: int, elapsed: float) -> None:
+        """Feed one completed _load_one into the throughput EMA. ok_blocks
+        approximates delivered blocks (promised minus newly-flagged); misses
+        counted as delivered only OVERSTATE throughput, which biases the gate
+        toward admitting — the safe direction (today's behavior).
+
+        DEBT for the cross-role plumbing wave (the parse refuses the knob
+        until then): the timer starts before the ONE-TIME pinned-slab
+        allocation, and the EMA has no decay/probe — a slow first sample
+        would refuse every hit for the life of the process. Both must be
+        fixed in the same change that carries the EMA worker->scheduler."""
+        if ok_blocks <= 0 or elapsed <= 0 or total <= 0:
+            return
+        bps = ok_blocks * total / elapsed
+        ema = self._load_bps_ema
+        self._load_bps_ema = bps if ema is None else 0.2 * bps + 0.8 * ema
+        self._load_bytes_per_token = total / self._block_size
+
+    def _gate_hit_tokens(self, ext_tokens: int) -> int:
+        """Never-lose-to-recompute admission gate — INERT at the defaults
+        (min_hit_tokens=0, recompute_ms_per_token=0). Refuses the WHOLE hit
+        or admits the whole hit, NEVER truncates it to the threshold: causal
+        attention makes the TAIL of the prefix the expensive end, so a
+        truncated head-hit would keep exactly the costly part as recompute
+        while still paying the load. A refused hit is a disclosed miss —
+        vLLM recomputes, never a wrong byte."""
+        if ext_tokens <= 0:
+            return 0
+        mht = self._cfg.min_hit_tokens
+        if mht > 0 and ext_tokens < mht:
+            return 0
+        # rc is 0.0 in every real deployment — the config parse refuses a
+        # nonzero value until the EMA is plumbed worker->scheduler (the
+        # branch is kept as the landing point for that plumbing).
+        rc = self._cfg.recompute_ms_per_token
+        if rc > 0:
+            load_ms = self._load_ms_per_token()
+            if load_ms is not None and load_ms >= rc:
+                return 0  # loading cannot pay at ANY length under a linear model
+        return ext_tokens
+
     def _lookup_sync(self, request, num_computed_tokens: int):
-        """The original synchronous lookup (flag off / fallback), unchanged."""
+        """The original synchronous lookup (flag off / fallback), now routed
+        through the admission gate (identity at the gate's defaults)."""
         try:
             token_ids = list(getattr(request, "prompt_token_ids", None) or [])
             aligned = align_to_block_size(len(token_ids), self._block_size)
@@ -631,7 +753,7 @@ class KvblockdConnector(_Base):
             keys = block_chain_keys(seed, token_ids[:aligned], self._block_size)
             n_consec, _ = self._ensure().batch_exists(keys)
             hit_tokens = min(n_consec * self._block_size, aligned)
-            return max(0, hit_tokens - num_computed_tokens), False
+            return self._gate_hit_tokens(max(0, hit_tokens - num_computed_tokens)), False
         except Exception as e:  # noqa: BLE001 — never raise: a failed lookup is a miss
             self._log.maybe("lookup", "kvblockd BATCH_EXISTS failed (treated as miss)", e)
             self._drop_client(e)
@@ -660,7 +782,8 @@ class KvblockdConnector(_Base):
             hit = resolver.pop(rid)  # a result posted before a thread death still counts
             if hit is not None:
                 self._lookup_pending.pop(rid, None)
-                return max(0, min(hit, aligned) - num_computed_tokens), False
+                return (self._gate_hit_tokens(
+                    max(0, min(hit, aligned) - num_computed_tokens)), False)
             if not resolver.alive():
                 # Dead resolver (never expected; armor): serve inline, sync.
                 self._log.maybe("lookup-thread",
@@ -1172,9 +1295,18 @@ class KvblockdConnector(_Base):
         # bounds each recv, this bounds the WHOLE load — a daemon trickling
         # bytes passes every per-recv check forever, and the engine counted
         # these blocks computed, so the only safe degrade is: abandon the
-        # remaining shards, flag the unfilled bids, recompute.
-        deadline = (time.monotonic() + self._cfg.load_deadline_s
-                    if self._cfg.load_deadline_s > 0 else None)
+        # remaining shards, flag the unfilled bids, recompute. The budget is
+        # token-scaled: min(cap, base + per_block_s * n_load_blocks) — at the
+        # flat-compat defaults (per_block=0, cap unset) it is exactly base.
+        deadline = None
+        if self._cfg.load_deadline_s > 0:
+            budget = (self._cfg.load_deadline_s
+                      + self._cfg.load_deadline_per_block_s * req.num_load_blocks)
+            if self._cfg.load_deadline_cap_s > 0:
+                budget = min(budget, self._cfg.load_deadline_cap_s)
+            deadline = time.monotonic() + budget
+        t0 = time.monotonic()
+        errs_before = len(self._load_errors)
         path = None
         took_slab = False
         if keys and self._slab_path_ok(dev):
@@ -1205,6 +1337,11 @@ class KvblockdConnector(_Base):
             path = "per-block"
         if keys:
             self._note_path(path)
+            # Estimator feed: promised minus newly-flagged approximates the
+            # delivered blocks (a bid flagged twice undercounts errors, i.e.
+            # overstates throughput — the admit-biased direction).
+            self._observe_load(len(keys) - (len(self._load_errors) - errs_before),
+                               total, time.monotonic() - t0)
 
     def _note_path(self, path: str) -> None:
         """One machine-readable line on the first completed load — the bench
@@ -1940,16 +2077,33 @@ class KvblockdConnector(_Base):
             end = hole
         if end <= req.store_start_block:
             return None
+        start = req.store_start_block
+        if self._acked_keys is not None:
+            # Acked-key dedupe, BEFORE any copy/D2H: skip the LEADING run of
+            # keys the daemon already acked. Leading-run only, on purpose —
+            # acks land in per-request block order (FIFO drain), so the
+            # target workload (a re-served local-prefix request) re-offers an
+            # already-acked PREFIX; skipping a mid-range key would also break
+            # _finish_stage's tail-skip arithmetic (it counts plan rows by
+            # block index). A non-leading acked key just re-puts and collects
+            # OK_EXISTS — today's cost, not a correctness event.
+            while start < end and self._acked_keys.hit(keys[start]):
+                start += 1
+            if start > req.store_start_block:
+                with self._sq_cond:
+                    self.deduped_puts += start - req.store_start_block
+            if start >= end:
+                return None  # the whole range is recently-acked: nothing to stage
         dev = self._layer_kv[names[0]].device
         if (self._slab_path_ok(dev) and not self._store_gather_disabled
                 and self._store_pool_ready(total)):
             plan = self._stage_gather(req, names, bytes_per_layer, total,
-                                      prefix, keys, end)
+                                      prefix, keys, start, end)
             if plan is not None:
                 self._note_store_path("gathered-slots")
                 return plan
         self._note_store_path("bytearray")
-        for j in range(req.store_start_block, end):
+        for j in range(start, end):
             buf = self._build_block_blob(req.block_ids[j], names,
                                          bytes_per_layer, prefix, total)
             if not self._sq_enqueue(keys[j], buf):
@@ -2061,7 +2215,8 @@ class KvblockdConnector(_Base):
                            path, self._reported_store_path)
 
     def _stage_gather(self, req: KvbReqMeta, names, bytes_per_layer: int,
-                      total: int, prefix: bytes, keys, end: int) -> _StagePlan | None:
+                      total: int, prefix: bytes, keys, start: int,
+                      end: int) -> _StagePlan | None:
         """Batched gather staging: per chunk one index_select per layer into
         the (shared) GPU scratch — the exact inverse of the load's
         index_copy_ — then one async D2H per slot into its pinned body
@@ -2072,9 +2227,11 @@ class KvblockdConnector(_Base):
         which is why every enqueue is deferred into the returned plan.
         A slot-pool dry spell mid-request is congestion, not failure: that
         block takes an inline bytearray (slot None) and keeps its place in
-        the request's enqueue order. Returns None on failure (counted toward
-        the latch) with every leased slot freed — paged memory is still
-        valid, so the caller's bytearray loop rebuilds everything."""
+        the request's enqueue order. start is the caller's dedupe-adjusted
+        first block (== req.store_start_block with the acked-key LRU off).
+        Returns None on failure (counted toward the latch) with every leased
+        slot freed — paged memory is still valid, so the caller's bytearray
+        loop rebuilds everything."""
         torch = _torch()
         n_layers = len(names)
         dev = self._layer_kv[names[0]].device
@@ -2094,7 +2251,7 @@ class KvblockdConnector(_Base):
         items: list[list] = []                 # [j, key, buf, slot_id]
         gathered: list[tuple[int, int]] = []   # (items index, slot id)
         try:
-            for j in range(req.store_start_block, end):
+            for j in range(start, end):
                 slot = self._store_slot_lease()
                 if slot is None:
                     items.append([j, keys[j],
@@ -2361,6 +2518,12 @@ class KvblockdConnector(_Base):
                     self._store_slot_free.append(slot_id)
                 self._sq_cond.notify_all()
             if err is None:
+                # Ack-populated dedupe: put() returned OK or OK_EXISTS (any
+                # other status raises), so the daemon holds this key NOW —
+                # the only evidence the LRU ever accepts. Outside _sq_cond
+                # (the LRU has its own lock).
+                if self._acked_keys is not None:
+                    self._acked_keys.add(key)
                 continue
             self._log.maybe("store", "kvblockd async store failed", err)
             self._drop_client(err)
@@ -2423,10 +2586,13 @@ class KvblockdConnector(_Base):
             self._sq.clear()
             self._sq_bytes = 0
             self._sq_cond.notify_all()
-            dropped, failed, dbytes = (self.dropped_puts, self.failed_puts,
-                                       self.dropped_put_bytes)
-        logger.warning("kvblockd store queue: dropped=%d failed=%d dropped_bytes=%d",
-                       dropped, failed, dbytes)
+            dropped, failed, dbytes, deduped = (self.dropped_puts, self.failed_puts,
+                                                self.dropped_put_bytes,
+                                                self.deduped_puts)
+        # deduped rides at the END so the bench's existing dropped=/failed=
+        # greps keep matching the unchanged head of the line.
+        logger.warning("kvblockd store queue: dropped=%d failed=%d dropped_bytes=%d"
+                       " deduped=%d", dropped, failed, dbytes, deduped)
 
     def handle_preemptions(self, *args, **kwargs) -> None:
         """Explicit NO-OP, on purpose: the write-behind queue holds OWNED

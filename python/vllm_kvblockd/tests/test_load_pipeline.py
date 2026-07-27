@@ -375,7 +375,7 @@ def test_exit_sync_precedes_store_gather_ring_use_and_no_thread_survives():
     conn._scratch_ring = logging_ring
     req.store_start_block, req.store_end_block = 0, 2
     plan = conn._stage_gather(req, w["names"], w["bpl"], w["total"],
-                              w["prefix"], w["keys"], 2)
+                              w["prefix"], w["keys"], 0, 2)
     assert plan is not None
     assert log.index(("ring-store", 0)) > log.index(("sync", last_eid))
     # Shutdown joins the prefetch worker: no load thread of THIS connector
