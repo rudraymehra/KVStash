@@ -7,6 +7,7 @@ Exit 1 on any failure."""
 from __future__ import annotations
 
 import sys
+from typing import ClassVar
 
 
 def main() -> int:
@@ -19,7 +20,7 @@ def main() -> int:
 
     class StubConfig:
         remote_url = None
-        extra_config = {
+        extra_config: ClassVar[dict] = {
             "kvblockd_token": "t",
             "remote_storage_plugin.kvblockd.url":
                 "kvblockd://127.0.0.1:9440?namespace=lmcache&streams=2",

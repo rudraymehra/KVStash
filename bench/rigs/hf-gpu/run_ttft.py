@@ -510,12 +510,11 @@ def run_measure(args, stamp: dict) -> int:
                   f"ttft={r['ttft_ms']:.0f}ms misses+={r['miss_delta']:.0f}", flush=True)
 
     # ---- aggregate + emit (schema unchanged: plot.py / log extraction as-is)
-    out = open(args.out, "a")
 
     def emit(rec: dict):
         line = json.dumps(rec, sort_keys=True)
-        out.write(line + "\n")
-        out.flush()
+        with open(args.out, "a") as out:
+            out.write(line + "\n")
         print(f"{args.print_prefix} {line}", flush=True)
 
     failures = 0
@@ -576,7 +575,6 @@ def run_measure(args, stamp: dict) -> int:
                          "reason": p["warm_verify_reason"]} for p in pairs],
               "speedup_p50_vs_cold": (cold_p50 / warm_p50) if warm_p50 > 0 else None})
         summary.append((L, base["prefix_tokens"], cold_p50, warm_p50, verified))
-    out.close()
 
     print("\n== TTFT summary (p50 over reps, warmup discarded; warm arm = fresh "
           "engine reading kvblockd over TCP) ==")
@@ -606,7 +604,6 @@ def run_baseline(args, stamp: dict) -> int:
     by "recompute". Fresh nonce per rep (no reuse), no daemon, no state."""
     lengths = parse_lengths(args.lengths)
     n_pairs = args.warmup + args.reps
-    out = open(args.out, "a")
     rc = 0
     for L in lengths:
         rows = []
@@ -638,10 +635,9 @@ def run_baseline(args, stamp: dict) -> int:
         rec.update({"ttft_ms": p50, "ttft_p50_ms": p50, "ttft_p95_ms": _p95(ttfts),
                     "ttft_all_ms": [round(x, 3) for x in ttfts]})
         line = json.dumps(rec, sort_keys=True)
-        out.write(line + "\n")
-        out.flush()
+        with open(args.out, "a") as out:
+            out.write(line + "\n")
         print(f"{args.print_prefix} {line}", flush=True)
-    out.close()
     return rc
 
 
@@ -660,7 +656,7 @@ def _stub_server(ctl):
     class Stub(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
 
-        def log_message(self, *a):  # noqa: ARG002 - quiet
+        def log_message(self, *a):
             pass
 
         def _send(self, code, body, ctype="application/json"):
@@ -745,11 +741,11 @@ def selftest() -> int:
     ok = True
 
     def mkargs(**kw):
-        d = dict(vllm=url, metrics=url, model="stub", gen_tokens=2,
-                 request_timeout=15.0, print_prefix=PRINT_PREFIX,
-                 put_wait_s=0.6, drain_s=0.1, drain_timeout_s=3.0, poll_s=0.05,
-                 lengths="96,160", reps=1, warmup=1, state="", out="",
-                 block_size=0, vllm_log="")
+        d = {"vllm": url, "metrics": url, "model": "stub", "gen_tokens": 2,
+             "request_timeout": 15.0, "print_prefix": PRINT_PREFIX,
+             "put_wait_s": 0.6, "drain_s": 0.1, "drain_timeout_s": 3.0, "poll_s": 0.05,
+             "lengths": "96,160", "reps": 1, "warmup": 1, "state": "", "out": "",
+             "block_size": 0, "vllm_log": ""}
         d.update(kw)
         return argparse.Namespace(**d)
 
@@ -816,7 +812,8 @@ def selftest() -> int:
         # 5) healthy populate: receipt verified per prompt, state persisted.
         ctl["on_completion"] = "store"
         rc = run_populate(mkargs(state=state_path))
-        st = json.load(open(state_path))
+        with open(state_path) as f:
+            st = json.load(f)
         if rc != 0 or sorted(st["entries"]) != ["160", "96"] or \
                 any(len(v) != 2 for v in st["entries"].values()):
             print(f"FAIL: healthy populate rc={rc} or malformed state", file=sys.stderr)
@@ -884,7 +881,8 @@ def selftest() -> int:
         out_bad = os.path.join(tmp, "bad.jsonl")
         rc = run_measure(mkargs(state=state_path, out=out_bad),
                          {"model": "stub", "rig": "selftest"})
-        bad_warm = [r for r in (json.loads(l) for l in open(out_bad)) if r["arm"] == "warm"]
+        with open(out_bad) as f:
+            bad_warm = [r for r in map(json.loads, f) if r["arm"] == "warm"]
         if rc != 3 or len(bad_warm) != 2 or any(r["warm_hits_verified"] for r in bad_warm) \
                 or any(r["kvb_hit_delta_total"] != 0 for r in bad_warm):
             print(f"FAIL: no-hit measure not flagged: rc={rc} warm={bad_warm}", file=sys.stderr)
@@ -947,7 +945,8 @@ def selftest() -> int:
         ctl["on_completion"] = "none"
         out_base = os.path.join(tmp, "base.jsonl")
         rc = run_baseline(mkargs(out=out_base), {"model": "stub", "rig": "selftest"})
-        base = [json.loads(l) for l in open(out_base)]
+        with open(out_base) as f:
+            base = [json.loads(line) for line in f]
         if rc != 0 or len(base) != 2 or any(r["arm"] != "baseline" for r in base) \
                 or any(r["series"] != "recompute (no connector)" for r in base) \
                 or any("warm_hits_verified" in r or "kvb_hit_delta_total" in r for r in base) \
@@ -966,7 +965,8 @@ def selftest() -> int:
             rc = run_measure(mkargs(state=state_path, out=out_good),
                              {"model": "stub", "rig": "selftest"})
         sys.stdout.write(buf.getvalue())  # captured only to verify the marker lines
-        good = [json.loads(l) for l in open(out_good)]
+        with open(out_good) as f:
+            good = [json.loads(line) for line in f]
         marked = [json.loads(l.split(PRINT_PREFIX + " ", 1)[1])
                   for l in buf.getvalue().splitlines()
                   if l.startswith(PRINT_PREFIX + " ")]

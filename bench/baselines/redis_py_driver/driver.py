@@ -156,7 +156,11 @@ def main():
             "duration_s": took, "goodput_gbytes_s": gbps, "ops": {},
         }
         line = json.dumps(rec)
-        (open(args.out, "a").write(line + "\n") if args.out else print(line))
+        if args.out:
+            with open(args.out, "a") as f:
+                f.write(line + "\n")
+        else:
+            print(line)
         print(f"redis-py getbench: {gbps:.3f} GB/s over {took:.1f}s", file=sys.stderr)
         return
 

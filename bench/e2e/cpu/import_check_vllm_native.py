@@ -73,7 +73,6 @@ def check_connector() -> int:
 
 def check_tier_manager() -> int:
     import numpy as np  # noqa: F401 - JobMetadata.block_ids contract
-
     from vllm_kvblockd.tier_manager import KvblockdTierManager
 
     tiering = False
