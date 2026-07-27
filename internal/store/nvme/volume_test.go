@@ -2,7 +2,9 @@ package nvme
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,7 +83,7 @@ func appendWait(t *testing.T, v *Volume, i, n int) (Loc, uint64) {
 
 func mustRead(t *testing.T, v *Volume, loc Loc, i int, sum uint64, wantLen int) {
 	t.Helper()
-	data, rel, st := v.Read(loc, 1, testKey(i), sum)
+	data, rel, st := v.Read(context.Background(), loc, 1, testKey(i), sum)
 	if st != ReadOK {
 		t.Fatalf("read %d: status %d", i, st)
 	}
@@ -112,13 +114,13 @@ func TestVolumeAppendReadRoundTrip(t *testing.T) {
 	}
 
 	// Wrong expectations must never serve bytes.
-	if _, _, st := v.Read(locs[1], 2, testKey(1), sums[1]); st != ReadCorrupt {
+	if _, _, st := v.Read(context.Background(), locs[1], 2, testKey(1), sums[1]); st != ReadCorrupt {
 		t.Fatalf("cross-namespace read: %d, want corrupt", st)
 	}
-	if _, _, st := v.Read(locs[1], 1, testKey(1), sums[1]^1); st != ReadCorrupt {
+	if _, _, st := v.Read(context.Background(), locs[1], 1, testKey(1), sums[1]^1); st != ReadCorrupt {
 		t.Fatalf("wrong-sum read: %d, want corrupt", st)
 	}
-	if _, _, st := v.Read(Loc{SegmentID: 99, Offset: 0, Len: 8}, 1, testKey(1), 1); st != ReadGone {
+	if _, _, st := v.Read(context.Background(), Loc{SegmentID: 99, Offset: 0, Len: 8}, 1, testKey(1), 1); st != ReadGone {
 		t.Fatalf("unknown segment read: %d, want gone", st)
 	}
 }
@@ -145,7 +147,7 @@ func TestVolumeRotationAndSeal(t *testing.T) {
 	}
 	// Sealed records stay readable.
 	e := entries[0]
-	data, rel, st := v.Read(Loc{SegmentID: id, Offset: e.Off, Len: e.Len}, e.NS, e.Key, e.XXH3)
+	data, rel, st := v.Read(context.Background(), Loc{SegmentID: id, Offset: e.Off, Len: e.Len}, e.NS, e.Key, e.XXH3)
 	if st != ReadOK {
 		t.Fatalf("sealed read: %d", st)
 	}
@@ -204,13 +206,136 @@ func TestVolumeCrashReopen(t *testing.T) {
 		t.Fatalf("crash reopen recovered %d blocks, want %d (report %+v)", len(ents), n, rep)
 	}
 	for _, e := range ents {
-		data, rel, st := v2.Read(e.Loc, e.NS, e.Key, e.XXH3)
+		data, rel, st := v2.Read(context.Background(), e.Loc, e.NS, e.Key, e.XXH3)
 		if st != ReadOK {
 			t.Fatalf("recovered block read: %d", st)
 		}
 		rel()
 		_ = data
 	}
+}
+
+// gateBackend wraps the default backend; while armed, every ReadAt parks on
+// gate (announcing itself on entered) — a stand-in for an NVMe controller
+// stall. Writes and recovery reads pass through untouched (arm after setup).
+type gateBackend struct {
+	inner   IOBackend
+	armed   atomic.Bool
+	gate    chan struct{}
+	entered chan struct{}
+}
+
+func newGateBackend() *gateBackend {
+	return &gateBackend{
+		inner:   DefaultBackend(),
+		gate:    make(chan struct{}),
+		entered: make(chan struct{}, 16),
+	}
+}
+
+func (b *gateBackend) Open(path string, forWrite bool) (File, error) {
+	f, err := b.inner.Open(path, forWrite)
+	if err != nil {
+		return nil, err
+	}
+	return &gateFile{File: f, b: b}, nil
+}
+
+type gateFile struct {
+	File
+	b *gateBackend
+}
+
+func (f *gateFile) ReadAt(p []byte, off int64) error {
+	if f.b.armed.Load() {
+		f.b.entered <- struct{}{}
+		<-f.b.gate
+	}
+	return f.File.ReadAt(p, off)
+}
+
+// TestReadCancelReleasesHoldAndBuffer pins the ctx leg of Volume.Read: with
+// the single worker wedged in a device stall, (a) a QUEUED read whose ctx
+// fires returns immediately instead of blocking behind the stall, and (b)
+// the stalled read's own cancellation abandons it to the worker, which —
+// once the device answers — must put the pooled buffer back and drop BOTH
+// segment read-holds (exactly-one-owner via the claimed flag). Before the
+// ctx plumb both callers blocked unboundedly and pinned their holds, which
+// also wedged RetireFinish's drain loop.
+func TestReadCancelReleasesHoldAndBuffer(t *testing.T) {
+	dir := t.TempDir()
+	p := testParams(t, dir)
+	p.ReadWorkers = 1
+	gb := newGateBackend()
+	p.Backend = gb
+	v, _, _, err := OpenVolume(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = v.Close() }()
+
+	locA, sumA := appendWait(t, v, 1, 8<<10)
+	locB, sumB := appendWait(t, v, 2, 8<<10)
+	gb.armed.Store(true)
+
+	// Read A occupies the only worker and parks inside the device stall.
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	aDone := make(chan ReadStatus, 1)
+	go func() {
+		_, _, st := v.Read(ctxA, locA, 1, testKey(1), sumA)
+		aDone <- st
+	}()
+	<-gb.entered // the worker is now wedged mid-pread
+
+	// Read B sits QUEUED behind the stall; its cancellation must answer NOW.
+	ctxB, cancelB := context.WithCancel(context.Background())
+	bDone := make(chan ReadStatus, 1)
+	go func() {
+		_, _, st := v.Read(ctxB, locB, 1, testKey(2), sumB)
+		bDone <- st
+	}()
+	cancelB()
+	select {
+	case st := <-bDone:
+		if st != ReadGone {
+			t.Fatalf("cancelled queued read: %d, want ReadGone", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled queued read still blocked behind the device stall")
+	}
+
+	// Cancel A mid-pread: the caller unblocks; ownership of the buffer and
+	// the read-hold moves to the worker.
+	cancelA()
+	select {
+	case st := <-aDone:
+		if st != ReadGone {
+			t.Fatalf("cancelled in-flight read: %d, want ReadGone", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled in-flight read never returned")
+	}
+
+	// Un-stall the device: the worker completes A (cleans up as the claim
+	// loser) and drains B's queued request (releasing its hold unread).
+	gb.armed.Store(false)
+	close(gb.gate)
+	v.mu.RLock()
+	segA, segB := v.segs[locA.SegmentID], v.segs[locB.SegmentID]
+	v.mu.RUnlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for segA.reads.Load() != 0 || segB.reads.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("read-holds leaked after cancellation: segA=%d segB=%d",
+				segA.reads.Load(), segB.reads.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The tier still serves both records — nothing was corrupted or stuck.
+	mustRead(t, v, locA, 1, sumA, 8<<10)
+	mustRead(t, v, locB, 2, sumB, 8<<10)
 }
 
 func TestVolumeDualResidencyLatestWins(t *testing.T) {

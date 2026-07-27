@@ -161,8 +161,11 @@ func (s *session) handleBatchGet(c *transport.Conn, h protocol.Header, body []by
 			tier := "dram"
 			switch {
 			case hasTier:
+				// The connection context: a client that vanished (or a drain)
+				// cancels the device/S3 read under this key instead of
+				// pinning THIS read goroutine through the stall.
 				var st protocol.Status
-				data, sum, rel, tier, st = tg.GetRefTier(s.ns, keys[j])
+				data, sum, rel, tier, st = tg.GetRefTier(c.Context(), s.ns, keys[j])
 				hit = st == protocol.StatusOK
 				busy = st == protocol.StatusErrBusy
 			case hasRefs:

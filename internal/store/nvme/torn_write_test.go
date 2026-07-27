@@ -1,6 +1,8 @@
 package nvme
 
 import (
+	"context"
+
 	"bytes"
 	"os"
 	"testing"
@@ -235,7 +237,7 @@ func TestSealedRecordBodyDamageSelfHeals(t *testing.T) {
 		if e.Key != seg0.Key {
 			continue
 		}
-		if _, _, st := v3.Read(e.Loc, e.NS, e.Key, e.XXH3); st != ReadCorrupt {
+		if _, _, st := v3.Read(context.Background(), e.Loc, e.NS, e.Key, e.XXH3); st != ReadCorrupt {
 			t.Fatalf("rotted sealed record served: status %d, want ReadCorrupt", st)
 		}
 		return
@@ -379,7 +381,7 @@ func TestCheckpointReferencingReclaimedSegment(t *testing.T) {
 		if e.Loc.SegmentID == id {
 			t.Fatalf("phantom entry into reclaimed segment %d: %+v", id, e)
 		}
-		data, rel, st := v2.Read(e.Loc, e.NS, e.Key, e.XXH3)
+		data, rel, st := v2.Read(context.Background(), e.Loc, e.NS, e.Key, e.XXH3)
 		if st != ReadOK {
 			t.Fatalf("surviving entry unreadable: %d", st)
 		}

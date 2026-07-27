@@ -2,11 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 
 	"github.com/zeebo/xxh3"
 
+	"github.com/kvstash/kvblockd/internal/protocol"
 	"github.com/kvstash/kvblockd/internal/store/dram"
 	"github.com/kvstash/kvblockd/internal/store/nvme"
 	"github.com/kvstash/kvblockd/internal/tenant"
@@ -92,31 +94,131 @@ func (t *Tiered) spillPass() {
 	}
 }
 
+// s3ColdReadConcurrency bounds concurrent cold ranged GETs. The
+// RestoreBackend only promises dedup for whole-segment restores, so without
+// this bound N concurrent cold GETs open N backend reads — connection
+// goroutines pile up fleet-wide behind a slow endpoint. Overflow answers
+// ERR_BUSY (retryable on this path already).
+const s3ColdReadConcurrency = 16
+
+// The breaker's shape: trip after this many CONSECUTIVE ReadRange failures,
+// then answer cold reads NOT_FOUND without touching the backend, letting
+// one probe through per cooldown. Contain, don't just count — an outage
+// must cost one deadline, not one per key per connection.
+const (
+	s3BreakerTripAfter = 8
+	s3BreakerCooldown  = 5 * time.Second
+)
+
 // readS3 serves one cold block from the segment object, verified before a
-// byte escapes. Heap buffer (no arena hold), wire-deadline context.
-func (t *Tiered) readS3(ref *nvmeRef) (data []byte, release func(), ok bool) {
+// byte escapes. Heap buffer (no arena hold). ctx is the caller's lifetime —
+// a disconnected client or a draining server cancels the ranged GET instead
+// of riding out the full deadline; the deadline still caps a live caller.
+// Status: OK / NOT_FOUND (no copy, failed read, breaker open) / ERR_BUSY
+// (concurrency bound hit).
+func (t *Tiered) readS3(ctx context.Context, ref *nvmeRef) (data []byte, release func(), st protocol.Status) {
 	if t.p.Restore == nil || !ref.S3.Load() {
-		return nil, nil, false
+		return nil, nil, protocol.StatusNotFound
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), t.s3ReadDeadline())
+	now := t.now()
+	if !t.s3BreakerAllow(now) {
+		t.s3BreakerSkips.Add(1)
+		return nil, nil, protocol.StatusNotFound // the outage already paid its deadline
+	}
+	select {
+	case t.s3ReadSem <- struct{}{}:
+	default:
+		t.s3ReadBusy.Add(1)
+		return nil, nil, protocol.StatusErrBusy
+	}
+	defer func() { <-t.s3ReadSem }()
+	rctx, cancel := context.WithTimeout(ctx, t.s3ReadDeadline())
 	defer cancel()
 	buf := make([]byte, ref.Len)
 	// Loc.Offset addresses the RECORD (56-byte header first); the payload
 	// starts at RecordDataOffset. The object is the byte-identical segment
 	// file, so file offsets transfer 1:1.
-	if err := t.p.Restore.ReadRange(ctx, uint64(ref.Loc.SegmentID), nvme.RecordDataOffset(ref.Loc.Offset), int64(ref.Len), buf); err != nil {
-		t.s3ReadErrs.Add(1)
-		return nil, nil, false
+	if err := t.p.Restore.ReadRange(rctx, uint64(ref.Loc.SegmentID), nvme.RecordDataOffset(ref.Loc.Offset), int64(ref.Len), buf); err != nil {
+		switch {
+		case s3ObjectGone(err):
+			// The endpoint ANSWERED: the OBJECT is gone (external deletion —
+			// e.g. a misconfigured lifecycle rule reaping live keys). Object
+			// health is a per-key miss; only ENDPOINT health feeds the
+			// breaker — a streak of dead keys tripping it would blackhole
+			// every healthy cold key for the cooldown, and each probe landing
+			// on another dead key would re-open it: partial object loss
+			// amplified into a self-sustaining full cold-tier outage.
+			t.s3ReadNotFound.Add(1)
+			t.s3BreakerNote(true, now)
+		case ctx.Err() == nil:
+			// Endpoint sickness (deadline, transport, 5xx). A caller leaving
+			// mid-read is neither that nor an error at all — counting it made
+			// every routine drain with in-flight cold reads spike
+			// read_errors_total and page as an S3 outage.
+			t.s3ReadErrs.Add(1)
+			t.s3BreakerNote(false, now)
+		}
+		return nil, nil, protocol.StatusNotFound
 	}
+	// A completed ReadRange proves the ENDPOINT healthy regardless of what
+	// the bytes say — checksum rot is the object's problem, never the
+	// breaker's (tripping on rot would blackhole every healthy cold key).
+	t.s3BreakerNote(true, now)
 	if xxh3.Hash(buf) != ref.XXH3 {
 		// The cold tier's OWN counter: an operator chasing corruption must
 		// know whether to suspect the device or the object store — this once
 		// rode the NVMe counter and misattributed S3 rot to the local disk.
 		t.s3ChecksumErrs.Add(1)
-		return nil, nil, false // never serve unverified bytes
+		return nil, nil, protocol.StatusNotFound // never serve unverified bytes
 	}
 	t.s3Hits.Add(1)
-	return buf, func() {}, true
+	return buf, func() {}, protocol.StatusOK
+}
+
+// s3ObjectGone reports an object-level not-found from the RestoreBackend:
+// the endpoint answered, the object is gone. Structural (errors.As against
+// the method, not a shared sentinel), so the seam stays SDK-free on this
+// side — the same posture as the backend interfaces themselves.
+func s3ObjectGone(err error) bool {
+	var nf interface{ ObjectNotFound() bool }
+	return errors.As(err, &nf) && nf.ObjectNotFound()
+}
+
+// s3BreakerOpen is the read-only breaker view (promoteSync's status mapping):
+// unlike s3BreakerAllow it can never consume the post-cooldown probe slot.
+func (t *Tiered) s3BreakerOpen(now int64) bool {
+	until := t.s3BreakerOpenUntil.Load()
+	return until != 0 && now < until
+}
+
+// s3BreakerAllow reports whether a cold read may touch the backend: closed
+// → yes; open → no, except that once the cooldown lapses exactly ONE caller
+// wins the probe by CASing the deadline forward (losers stay contained).
+func (t *Tiered) s3BreakerAllow(now int64) bool {
+	until := t.s3BreakerOpenUntil.Load()
+	if until == 0 {
+		return true
+	}
+	if now < until {
+		return false
+	}
+	return t.s3BreakerOpenUntil.CompareAndSwap(until, now+int64(s3BreakerCooldown))
+}
+
+// s3BreakerNote records a ReadRange outcome: success closes the breaker and
+// zeroes the streak; the s3BreakerTripAfter'th consecutive failure opens it
+// (counted once per closed→open transition).
+func (t *Tiered) s3BreakerNote(ok bool, now int64) {
+	if ok {
+		t.s3BreakerFails.Store(0)
+		t.s3BreakerOpenUntil.Store(0)
+		return
+	}
+	if t.s3BreakerFails.Add(1) >= s3BreakerTripAfter {
+		if t.s3BreakerOpenUntil.Swap(now+int64(s3BreakerCooldown)) == 0 {
+			t.s3BreakerOpens.Add(1)
+		}
+	}
 }
 
 func (t *Tiered) s3ReadDeadline() time.Duration {
@@ -366,17 +468,15 @@ func (t *Tiered) enqueueObjectGC(segID uint32) {
 	}
 }
 
-// gcDropBudget bounds the object-Drop I/O one gcPass runs inline on the
-// demoter goroutine: each drop is a deadline-bounded DeleteObject (up to
-// ~2 s on a hung backend), and an unbounded drain of a full dropq could
-// stall the memory ladder for minutes. The remainder stays queued for the
-// next tick (100 ms cadence). Chosen over a separate drop worker for
-// simplicity: the budget caps the worst-case tick stall at a few deadlines,
-// which the ladder tolerates, and adds no goroutine, no shutdown edge.
+// gcDropBudget bounds the object-Drop I/O one gcPass drains synchronously.
+// In production drops run on their OWN loopWG goroutine (see Start) so a
+// hung DeleteObject can never stall the demote/reclaim cadence; gcPass
+// remains the tests' (and DemoteNow's) deterministic handle, and the budget
+// keeps that handle bounded too.
 const gcDropBudget = 4
 
-// gcPass processes up to gcDropBudget queued candidates (demoter goroutine;
-// also the tests' deterministic handle).
+// gcPass processes up to gcDropBudget queued candidates synchronously — the
+// deterministic handle. The production consumer is the GC goroutine.
 func (t *Tiered) gcPass() {
 	for i := 0; i < gcDropBudget; i++ {
 		select {
@@ -385,14 +485,17 @@ func (t *Tiered) gcPass() {
 			// lands mid-drop re-nominates (an extra deadness re-check)
 			// instead of being swallowed into a never-reaped orphan.
 			t.s3GCQueued.Delete(id)
-			t.dropObject(id)
+			t.dropObject(context.Background(), id)
 		default:
 			return
 		}
 	}
 }
 
-func (t *Tiered) dropObject(id uint32) {
+// dropObject latches the segment and drops its object. ctx is the consumer
+// loop's lifetime: shutdown cancels an in-flight DeleteObject instead of
+// waiting out its deadline (the drop just orphans — lifecycle rule reaps).
+func (t *Tiered) dropObject(ctx context.Context, id uint32) {
 	if _, loaded := t.spillInflight.LoadOrStore(id, struct{}{}); loaded {
 		// A spill or restore owns the segment right now — deleting under a
 		// concurrent PUT has no ordering guarantee. Skip; orphan-safe.
@@ -400,13 +503,13 @@ func (t *Tiered) dropObject(id uint32) {
 		return
 	}
 	defer t.spillInflight.Delete(id)
-	t.dropObjectHeld(id)
+	t.dropObjectHeld(ctx, id)
 }
 
 // dropObjectHeld re-checks deadness under the caller-held latch and drops.
 // The re-check matters: between the enqueue and this pass the segment may
 // have re-spilled and re-flipped — its object is live again.
-func (t *Tiered) dropObjectHeld(id uint32) {
+func (t *Tiered) dropObjectHeld(ctx context.Context, id uint32) {
 	if t.p.Spill == nil || t.s3SegLive(id) {
 		return
 	}
@@ -415,9 +518,9 @@ func (t *Tiered) dropObjectHeld(id uint32) {
 			return // a live spilled segment's object backs its next retire-flip
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), t.s3ReadDeadline())
+	dctx, cancel := context.WithTimeout(ctx, t.s3ReadDeadline())
 	defer cancel()
-	if err := t.p.Spill.Drop(ctx, uint64(id)); err != nil {
+	if err := t.p.Spill.Drop(dctx, uint64(id)); err != nil {
 		t.s3GCErrs.Add(1) // orphan — the bucket lifecycle rule is the backstop
 		return
 	}

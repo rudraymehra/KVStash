@@ -94,11 +94,34 @@ type Tiered struct {
 	restoreq chan restoreReq // best-effort 2nd-COLD-hit segment restores (drop on full)
 	dropq    chan uint32     // dead-object GC candidates (drop on full — orphan-safe)
 
+	// s3ReadSem bounds concurrent cold ranged GETs (nil without a Restore
+	// backend): N connection goroutines discovering N cold keys must not
+	// open N backend reads — the overflow answers ERR_BUSY, already the
+	// retryable status on this path. Try-acquire only; nothing blocks.
+	s3ReadSem chan struct{}
+
+	// The cold-read circuit breaker (endpoint health, NOT object health —
+	// checksum failures never trip it). s3BreakerFails counts consecutive
+	// ReadRange failures; at s3BreakerTripAfter the breaker opens
+	// (s3BreakerOpenUntil holds the next probe time): cold reads answer
+	// NOT_FOUND immediately — an S3 outage costs ONE deadline, not one per
+	// key per connection — and exactly one probe per cooldown re-tests.
+	s3BreakerFails     atomic.Int32
+	s3BreakerOpenUntil atomic.Int64
+
 	stopOnce sync.Once
 	stopped  chan struct{}
 	loopWG   sync.WaitGroup
 
-	// Pass scratch (single demoter goroutine — same rationale as dram's).
+	// demoteMu singleflights the demote/spill/reclaim/restore/GC pass chain:
+	// the ticker body and the exported DemoteNow both own the sc* scratch
+	// below while they hold it (the dram evictor's evictMu, mirrored). Every
+	// exported trigger of a single-goroutine machine gets singleflight —
+	// without it the first admin verb or bench harness calling DemoteNow on
+	// a live store races the ticker's scratch silently.
+	demoteMu sync.Mutex
+
+	// Pass scratch, guarded by demoteMu.
 	scUsages []eviction.DomainUsage
 	scCands  []eviction.Candidate
 	scSegs   []nvme.SegmentInfo
@@ -140,7 +163,11 @@ type Tiered struct {
 	admitRefusals  atomic.Uint64 // blocks under the min-hits endurance gate, DELETED instead of demoted
 	promotions     atomic.Uint64
 	s3Hits         atomic.Uint64 // cold ranged GETs served (verified)
-	s3ReadErrs     atomic.Uint64 // cold read failures (deadline, transport)
+	s3ReadErrs     atomic.Uint64 // cold read ENDPOINT failures (deadline, transport, 5xx) — dead objects and cancelled callers excluded
+	s3ReadNotFound atomic.Uint64 // cold reads the endpoint answered not-found for (dead object) — per-key miss, never breaker food
+	s3ReadBusy     atomic.Uint64 // cold reads refused at the concurrency bound (ERR_BUSY)
+	s3BreakerOpens atomic.Uint64 // closed→open breaker transitions
+	s3BreakerSkips atomic.Uint64 // cold reads answered NOT_FOUND while the breaker was open
 	s3ChecksumErrs atomic.Uint64 // cold reads that failed verification (object rot — distinct from the device counter)
 	s3Blocks       atomic.Int64  // s3-resident (retire-flipped) blocks — Int64: removals decrement
 	s3Bytes        atomic.Int64
@@ -152,8 +179,12 @@ type Tiered struct {
 	s3GCSkips      atomic.Uint64 // queue-full / latch-busy GC refusals (also orphan-safe)
 	reclaims       atomic.Uint64
 	reclaimSkips   atomic.Uint64
-	readBusy       atomic.Uint64
-	checksumErrs   atomic.Uint64 // DEVICE reads that failed verification (nvme tier; s3 has its own)
+	// reclaimBlockedProtected counts oldest-segment candidates skipped
+	// because an entry was leased/pinned — the on-call signal for a volume
+	// whose reclaim keeps bending around protected FIFO heads.
+	reclaimBlockedProtected atomic.Uint64
+	readBusy                atomic.Uint64
+	checksumErrs            atomic.Uint64 // DEVICE reads that failed verification (nvme tier; s3 has its own)
 
 	recoveredBlocks int
 	recoverySecs    float64
@@ -196,6 +227,9 @@ func NewTiered(d *dram.Store, pol eviction.Policy, vols []*nvme.Volume, reports 
 		s3SegRefs: make(map[uint32]int),
 		stopped:   make(chan struct{}),
 	}
+	if t.p.Restore != nil {
+		t.s3ReadSem = make(chan struct{}, s3ColdReadConcurrency)
+	}
 	t.now = t.p.Now
 	for _, rep := range reports {
 		if rep != nil {
@@ -221,7 +255,7 @@ func NewTiered(d *dram.Store, pol eviction.Policy, vols []*nvme.Volume, reports 
 // returned stop func cancels and WAITS — call it after Drain, before Close.
 func (t *Tiered) Start(ctx context.Context) (stop func()) {
 	ctx, cancel := context.WithCancel(ctx)
-	t.loopWG.Add(3)
+	t.loopWG.Add(4)
 	go func() {
 		defer t.loopWG.Done()
 		tick := time.NewTicker(t.p.Interval)
@@ -233,10 +267,29 @@ func (t *Tiered) Start(ctx context.Context) (stop func()) {
 			case <-tick.C:
 			case <-t.kick:
 			}
+			t.demoteMu.Lock()
 			t.demotePass(false)
 			t.spillPass()
 			t.reclaimPass()
-			t.gcPass()
+			t.demoteMu.Unlock()
+		}
+	}()
+	// Object drops get their OWN goroutine (the restorer shape: ctx-
+	// cancelled, loopWG-tracked): each drop is a deadline-bounded
+	// DeleteObject, and running them on the demoter tick let a hung S3
+	// endpoint stall demotion/reclaim ~80 ticks — converting demotions into
+	// evictions exactly when DRAM pressure peaked. The memory ladder's
+	// cadence is now independent of third-party health.
+	go func() {
+		defer t.loopWG.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case id := <-t.dropq:
+				t.s3GCQueued.Delete(id) // see gcPass: clear BEFORE the drop
+				t.dropObject(ctx, id)
+			}
 		}
 	}()
 	go func() {
@@ -349,7 +402,7 @@ func (t *Tiered) ExistsPrefix(ns uint32, keys [][32]byte, withBitmap bool) (uint
 
 // Get is the copying interface method (conformance/tooling parity).
 func (t *Tiered) Get(ns uint32, key [32]byte) ([]byte, uint64, bool) {
-	data, sum, rel, _, st := t.GetRefTier(ns, key)
+	data, sum, rel, _, st := t.GetRefTier(context.Background(), ns, key)
 	if st != protocol.StatusOK {
 		return nil, 0, false
 	}
@@ -362,7 +415,7 @@ func (t *Tiered) Get(ns uint32, key [32]byte) ([]byte, uint64, bool) {
 // GetRef is the legacy zero-copy extension (tier dropped) — the server
 // prefers GetRefTier.
 func (t *Tiered) GetRef(ns uint32, key [32]byte) (data []byte, xxh3 uint64, release func(), ok bool) {
-	data, xxh3, release, _, st := t.GetRefTier(ns, key)
+	data, xxh3, release, _, st := t.GetRefTier(context.Background(), ns, key)
 	return data, xxh3, release, st == protocol.StatusOK
 }
 
@@ -370,7 +423,13 @@ func (t *Tiered) GetRef(ns uint32, key [32]byte) (data []byte, xxh3 uint64, rele
 // NVMe index, a bounded synchronous device read (verified before a byte
 // escapes), auto-lease, and the 2nd-hit promotion probe. Status is OK /
 // NOT_FOUND / ERR_BUSY (reader pool saturated — retryable, per-key).
-func (t *Tiered) GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, release func(), tier string, st protocol.Status) {
+//
+// ctx is the caller's wire lifetime (the transport's per-connection
+// context): its cancellation abandons an in-flight NVMe read (the volume's
+// claim handshake keeps buffer/hold ownership single) and cuts a cold S3
+// read short — client disconnect and server drain reach every blocking I/O
+// under this call instead of pinning the connection goroutine.
+func (t *Tiered) GetRefTier(ctx context.Context, ns uint32, key [32]byte) (data []byte, xxh3 uint64, release func(), tier string, st protocol.Status) {
 	if data, sum, rel, ok := t.d.GetRef(ns, key); ok {
 		return data, sum, rel, "dram", protocol.StatusOK
 	}
@@ -380,7 +439,7 @@ func (t *Tiered) GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, 
 		return nil, 0, nil, "", protocol.StatusNotFound
 	}
 	vol := t.volumeFor(key)
-	blob, rel, rst := vol.Read(e.Loc, ns, key, e.XXH3)
+	blob, rel, rst := vol.Read(ctx, e.Loc, ns, key, e.XXH3)
 	switch rst {
 	case nvme.ReadOK:
 		// served — lease + promotion probe continue below the switch
@@ -388,9 +447,20 @@ func (t *Tiered) GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, 
 		t.readBusy.Add(1)
 		return nil, 0, nil, "", protocol.StatusErrBusy
 	case nvme.ReadGone:
+		if ctx.Err() != nil {
+			// Cancelled, not retired: the caller is gone — answer a plain
+			// miss without burning an S3 round trip (or its error counter)
+			// on a response nobody will read.
+			return nil, 0, nil, "", protocol.StatusNotFound
+		}
 		// Segment retired locally. If a spilled copy exists this is the
 		// COLD path: one ranged GetObject, verified before a byte escapes.
-		if data, rel, ok := t.readS3(e); ok {
+		data, rel, cst := t.readS3(ctx, e)
+		if cst == protocol.StatusErrBusy {
+			t.readBusy.Add(1) // cold saturation rides the same retryable per-key status
+			return nil, 0, nil, "", protocol.StatusErrBusy
+		}
+		if cst == protocol.StatusOK {
 			// Same discipline as the warm path below: the §3.3 auto-lease
 			// and the 2nd-hit probe land under the shard lock with an
 			// identity re-check, so they order against the delete gate and
@@ -642,7 +712,9 @@ func (t *Tiered) PinOp(ns uint32, key [32]byte, sub uint8) protocol.Status {
 		})
 		return st
 	case protocol.PinHard:
-		if st := t.promoteSync(k, e); st != protocol.StatusOK {
+		// Background lifetime: PIN promises survival — its promotion read
+		// must not die with the requesting connection.
+		if st := t.promoteSync(context.Background(), k, e); st != protocol.StatusOK {
 			return st
 		}
 		return t.d.PinOp(ns, key, sub)
@@ -705,11 +777,12 @@ func (t *Tiered) Stats() []byte {
 		// reclaims_total comes from the volume merge below — the tiered
 		// counter counted the SAME events and silently shadowed it (a
 		// fixed bug); t.reclaims stays for internal assertions only.
-		"reclaim_skips_total":   t.reclaimSkips.Load(),
-		"read_busy_total":       t.readBusy.Load(),
-		"checksum_errors_total": t.checksumErrs.Load(),
-		"recovered_blocks":      t.recoveredBlocks,
-		"recovery_seconds":      t.recoverySecs,
+		"reclaim_skips_total":             t.reclaimSkips.Load(),
+		"reclaim_blocked_protected_total": t.reclaimBlockedProtected.Load(),
+		"read_busy_total":                 t.readBusy.Load(),
+		"checksum_errors_total":           t.checksumErrs.Load(),
+		"recovered_blocks":                t.recoveredBlocks,
+		"recovery_seconds":                t.recoverySecs,
 	}
 	for k, v := range volStats {
 		nv[k] = v
@@ -731,6 +804,10 @@ func (t *Tiered) Stats() []byte {
 			"restores_total":         restores,
 			"hits_total":             t.s3Hits.Load(),
 			"read_errors_total":      t.s3ReadErrs.Load(),
+			"read_not_found_total":   t.s3ReadNotFound.Load(),
+			"read_busy_total":        t.s3ReadBusy.Load(),
+			"breaker_opens_total":    t.s3BreakerOpens.Load(),
+			"breaker_skips_total":    t.s3BreakerSkips.Load(),
 			"checksum_errors_total":  t.s3ChecksumErrs.Load(),
 			// restores_total above counts the BACKEND's downloads; this
 			// counts completed restore cycles (flip-back included) — they
@@ -764,7 +841,7 @@ func (t *Tiered) Scrub() (bad int) {
 		return true
 	})
 	for _, it := range items {
-		blob, rel, st := t.volumeFor(it.k.Hash).Read(it.e.Loc, it.k.NS, it.k.Hash, it.e.XXH3)
+		blob, rel, st := t.volumeFor(it.k.Hash).Read(context.Background(), it.e.Loc, it.k.NS, it.k.Hash, it.e.XXH3)
 		switch st {
 		case nvme.ReadOK:
 			rel()
@@ -772,7 +849,7 @@ func (t *Tiered) Scrub() (bad int) {
 		case nvme.ReadBusy:
 			// Retry once synchronously — scrub runs on quiet stores.
 			time.Sleep(time.Millisecond)
-			if blob2, rel2, st2 := t.volumeFor(it.k.Hash).Read(it.e.Loc, it.k.NS, it.k.Hash, it.e.XXH3); st2 == nvme.ReadOK {
+			if blob2, rel2, st2 := t.volumeFor(it.k.Hash).Read(context.Background(), it.e.Loc, it.k.NS, it.k.Hash, it.e.XXH3); st2 == nvme.ReadOK {
 				rel2()
 				_ = blob2
 			} else {
@@ -789,8 +866,12 @@ func (t *Tiered) Scrub() (bad int) {
 // pressure handle) — it WAITS for every accepted append's completion, then
 // runs the spill pass (a synchronous backend completes flips inline; the
 // real async spiller just enqueues, exactly like the ticker), a reclaim
-// pass, the queued whole-segment restores, and the object-GC pass.
+// pass, the queued whole-segment restores, and the object-GC pass. demoteMu
+// singleflights it against the ticker: safe on a LIVE store, not just one
+// with loops stopped.
 func (t *Tiered) DemoteNow() int {
+	t.demoteMu.Lock()
+	defer t.demoteMu.Unlock()
 	n := t.demotePass(true)
 	t.spillPass()
 	t.reclaimPass()

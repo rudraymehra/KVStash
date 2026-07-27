@@ -1,6 +1,8 @@
 package nvme
 
 import (
+	"context"
+
 	"bytes"
 	"io"
 	"os"
@@ -168,7 +170,7 @@ func assertAdoptedRecovered(t *testing.T, v *Volume, id uint32, entries []footer
 		if got.Loc.SegmentID != id {
 			t.Fatalf("adopted block recovered from segment %d, want %d", got.Loc.SegmentID, id)
 		}
-		data, rel, st := v.Read(got.Loc, want.NS, want.Key, want.XXH3)
+		data, rel, st := v.Read(context.Background(), got.Loc, want.NS, want.Key, want.XXH3)
 		if st != ReadOK {
 			t.Fatalf("adopted block read: %d", st)
 		}
@@ -287,7 +289,7 @@ func TestSameSegmentLatestWins(t *testing.T) {
 	if got.Loc.Offset != newLoc.Offset {
 		t.Fatalf("HIGH regression: recovery kept offset %d (older), want %d (later)", got.Loc.Offset, newLoc.Offset)
 	}
-	data, rel, st := v2.Read(got.Loc, 1, testKey(7), xxh3Hash(p))
+	data, rel, st := v2.Read(context.Background(), got.Loc, 1, testKey(7), xxh3Hash(p))
 	if st != ReadOK {
 		t.Fatalf("later-generation read: %d", st)
 	}

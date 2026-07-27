@@ -882,7 +882,7 @@ func TestColdRestoreFires(t *testing.T) {
 	// Find a cold-served key (its GET is the 1st hit, arming the window).
 	cold := -1
 	for i := 0; i < 48 && cold < 0; i++ {
-		if _, _, rel, tier, st := tt.GetRefTier(3, key(i)); st == protocol.StatusOK {
+		if _, _, rel, tier, st := tt.GetRefTier(context.Background(), 3, key(i)); st == protocol.StatusOK {
 			if tier == "s3" {
 				cold = i
 			}
@@ -895,7 +895,7 @@ func TestColdRestoreFires(t *testing.T) {
 	// The 2nd cold hit ≥ the min gap later + one synchronous pass = restore.
 	for try := 0; try < 10; try++ {
 		cur += int64(20 * time.Millisecond)
-		_, _, rel, tier, st := tt.GetRefTier(3, key(cold))
+		_, _, rel, tier, st := tt.GetRefTier(context.Background(), 3, key(cold))
 		if st != protocol.StatusOK {
 			t.Fatalf("cold key vanished (try %d): %s", try, st)
 		}
@@ -909,7 +909,7 @@ func TestColdRestoreFires(t *testing.T) {
 		t.Fatal("the 2nd cold hit never triggered a whole-segment restore (restores=0)")
 	}
 	// And the restored key serves locally again, byte-identical.
-	data, _, rel, tier, st := tt.GetRefTier(3, key(cold))
+	data, _, rel, tier, st := tt.GetRefTier(context.Background(), 3, key(cold))
 	if st != protocol.StatusOK || tier != "nvme" {
 		t.Fatalf("post-restore get: %s tier=%q, want OK nvme", st, tier)
 	}

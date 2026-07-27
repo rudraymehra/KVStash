@@ -2,13 +2,46 @@ package s3spill
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
+
+// objectNotFound wraps an object-level miss so the orchestrator can separate
+// "this object is gone" (per-key miss, endpoint healthy) from "the endpoint
+// is sick" (breaker food) without a shared sentinel: the store side matches
+// errors.As against the structural ObjectNotFound() method — the same
+// SDK-free posture as the S3API seam itself.
+type objectNotFound struct{ err error }
+
+func (e *objectNotFound) Error() string        { return e.err.Error() }
+func (e *objectNotFound) Unwrap() error        { return e.err }
+func (e *objectNotFound) ObjectNotFound() bool { return true }
+
+// classifyNotFound wraps the SDK's object-miss shapes: the typed NoSuchKey,
+// plus a compat target's bare NoSuchKey/NotFound code (MinIO-class endpoints
+// don't always deserialize to the typed error). Everything else — transport,
+// deadline, 5xx — passes through untouched.
+func classifyNotFound(err error) error {
+	var nsk *types.NoSuchKey
+	if errors.As(err, &nsk) {
+		return &objectNotFound{err: err}
+	}
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		switch ae.ErrorCode() {
+		case "NoSuchKey", "NotFound":
+			return &objectNotFound{err: err}
+		}
+	}
+	return err
+}
 
 // Restorer serves cold reads: ONE ranged GetObject for exactly (segID,
 // offset, len), and a singleflight whole-segment restore so two concurrent
@@ -50,7 +83,7 @@ func (r *Restorer) ReadRange(ctx context.Context, segID uint64, off, n int64, ds
 		Bucket: &r.cfg.Bucket, Key: &key, Range: &rng,
 	})
 	if err != nil {
-		return err
+		return classifyNotFound(err)
 	}
 	defer drainClose(out.Body)
 	if _, err := io.ReadFull(out.Body, dst); err != nil {

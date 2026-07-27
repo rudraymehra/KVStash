@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"sync"
 
 	"github.com/kvstash/kvblockd/internal/eviction"
@@ -216,13 +217,14 @@ func (t *Tiered) promoteOne(req promoteReq) {
 	if cur := t.idx.get(req.k); cur != req.ref {
 		return // replaced or removed since the hit — stale request
 	}
-	_ = t.promoteSync(req.k, req.ref)
+	_ = t.promoteSync(context.Background(), req.k, req.ref)
 }
 
 // promoteSync is the synchronous promotion core (also the PIN_HARD path).
-func (t *Tiered) promoteSync(k dram.Key, e *nvmeRef) protocol.Status {
+// ctx bounds the device/S3 reads; background callers pass Background.
+func (t *Tiered) promoteSync(ctx context.Context, k dram.Key, e *nvmeRef) protocol.Status {
 	var heap []byte
-	blob, rel, st := t.volumeFor(k.Hash).Read(e.Loc, k.NS, k.Hash, e.XXH3)
+	blob, rel, st := t.volumeFor(k.Hash).Read(ctx, e.Loc, k.NS, k.Hash, e.XXH3)
 	switch st {
 	case nvme.ReadOK:
 		heap = make([]byte, len(blob))
@@ -235,12 +237,23 @@ func (t *Tiered) promoteSync(k dram.Key, e *nvmeRef) protocol.Status {
 		// survive" = DRAM residency) must work from the cold tier too — a
 		// GET serves this block, so a pin refusing NOT_FOUND would be a lie.
 		// readS3 verifies before a byte escapes and hands us a heap buffer.
-		data, crel, ok := t.readS3(e)
-		if !ok {
+		data, crel, cst := t.readS3(ctx, e)
+		switch cst {
+		case protocol.StatusOK:
+			heap = data
+			crel()
+		case protocol.StatusErrBusy:
+			return protocol.StatusErrBusy // cold tier saturated — retryable
+		default:
+			// NOT_FOUND is honest only when the BLOCK is gone. With the
+			// breaker open the block exists and its endpoint is sick — that
+			// maps to retryable ERR_BUSY, or the "must survive" pin above
+			// would lie NOT_FOUND for a whole cooldown window.
+			if t.s3BreakerOpen(t.now()) {
+				return protocol.StatusErrBusy
+			}
 			return protocol.StatusNotFound
 		}
-		heap = data
-		crel()
 	case nvme.ReadCorrupt:
 		return protocol.StatusNotFound
 	}
@@ -355,8 +368,16 @@ func (t *Tiered) reclaimSegment(vol *nvme.Volume, from uint32) (reclaimOutcome, 
 			protected = e.leased(now) || e.pinned()
 		})
 		if protected {
+			// A protected oldest segment bends FIFO exactly like a latch-busy
+			// one: reclaimBusy, so the caller bumps its floor and tries the
+			// next-oldest under the skip budget. Ending the pass here let ONE
+			// soft pin (no expiry until UNPIN) or one continuously re-leased
+			// hot block head-of-line-block ALL reclaim on the volume — the
+			// precise pressure spiral the reclaimBusy machinery exists to
+			// prevent. The counter makes a wedged-oldest volume visible.
 			t.reclaimSkips.Add(1)
-			return reclaimStop, id // segment skipped this round (retry when the lease lapses)
+			t.reclaimBlockedProtected.Add(1)
+			return reclaimBusy, id
 		}
 	}
 	if !vol.RetireBegin(id) {

@@ -115,7 +115,7 @@ func (fx *fixture) fillRange(t *testing.T, start, n, sz int) []uint64 {
 		if st := fx.t.Put(1, tk(i), b, sums[j]); st != protocol.StatusOK {
 			t.Fatalf("put %d: %s", i, st)
 		}
-		data, _, rel, tier, st := fx.t.GetRefTier(1, tk(i))
+		data, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, tk(i))
 		if st != protocol.StatusOK || tier != "dram" {
 			t.Fatalf("get %d: %s tier=%s", i, st, tier)
 		}
@@ -147,7 +147,7 @@ func TestDemoteThenGetRoundTrip(t *testing.T) {
 	// Every block still answers byte-identical — from whichever tier.
 	nvmeHits := 0
 	for i := 0; i < fillN; i++ {
-		data, sum, rel, tier, st := fx.t.GetRefTier(1, tk(i))
+		data, sum, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, tk(i))
 		if st != protocol.StatusOK {
 			t.Fatalf("block %d lost after demotion: %s", i, st)
 		}
@@ -181,7 +181,7 @@ func TestWriteOnceAcrossTiers(t *testing.T) {
 	// Find an NVMe-only resident.
 	victim := -1
 	for i := 0; i < fillN; i++ {
-		_, _, rel, tier, st := fx.t.GetRefTier(1, tk(i))
+		_, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, tk(i))
 		if st == protocol.StatusOK {
 			rel()
 			if tier == "nvme" {
@@ -215,7 +215,7 @@ func TestPromoteOnSecondHit(t *testing.T) {
 
 	victim := -1
 	for i := 0; i < fillN; i++ {
-		_, _, rel, tier, st := fx.t.GetRefTier(1, tk(i))
+		_, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, tk(i))
 		if st == protocol.StatusOK {
 			rel()
 			if tier == "nvme" {
@@ -234,7 +234,7 @@ func TestPromoteOnSecondHit(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		fx.cur.Add(50 * msNanos)
-		_, _, rel, tier, st := fx.t.GetRefTier(1, tk(victim))
+		_, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, tk(victim))
 		if st != protocol.StatusOK {
 			t.Fatalf("victim lost during promotion: %s", st)
 		}
@@ -260,7 +260,7 @@ func TestHardPinPromotes(t *testing.T) {
 	}
 	victim := -1
 	for i := 0; i < fillN; i++ {
-		_, _, rel, tier, st := fx.t.GetRefTier(1, tk(i))
+		_, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, tk(i))
 		if st == protocol.StatusOK {
 			rel()
 			if tier == "nvme" {
@@ -276,7 +276,7 @@ func TestHardPinPromotes(t *testing.T) {
 		t.Fatalf("hard pin on nvme resident: %s", st)
 	}
 	// The pin promoted it: DRAM serves it now, and DELETE refuses hard.
-	_, _, rel, tier, st := fx.t.GetRefTier(1, tk(victim))
+	_, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, tk(victim))
 	if st != protocol.StatusOK || tier != "dram" {
 		t.Fatalf("hard-pinned block: %s tier=%s, want dram", st, tier)
 	}
@@ -315,7 +315,7 @@ func TestLeaseProtectsNvmeResidentFromReclaim(t *testing.T) {
 		t.Log("reclaim proceeded — verifying no leased block was dropped")
 	}
 	for i := range leased {
-		data, _, rel, _, st := fx.t.GetRefTier(1, tk(i))
+		data, _, rel, _, st := fx.t.GetRefTier(context.Background(), 1, tk(i))
 		if st != protocol.StatusOK {
 			t.Fatalf("leased nvme block %d dropped by reclaim: %s", i, st)
 		}
@@ -434,7 +434,7 @@ func TestAdmitMinHitsZeroAdmitsColdFill(t *testing.T) {
 	// The demoted cold blocks still answer byte-identical from NVMe.
 	nvmeHits := 0
 	for i := 0; i < fillN; i++ {
-		data, _, rel, tier, st := fx.t.GetRefTier(1, tk(i))
+		data, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, tk(i))
 		if st != protocol.StatusOK {
 			continue // eviction overlap is cache-legal; misses allowed
 		}

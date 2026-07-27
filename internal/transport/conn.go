@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -198,6 +199,32 @@ func (c *Conn) Close() error {
 // Done is closed when both loops have exited, the socket is closed, and every
 // release has fired.
 func (c *Conn) Done() <-chan struct{} { return c.done }
+
+// Context returns a context cancelled the moment the connection STARTS
+// tearing down (Close/Abort — peer death noticed by either loop, server
+// drain), not when teardown finishes like Done: a handler blocked inside a
+// store read IS the read loop, so only this earlier edge can reach it.
+// Handlers thread it into blocking store reads so a dying connection or a
+// draining server cancels in-flight device/S3 I/O instead of pinning the
+// goroutine through a device stall. Allocation-free; never carries values
+// or a deadline (the wire deadline lives on the socket).
+func (c *Conn) Context() context.Context { return connCtx{c.closed} }
+
+// connCtx adapts the closed channel to context.Context without a goroutine
+// per connection (context.WithCancel would need a watcher).
+type connCtx struct{ closed <-chan struct{} }
+
+func (connCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c connCtx) Done() <-chan struct{}     { return c.closed }
+func (connCtx) Value(any) any               { return nil }
+func (c connCtx) Err() error {
+	select {
+	case <-c.closed:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
 
 // respondError enqueues a transport-owned canned error response — used for
 // frames that structurally cannot reach a handler (oversize, credit breach),

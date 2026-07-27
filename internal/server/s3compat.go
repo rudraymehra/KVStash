@@ -301,7 +301,7 @@ func (h *S3Compat) putObject(w http.ResponseWriter, r *http.Request, ns uint32, 
 // pair share lookup, headers, and Range arithmetic; HEAD just never writes
 // the body (S3 HEAD honors Range in its headers, and so does this).
 func (h *S3Compat) getObject(w http.ResponseWriter, r *http.Request, ns uint32, key [32]byte, head bool) {
-	data, sum, st := h.getCopy(ns, key)
+	data, sum, st := h.getCopy(r.Context(), ns, key)
 	switch st {
 	case protocol.StatusOK:
 	case protocol.StatusErrBusy:
@@ -349,7 +349,7 @@ func (h *S3Compat) getObject(w http.ResponseWriter, r *http.Request, ns uint32, 
 // ALWAYS returns a heap copy, releasing any arena reference before returning:
 // an HTTP writer can stall for seconds, and holding a block reference across
 // that would fight DELETE/eviction for the extent's lifetime.
-func (h *S3Compat) getCopy(ns uint32, key [32]byte) (data []byte, sum uint64, st protocol.Status) {
+func (h *S3Compat) getCopy(ctx context.Context, ns uint32, key [32]byte) (data []byte, sum uint64, st protocol.Status) {
 	copyOut := func(view []byte, release func()) []byte {
 		out := make([]byte, len(view))
 		copy(out, view)
@@ -360,7 +360,7 @@ func (h *S3Compat) getCopy(ns uint32, key [32]byte) (data []byte, sum uint64, st
 	}
 	switch s := h.store.(type) {
 	case tierRefGetter:
-		view, x, rel, _, tst := s.GetRefTier(ns, key)
+		view, x, rel, _, tst := s.GetRefTier(ctx, ns, key)
 		if tst != protocol.StatusOK {
 			return nil, 0, tst
 		}

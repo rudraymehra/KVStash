@@ -2,6 +2,7 @@ package nvme
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -13,9 +14,20 @@ import (
 // blocks, and the max record span; each class retains a bounded free list
 // and overflow is munmapped on Put, so the pool is bounded-by-demand even
 // while the transport holds released-late buffers.
+//
+// The retain bound must follow the HOLDER's lifetime, not the producer's
+// parallelism: buffers stay out until the transport's writev completes, so
+// once outstanding responses exceed the bound EVERY read pays an mmap on
+// Get plus a munmap on Put — cross-core TLB-shootdown IPIs plus first-touch
+// page faults, a throughput cliff at exactly peak load. The counters make
+// that cliff visible on the scrape (allocs = pool misses, overflowMunmaps =
+// returns the free list could not hold).
 type bufPool struct {
 	classes []uint32      // ascending buffer sizes, page-multiples
 	free    []chan []byte // one bounded free list per class
+
+	allocs         atomic.Uint64 // fresh mmaps (free list empty on Get)
+	overflowMunmap atomic.Uint64 // Puts munmapped because the free list was full
 }
 
 // newBufPool sizes the largest class to maxSpan (rounded to recordAlign)
@@ -48,6 +60,7 @@ func (p *bufPool) Get(n uint32) ([]byte, error) {
 		case b := <-p.free[i]:
 			return b, nil
 		default:
+			p.allocs.Add(1)
 			return mmapBuf(int(c))
 		}
 	}
@@ -67,11 +80,18 @@ func (p *bufPool) Put(b []byte) {
 		select {
 		case p.free[i] <- b[:cap(b)]:
 		default:
+			p.overflowMunmap.Add(1)
 			_ = unix.Munmap(b[:cap(b)])
 		}
 		return
 	}
 	_ = unix.Munmap(b[:cap(b)])
+}
+
+// statsInto merges the pool's counters into the volume stats document.
+func (p *bufPool) statsInto(m map[string]int64) {
+	m["pool_alloc_total"] += int64(p.allocs.Load())                   //nolint:gosec // G115: counters
+	m["pool_overflow_munmap_total"] += int64(p.overflowMunmap.Load()) //nolint:gosec // G115: counters
 }
 
 // Close munmaps every buffer currently retained in the free lists. The

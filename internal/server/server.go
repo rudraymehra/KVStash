@@ -62,8 +62,11 @@ type nsQuotaChecker interface {
 // store reports WHICH tier served the hit (metrics honesty) and a per-key
 // status — StatusOK, StatusNotFound, or StatusErrBusy when a bounded device
 // reader is saturated (retryable; rides the descriptor, no wire change).
+// ctx is the caller's lifetime (the connection context / HTTP request):
+// cancellation reaches the device and S3 reads underneath, so a dead client
+// or a drain never pins a goroutine through a device stall.
 type tierRefGetter interface {
-	GetRefTier(ns uint32, key [32]byte) (data []byte, xxh3 uint64, release func(), tier string, st protocol.Status)
+	GetRefTier(ctx context.Context, ns uint32, key [32]byte) (data []byte, xxh3 uint64, release func(), tier string, st protocol.Status)
 }
 
 // Recorder observes served requests (the metrics seam, satisfied structurally

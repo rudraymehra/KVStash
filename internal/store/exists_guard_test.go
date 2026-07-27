@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+
 	"sync/atomic"
 	"testing"
 
@@ -94,7 +96,7 @@ func TestExistsNeverTouchesNVMe(t *testing.T) {
 	if before != readsDuringGuard {
 		t.Fatalf("device reads happened during the guarded surface: %d", before-readsDuringGuard)
 	}
-	if _, _, rel, tier, st := fx.t.GetRefTier(1, nvmeKey); st != protocol.StatusOK || tier != "nvme" {
+	if _, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, nvmeKey); st != protocol.StatusOK || tier != "nvme" {
 		t.Fatalf("GET through the spy: %s tier=%s", st, tier)
 	} else {
 		rel()

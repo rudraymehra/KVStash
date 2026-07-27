@@ -1,6 +1,7 @@
 package nvme
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -17,11 +18,18 @@ type VolumeParams struct {
 	MaxBytes       int64 // reclaim pressure reference for this volume
 	SyncEveryBytes int64 // group-commit cadence (fdatasync ledger)
 	ReadWorkers    int
-	CkptEverySegs  int    // checkpoint every N seals; 0 = never
-	MaxBlobLen     uint32 // record payload cap (mirrors the wire limit)
-	Backend        IOBackend
-	Now            func() int64 // unix nanos; nil = real time
-	Logger         *slog.Logger
+	// ReadBufRetain caps each buffer-pool class's free list. 0 = default:
+	// 8×ReadWorkers — the readq depth (4×) plus transport-held slack (4×),
+	// because buffers are held until the response's writev completes, so
+	// the outstanding population tracks queued reads + in-flight responses,
+	// NOT worker parallelism (the old 2× bound turned every read past 32
+	// outstanding into an mmap/munmap TLB-shootdown pair under load).
+	ReadBufRetain int
+	CkptEverySegs int    // checkpoint every N seals; 0 = never
+	MaxBlobLen    uint32 // record payload cap (mirrors the wire limit)
+	Backend       IOBackend
+	Now           func() int64 // unix nanos; nil = real time
+	Logger        *slog.Logger
 }
 
 // AppendReq is one demotion write. Data is typically an arena view whose
@@ -137,6 +145,9 @@ func OpenVolume(p VolumeParams) (*Volume, *RecoveryReport, []RecoveredEntry, err
 	if p.ReadWorkers <= 0 {
 		p.ReadWorkers = 16
 	}
+	if p.ReadBufRetain <= 0 {
+		p.ReadBufRetain = 8 * p.ReadWorkers // readq depth + transport-held slack (see the field doc)
+	}
 	if p.SyncEveryBytes <= 0 {
 		p.SyncEveryBytes = 8 << 20
 	}
@@ -157,7 +168,7 @@ func OpenVolume(p VolumeParams) (*Volume, *RecoveryReport, []RecoveredEntry, err
 		backend:    p.Backend,
 		log:        p.Logger,
 		now:        p.Now,
-		pool:       newBufPool(uint32(recordSpan(p.MaxBlobLen)), 2*p.ReadWorkers), //nolint:gosec // G115: span < 4 GiB (validated above)
+		pool:       newBufPool(uint32(recordSpan(p.MaxBlobLen)), p.ReadBufRetain), //nolint:gosec // G115: span < 4 GiB (validated above)
 		segs:       make(map[uint32]*segment),
 		reqs:       make(chan AppendReq, 128),
 		writerStop: make(chan struct{}),
@@ -210,7 +221,16 @@ func (v *Volume) Append(r AppendReq) bool {
 // verifying magic, nskey, and xxh3 before a byte escapes. release returns
 // the pooled buffer AND the segment read-hold; it must be called exactly
 // once on ReadOK.
-func (v *Volume) Read(loc Loc, ns uint32, key [32]byte, want uint64) (data []byte, release func(), st ReadStatus) {
+//
+// ctx (non-nil; the wire deadline the transport carries) cancels the WAIT,
+// not the device I/O: a cancelled caller returns ReadGone immediately and
+// ownership of the segment read-hold — and of the pooled buffer, if the
+// worker's pread completes anyway — transfers to the worker via the
+// per-request claimed flag. Exactly one side ever owns the result, so a
+// 10–30s controller stall costs the device a worker, never a transport
+// goroutine, and never wedges RetireFinish's read-hold drain behind a
+// caller nobody will answer.
+func (v *Volume) Read(ctx context.Context, loc Loc, ns uint32, key [32]byte, want uint64) (data []byte, release func(), st ReadStatus) {
 	if v.closed.Load() {
 		return nil, nil, ReadGone
 	}
@@ -223,24 +243,37 @@ func (v *Volume) Read(loc Loc, ns uint32, key [32]byte, want uint64) (data []byt
 	if !seg.acquireRead() {
 		return nil, nil, ReadGone
 	}
-	req := readReq{seg: seg, loc: loc, ns: ns, key: key, want: want, done: make(chan readResult, 1)}
+	req := readReq{
+		seg: seg, loc: loc, ns: ns, key: key, want: want,
+		done:    make(chan readResult, 1),
+		claimed: new(atomic.Bool),
+	}
 	select {
 	case v.readq <- req:
 	default:
 		seg.releaseRead()
 		return nil, nil, ReadBusy
 	}
-	// readStop unblocks a caller whose request was queued when shutdown
-	// drained the pool (the Read-vs-Close hang/panic trap). A
-	// worker that already picked the request up replies on done regardless
-	// (buffered — its send never blocks; a raced buf is impossible because
-	// queued requests own no buffer yet).
+	// Three ways out of the wait. done: the worker won the claim and the
+	// result (buffer ownership included) is ours. ctx/readStop: we try to
+	// claim abandonment — winning transfers cleanup (buffer Put + read-hold
+	// release) to whichever worker processes the request (every queued
+	// request IS processed: the readStop drain replies or cleans up too);
+	// LOSING the claim means a result is already committed to the buffered
+	// channel, so take it and proceed as a normal completion.
 	var res readResult
 	select {
 	case res = <-req.done:
+	case <-ctx.Done():
+		if req.claimed.CompareAndSwap(false, true) {
+			return nil, nil, ReadGone
+		}
+		res = <-req.done
 	case <-v.readStop:
-		seg.releaseRead()
-		return nil, nil, ReadGone
+		if req.claimed.CompareAndSwap(false, true) {
+			return nil, nil, ReadGone
+		}
+		res = <-req.done
 	}
 	if res.st != ReadOK {
 		seg.releaseRead()
@@ -275,6 +308,7 @@ func (v *Volume) StatsInto(m map[string]int64) {
 	m["checkpoints_total"] += int64(v.ckpts.Load()) //nolint:gosec // G115: counters
 	m["enospc_total"] += int64(v.enospc.Load())     //nolint:gosec // G115: counters
 	m["reclaims_total"] += int64(v.reclaims.Load()) //nolint:gosec // G115: counters
+	v.pool.statsInto(m)
 }
 
 // Close stops the writer (STAGED records are flushed and synced; records

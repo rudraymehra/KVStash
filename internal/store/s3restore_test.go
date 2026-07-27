@@ -254,7 +254,7 @@ func (fx *restoreFixture) reclaimToHeadroom(t *testing.T) {
 // coldGet asserts one verified cold-tier read.
 func (fx *restoreFixture) coldGet(t *testing.T, key [32]byte, want []byte) {
 	t.Helper()
-	data, _, rel, tier, st := fx.t.GetRefTier(1, key)
+	data, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, key)
 	if st != protocol.StatusOK {
 		t.Fatalf("cold get: %s", st)
 	}
@@ -295,7 +295,7 @@ func TestSecondColdHitRestoresWholeSegment(t *testing.T) {
 		t.Fatalf("segment restores = %d, want 1", got)
 	}
 	for _, k := range keys {
-		data, _, rel, tier, st := fx.t.GetRefTier(1, k)
+		data, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, k)
 		if st != protocol.StatusOK {
 			t.Fatalf("post-restore get: %s", st)
 		}
@@ -424,7 +424,7 @@ func TestRestoreFailureKeepsColdService(t *testing.T) {
 	if got := fx.t.s3SegRestores.Load(); got != 1 {
 		t.Fatalf("segment restores after retry = %d, want 1", got)
 	}
-	if _, _, rel, tier, st := fx.t.GetRefTier(1, k0); st != protocol.StatusOK || tier != "nvme" {
+	if _, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, k0); st != protocol.StatusOK || tier != "nvme" {
 		t.Fatalf("post-retry get: %s tier=%q, want OK nvme", st, tier)
 	} else {
 		rel()
@@ -468,11 +468,11 @@ func TestDeleteRacingRestoreDoesNotResurrect(t *testing.T) {
 	if n, _ := fx.t.ExistsPrefix(1, [][32]byte{victim}, false); n != 0 {
 		t.Fatal("deleted key EXISTS after a racing restore — resurrected")
 	}
-	if _, _, _, _, st := fx.t.GetRefTier(1, victim); st != protocol.StatusNotFound {
+	if _, _, _, _, st := fx.t.GetRefTier(context.Background(), 1, victim); st != protocol.StatusNotFound {
 		t.Fatalf("deleted key GET = %s after a racing restore, want NOT_FOUND", st)
 	}
 	// Survivors flipped home and serve locally.
-	data, _, rel, tier, st := fx.t.GetRefTier(1, trigger)
+	data, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, trigger)
 	if st != protocol.StatusOK || tier != "nvme" || !bytes.Equal(data, blobs[trigger]) {
 		t.Fatalf("survivor after racing restore: %s tier=%q", st, tier)
 	}
@@ -548,7 +548,7 @@ func TestRestoredSegmentSurvivesReclaim(t *testing.T) {
 	// THE assertion: every restored block SURVIVES, byte-identical, on some
 	// tier. Against drop-on-restore all of them read NOT_FOUND here.
 	for _, k := range keys {
-		data, sum, rel, tier, st := fx.t.GetRefTier(1, k)
+		data, sum, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, k)
 		if st != protocol.StatusOK {
 			t.Fatalf("restored block LOST after reclaim: %s (the drop-on-restore blocker)", st)
 		}
@@ -725,7 +725,7 @@ func TestConcurrentRestoreVsReclaim(t *testing.T) {
 	// byte-identical from SOME tier (nvme if the restore's flip stood, s3 if
 	// a reclaim re-flipped it out — both are loss-free).
 	for _, k := range keys {
-		data, sum, rel, tier, st := fx.t.GetRefTier(1, k)
+		data, sum, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, k)
 		if st != protocol.StatusOK {
 			t.Fatalf("entry lost in the restore-vs-reclaim race: %s", st)
 		}
@@ -836,7 +836,7 @@ func TestReclaimLatchBlocksRestoreOvertake(t *testing.T) {
 		if deleted[k] {
 			continue // a legal removal, not a loss
 		}
-		data, sum, rel, tier, st := fx.t.GetRefTier(1, k)
+		data, sum, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, k)
 		if st != protocol.StatusOK {
 			t.Fatalf("block lost to the restore-overtake tear: %s", st)
 		}

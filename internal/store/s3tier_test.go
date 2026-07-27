@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -158,7 +159,7 @@ func driveToS3Residency(t *testing.T, fx *s3Fixture) (key [32]byte, blob []byte)
 		t.Fatalf("no segment reached s3-residency (spilled=%d dropped=%d errs=%d)", spilled, dropped, putErrs)
 	}
 	for i := 0; i < total; i++ {
-		data, _, rel, tier, st := fx.t.GetRefTier(1, s3key(i))
+		data, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, s3key(i))
 		if st != protocol.StatusOK {
 			continue
 		}
@@ -271,7 +272,7 @@ func TestS3FlipStrandAbortsRetire(t *testing.T) {
 
 	// After the abort the segment is live again: the pinned block still
 	// serves LOCALLY (never from S3), byte-intact.
-	_, _, rel, tier, st := fx.t.GetRefTier(1, keys[0])
+	_, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, keys[0])
 	if st != protocol.StatusOK {
 		t.Fatalf("pinned block unreadable after strand-abort: %s", st)
 	}
@@ -349,7 +350,7 @@ func TestS3SpillRetireFlipColdRead(t *testing.T) {
 	s3Served := 0
 	firstS3 := -1
 	for i := 0; i < total; i++ {
-		data, sum, rel, tier, st := fx.t.GetRefTier(1, s3key(i))
+		data, sum, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, s3key(i))
 		if st == protocol.StatusNotFound {
 			continue // cache-legal loss under pressure — but never wrong bytes
 		}
@@ -458,7 +459,7 @@ func TestS3ColdReadRefusesCorruptObject(t *testing.T) {
 
 	preS3 := fx.t.s3ChecksumErrs.Load()
 	preNvme := fx.t.checksumErrs.Load()
-	data, _, rel, tier, st := fx.t.GetRefTier(1, key)
+	data, _, rel, tier, st := fx.t.GetRefTier(context.Background(), 1, key)
 	if st == protocol.StatusOK {
 		same := bytes.Equal(data, blob)
 		rel()
@@ -475,6 +476,301 @@ func TestS3ColdReadRefusesCorruptObject(t *testing.T) {
 	}
 }
 
+// TestS3BreakerContainsOutage pins the circuit breaker: after
+// s3BreakerTripAfter consecutive ReadRange failures the breaker opens —
+// further cold reads answer NOT_FOUND WITHOUT touching the backend (no new
+// read errors, skips counted), and after the cooldown exactly one probe per
+// interval re-tests the endpoint. Before the breaker, every cold key on
+// every connection paid the full deadline for the whole outage.
+func TestS3BreakerContainsOutage(t *testing.T) {
+	fx := newS3Fixture(t)
+	key, _ := driveToS3Residency(t, fx)
+	fx.srv.Close() // outage: every ReadRange now fails fast
+
+	for i := 0; i < s3BreakerTripAfter; i++ {
+		if _, _, _, _, st := fx.t.GetRefTier(context.Background(), 1, key); st != protocol.StatusNotFound {
+			t.Fatalf("outage read %d: %s, want NOT_FOUND", i, st)
+		}
+	}
+	if got := fx.t.s3BreakerOpens.Load(); got != 1 {
+		t.Fatalf("breaker opens = %d after the trip streak, want 1", got)
+	}
+
+	// Open breaker: contained — no backend traffic, no new read errors.
+	preErrs, preSkips := fx.t.s3ReadErrs.Load(), fx.t.s3BreakerSkips.Load()
+	for i := 0; i < 5; i++ {
+		if _, _, _, _, st := fx.t.GetRefTier(context.Background(), 1, key); st != protocol.StatusNotFound {
+			t.Fatalf("breaker-open read %d: %s, want NOT_FOUND", i, st)
+		}
+	}
+	if got := fx.t.s3ReadErrs.Load(); got != preErrs {
+		t.Fatalf("breaker open but reads still hit the backend: errors %d → %d", preErrs, got)
+	}
+	if got := fx.t.s3BreakerSkips.Load(); got != preSkips+5 {
+		t.Fatalf("breaker skips %d → %d, want +5", preSkips, got)
+	}
+
+	// Cooldown lapse: exactly ONE probe goes through per interval (it fails
+	// — the endpoint is still dead — and re-opens the breaker).
+	fx.cur.Add(int64(s3BreakerCooldown) + 1)
+	preErrs = fx.t.s3ReadErrs.Load()
+	for i := 0; i < 3; i++ {
+		_, _, _, _, _ = fx.t.GetRefTier(context.Background(), 1, key)
+	}
+	if got := fx.t.s3ReadErrs.Load(); got != preErrs+1 {
+		t.Fatalf("post-cooldown probes hit the backend %d times, want exactly 1", got-preErrs)
+	}
+}
+
+// TestS3DeadObjectDoesNotOpenBreaker pins the breaker's own invariant —
+// ENDPOINT health, never OBJECT health: a full trip-streak of reads against
+// an externally-deleted object (a misconfigured bucket lifecycle rule is the
+// realistic shape) answers per-key NOT_FOUND on its own counter, never opens
+// the breaker, and never rides the endpoint-error counter — partial object
+// loss must not amplify into a self-sustaining cold-tier outage.
+func TestS3DeadObjectDoesNotOpenBreaker(t *testing.T) {
+	fx := newS3Fixture(t)
+	key, _ := driveToS3Residency(t, fx)
+	ref := fx.t.idx.get(dram.Key{NS: 1, Hash: key})
+	if ref == nil {
+		t.Fatal("served key has no index entry")
+	}
+	objKey := fmt.Sprintf("kvblockd/fx/segments/seg-%08d.seg", ref.Loc.SegmentID)
+	if _, err := fx.backend.DeleteObject("kvb-tier", objKey); err != nil {
+		t.Fatalf("delete segment object: %v", err)
+	}
+
+	preErrs := fx.t.s3ReadErrs.Load()
+	const reads = 2 * s3BreakerTripAfter
+	for i := 0; i < reads; i++ {
+		if _, _, _, _, st := fx.t.GetRefTier(context.Background(), 1, key); st != protocol.StatusNotFound {
+			t.Fatalf("dead-object read %d: %s, want NOT_FOUND", i, st)
+		}
+	}
+	if got := fx.t.s3BreakerOpens.Load(); got != 0 {
+		t.Fatalf("a dead OBJECT opened the breaker (%d opens) — every healthy cold key just blackholed for the cooldown", got)
+	}
+	if got := fx.t.s3ReadNotFound.Load(); got != reads {
+		t.Fatalf("dead-object reads on the wrong counter: read_not_found_total=%d, want %d", got, reads)
+	}
+	if got := fx.t.s3ReadErrs.Load(); got != preErrs {
+		t.Fatalf("dead object misattributed to endpoint sickness: read errors %d → %d", preErrs, got)
+	}
+}
+
+// cancellingRestore simulates a client that disconnects MID-read: ReadRange
+// cancels the caller's context, then fails with its error — the exact shape
+// a server drain or a dropped connection produces under the ctx plumb.
+type cancellingRestore struct{ cancel context.CancelFunc }
+
+func (c *cancellingRestore) ReadRange(ctx context.Context, _ uint64, _, _ int64, _ []byte) error {
+	c.cancel()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (c *cancellingRestore) RestoreSegment(context.Context, uint64, func(io.Reader) error) error {
+	return fmt.Errorf("cancelling backend")
+}
+func (c *cancellingRestore) Stats() (uint64, uint64) { return 0, 0 }
+
+// TestS3CancelledColdReadIsNotAnEndpointError pins the taxonomy leg the ctx
+// plumb introduced: a caller-cancelled cold read (client disconnect, server
+// drain) is neither an endpoint failure nor breaker food — read_errors_total
+// stays flat and the breaker stays closed through a full trip-streak of
+// cancellations, so a routine Drain can never page as endpoint sickness.
+func TestS3CancelledColdReadIsNotAnEndpointError(t *testing.T) {
+	fx := newS3Fixture(t)
+	key, _ := driveToS3Residency(t, fx)
+
+	preErrs := fx.t.s3ReadErrs.Load()
+	for i := 0; i < s3BreakerTripAfter; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		fx.t.p.Restore = &cancellingRestore{cancel: cancel}
+		_, _, _, _, st := fx.t.GetRefTier(ctx, 1, key)
+		cancel()
+		if st != protocol.StatusNotFound {
+			t.Fatalf("cancelled cold read %d: %s, want NOT_FOUND", i, st)
+		}
+	}
+	if got := fx.t.s3ReadErrs.Load(); got != preErrs {
+		t.Fatalf("client disconnects counted as S3 read errors: %d → %d", preErrs, got)
+	}
+	if got := fx.t.s3BreakerOpens.Load(); got != 0 {
+		t.Fatalf("breaker opened on caller cancellations: %d opens", got)
+	}
+}
+
+// TestPinHardBreakerOpenAnswersBusy pins the PIN_HARD status mapping while
+// the breaker is open: the block EXISTS and only its tier's endpoint is sick,
+// so the promotion must answer retryable ERR_BUSY — NOT_FOUND here would
+// break the "a pin refusing NOT_FOUND would be a lie" contract for a whole
+// cooldown window.
+func TestPinHardBreakerOpenAnswersBusy(t *testing.T) {
+	fx := newS3Fixture(t)
+	key, _ := driveToS3Residency(t, fx)
+	fx.srv.Close() // outage: every ReadRange now fails fast
+	for i := 0; i < s3BreakerTripAfter; i++ {
+		_, _, _, _, _ = fx.t.GetRefTier(context.Background(), 1, key)
+	}
+	if got := fx.t.s3BreakerOpens.Load(); got != 1 {
+		t.Fatalf("breaker opens = %d after the trip streak, want 1", got)
+	}
+	if st := fx.t.PinOp(1, key, protocol.PinHard); st != protocol.StatusErrBusy {
+		t.Fatalf("PIN_HARD with the breaker open: %s, want ERR_BUSY (the block exists; the endpoint is sick)", st)
+	}
+}
+
+// parkedRestore parks every ReadRange (announcing on entered) until gate
+// closes, then fails — the seam for holding cold reads in flight.
+type parkedRestore struct {
+	entered chan struct{}
+	gate    chan struct{}
+}
+
+func (p *parkedRestore) ReadRange(context.Context, uint64, int64, int64, []byte) error {
+	p.entered <- struct{}{}
+	<-p.gate
+	return fmt.Errorf("parked backend: read failed")
+}
+
+func (p *parkedRestore) RestoreSegment(context.Context, uint64, func(io.Reader) error) error {
+	return fmt.Errorf("parked backend")
+}
+func (p *parkedRestore) Stats() (uint64, uint64) { return 0, 0 }
+
+// TestS3ColdReadConcurrencyBound pins the semaphore: with every slot parked
+// in a slow backend read, the next cold GET answers ERR_BUSY (retryable)
+// instead of opening yet another backend read — N connections can no longer
+// fan an outage into N stalled goroutines.
+func TestS3ColdReadConcurrencyBound(t *testing.T) {
+	fx := newS3Fixture(t)
+	key, _ := driveToS3Residency(t, fx)
+	park := &parkedRestore{
+		entered: make(chan struct{}, 2*s3ColdReadConcurrency),
+		gate:    make(chan struct{}),
+	}
+	fx.t.p.Restore = park
+
+	var wg sync.WaitGroup
+	for i := 0; i < s3ColdReadConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _, _, _ = fx.t.GetRefTier(context.Background(), 1, key)
+		}()
+	}
+	for i := 0; i < s3ColdReadConcurrency; i++ {
+		select {
+		case <-park.entered:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of %d cold reads reached the backend", i, s3ColdReadConcurrency)
+		}
+	}
+
+	// Every slot held: the overflow read must bounce as ERR_BUSY without a
+	// 17th backend call.
+	preBusy := fx.t.s3ReadBusy.Load()
+	_, _, _, _, st := fx.t.GetRefTier(context.Background(), 1, key)
+	if st != protocol.StatusErrBusy {
+		t.Fatalf("cold read past the bound: %s, want ERR_BUSY", st)
+	}
+	if got := fx.t.s3ReadBusy.Load(); got != preBusy+1 {
+		t.Fatalf("read_busy %d → %d, want +1", preBusy, got)
+	}
+	select {
+	case <-park.entered:
+		t.Fatal("the bounded-out read still reached the backend")
+	default:
+	}
+	close(park.gate)
+	wg.Wait()
+}
+
+// hangDropSpill delegates everything to the real spiller except Drop, which
+// hangs until its ctx dies — the S3 endpoint that accepts connections and
+// never answers DeleteObject.
+type hangDropSpill struct {
+	inner   SpillBackend
+	entered chan struct{}
+}
+
+func (h *hangDropSpill) DemoteSegment(segID uint64, size int64, open func() (io.ReadSeekCloser, error), onUp func(uint64, bool)) bool {
+	return h.inner.DemoteSegment(segID, size, open, onUp)
+}
+
+func (h *hangDropSpill) Drop(ctx context.Context, _ uint64) error {
+	select {
+	case h.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (h *hangDropSpill) Stats() (uint64, uint64, uint64) { return h.inner.Stats() }
+
+// TestHungObjectDropDoesNotStallDemoter pins the GC decoupling: with the
+// drop worker wedged in a DeleteObject that never answers, the demote/
+// reclaim ticker must keep its cadence — fresh pressure still demotes.
+// Before the split, gcPass ran inline on the demoter goroutine and one hung
+// endpoint froze the whole memory ladder for the drop deadline (demotions
+// became evictions exactly under DRAM pressure).
+func TestHungObjectDropDoesNotStallDemoter(t *testing.T) {
+	fx := newS3Fixture(t)
+	_, _ = driveToS3Residency(t, fx)
+
+	// Free every s3-resident block: the last removal of a segment nominates
+	// its object for GC (force: cold reads just auto-leased them).
+	var coldKeys [][32]byte
+	fx.t.idx.rangeAll(func(k dram.Key, ref *nvmeRef) bool {
+		if ref.S3Only.Load() {
+			coldKeys = append(coldKeys, k.Hash)
+		}
+		return true
+	})
+	if len(coldKeys) == 0 {
+		t.Fatal("no s3-resident keys to free")
+	}
+	for _, k := range coldKeys {
+		if st := fx.t.Delete(1, k, true); st != protocol.StatusOK {
+			t.Fatalf("delete cold key: %s", st)
+		}
+	}
+	if len(fx.t.dropq) == 0 {
+		t.Fatal("no GC candidate nominated")
+	}
+
+	hang := &hangDropSpill{inner: fx.t.p.Spill, entered: make(chan struct{}, 1)}
+	fx.t.p.Spill = hang
+	fx.t.p.S3ReadTimeout = 30 * time.Second // the drop deadline a stalled ladder would ride out
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop := fx.t.Start(ctx)
+	defer stop()
+
+	select {
+	case <-hang.entered: // the drop worker is now wedged
+	case <-time.After(10 * time.Second):
+		t.Fatal("GC never attempted the drop")
+	}
+
+	// Fresh demote pressure with the drop wedged: the ticker must move it.
+	preDem := fx.t.demotions.Load()
+	for i := 0; i < 30; i++ {
+		b := bytes.Repeat([]byte{byte(i), 0x77}, 30<<10) //nolint:gosec // G115: test payload
+		_ = fx.t.Put(1, s3key(7000+i), b, xxh3.Hash(b))  // quota refusals under pressure are fine
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for fx.t.demotions.Load() == preDem {
+		if time.Now().After(deadline) {
+			t.Fatal("demoter made no progress while the object drop hung — the ladder stalled behind S3")
+		}
+		fx.cur.Add(int64(200 * time.Millisecond))
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestS3ColdReadTransportErrorIsMiss kills the fake S3 endpoint and proves a
 // dead object store degrades to per-key misses (counted on read_errors) —
 // never a hang, never an unverified byte.
@@ -484,7 +780,7 @@ func TestS3ColdReadTransportErrorIsMiss(t *testing.T) {
 
 	fx.srv.Close() // the endpoint drops mid-flight; ReadRange now fails fast
 	pre := fx.t.s3ReadErrs.Load()
-	_, _, rel, _, st := fx.t.GetRefTier(1, key)
+	_, _, rel, _, st := fx.t.GetRefTier(context.Background(), 1, key)
 	if st == protocol.StatusOK {
 		rel()
 		t.Fatal("cold read served with the transport down")

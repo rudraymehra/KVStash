@@ -1,6 +1,8 @@
 package nvme
 
 import (
+	"context"
+
 	"testing"
 	"time"
 )
@@ -21,7 +23,7 @@ func TestReclaimRetireProtocol(t *testing.T) {
 
 	// Hold a read across the retire — the transport-holds-a-view shape.
 	e := entries[0]
-	data, rel, st := v.Read(Loc{SegmentID: id, Offset: e.Off, Len: e.Len}, e.NS, e.Key, e.XXH3)
+	data, rel, st := v.Read(context.Background(), Loc{SegmentID: id, Offset: e.Off, Len: e.Len}, e.NS, e.Key, e.XXH3)
 	if st != ReadOK {
 		t.Fatalf("pre-retire read: %d", st)
 	}
@@ -33,12 +35,12 @@ func TestReclaimRetireProtocol(t *testing.T) {
 		t.Fatal("double RetireBegin succeeded")
 	}
 	// New reads on a dying segment refuse.
-	if _, _, st := v.Read(Loc{SegmentID: id, Offset: e.Off, Len: e.Len}, e.NS, e.Key, e.XXH3); st != ReadGone {
+	if _, _, st := v.Read(context.Background(), Loc{SegmentID: id, Offset: e.Off, Len: e.Len}, e.NS, e.Key, e.XXH3); st != ReadGone {
 		t.Fatalf("read on dying segment: %d, want gone", st)
 	}
 	// Abort restores service.
 	v.RetireAbort(id)
-	if d2, rel2, st := v.Read(Loc{SegmentID: id, Offset: e.Off, Len: e.Len}, e.NS, e.Key, e.XXH3); st != ReadOK {
+	if d2, rel2, st := v.Read(context.Background(), Loc{SegmentID: id, Offset: e.Off, Len: e.Len}, e.NS, e.Key, e.XXH3); st != ReadOK {
 		t.Fatalf("read after abort: %d", st)
 	} else {
 		rel2()
@@ -66,7 +68,7 @@ func TestReclaimRetireProtocol(t *testing.T) {
 	}
 
 	// The segment is gone: reads say so, space is back, writes may resume.
-	if _, _, st := v.Read(Loc{SegmentID: id, Offset: e.Off, Len: e.Len}, e.NS, e.Key, e.XXH3); st != ReadGone {
+	if _, _, st := v.Read(context.Background(), Loc{SegmentID: id, Offset: e.Off, Len: e.Len}, e.NS, e.Key, e.XXH3); st != ReadGone {
 		t.Fatalf("read after retire: %d, want gone", st)
 	}
 	if v.reclaims.Load() != 1 {
