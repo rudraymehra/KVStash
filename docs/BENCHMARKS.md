@@ -89,63 +89,65 @@ the native connector (`vllm_kvblockd` 0.1.0), **unshaped loopback link —
 disclosed on-chart**. Two-phase isolation: populate → **vLLM restart** →
 measure, `--no-enable-prefix-caching` in both phases, so a warm hit's KV has
 exactly one possible source: kvblockd over TCP into a fresh engine. TTFT =
-first SSE token; p50 of n=5 reps per point, warmup discarded. Raw JSONL:
-`bench/results/rig-e/chart2-ttft-{run5,baseline}.jsonl`; render exactly:
-`python bench/report/plot.py chart2 --in bench/results/rig-e/chart2-ttft-run5.jsonl bench/results/rig-e/chart2-ttft-baseline.jsonl`
-— NOT a wildcard: `rig-e/` keeps the superseded run3/run4 files for history
-(run3's warm arm is flagged UNVERIFIED; run4 predates the load-path rework),
-and a wildcard render would median them into the current cells.
-Honesty note against methodology rule 7: this table is ONE run of n=5 reps
-per point (per-rep values published in `ttft_all_ms`); an independent
-same-config re-run is queued with the next paid session, and until it lands
-the table is labeled single-run rather than silently treated as final.
+first SSE token; p50 of n=5 reps per point per run, **median across n=3
+independent runs** (each run its own two-phase job with fresh engine
+boots). Raw JSONL: `bench/results/rig-e/chart2-ttft-a10g-final-run{1,2,3}.jsonl`
+(warm+cold) with `chart2-ttft-baseline.jsonl` (pure recompute); render
+exactly:
+`python bench/report/plot.py chart2 --in bench/results/rig-e/chart2-ttft-a10g-final-run1.jsonl bench/results/rig-e/chart2-ttft-a10g-final-run2.jsonl bench/results/rig-e/chart2-ttft-a10g-final-run3.jsonl bench/results/rig-e/chart2-ttft-baseline.jsonl`
+— NOT a `rig-e/` wildcard: the directory keeps every superseded run for
+history (run3's warm arm is flagged UNVERIFIED; run4 predates the load-path
+rework; run5 and the `a10g-postwave-run{1,2,3}` table are superseded below),
+and a wildcard render would median history into the current cells.
+Cross-run protocol (methodology rule 7): per-cell p50 spread gated at ≤10%
+by `bench/report/aggregate.py` — looser than the 2% quiet-rig throughput
+gate because each run is a fresh engine boot on a shared GPU host
+(boot-state + neighbor variance), not a 30 s steady-state mean;
+aggregate.py's docstring carries the full justification. Worst cell in this
+table: **7.4%** (16k warm); per-run values and min/max are in the aggregate
+output.
 
-<!-- TODO(multi-run reruns): when the n>=3 independent submissions land
-     (bench/rigs/hf-gpu/submit-n.sh -> bench/results/rig-e/<tag>-run{1..N}.jsonl),
-     replace the single-run honesty note above with the n>=3 protocol:
-     median across runs charted with min/max whiskers (plot.py), per-cell
-     spread gated at <=10% by bench/report/aggregate.py — looser than the 2%
-     quiet-rig throughput gate because each run is a fresh engine boot on a
-     shared GPU host (boot-state + neighbor variance), not a 30s steady-state
-     mean; aggregate.py's docstring carries the full justification. Quote the
-     measured spread% here. The same marker covers the Qwen long-context
-     table below (its "single-run disclosures apply as above" line). -->
-
-**n=3 independent runs** (each its own engine boots; median across runs, per-run
-values and min/max in the aggregate JSONL; worst p50 spread 2.8%). The cold
-arm runs the connector's **gathered-slots** store path (0.3.x): misses stage
-through batched GPU gathers + async DMA into pinned slots, and the TCP put
-happens off the critical path — the store path each run took is stamped in
-its own receipts (`connector store path: gathered-slots`).
+The warm arm runs the connector's **pipelined-slab** load path
+(double-buffered slab halves on a dedicated copy stream) and the cold arm
+its **gathered-slots** store path (0.3.x): misses stage through batched GPU
+gathers + async DMA into pinned slots, and the TCP put happens off the
+critical path. The load path is stamped in every committed record
+(`path=pipelined-slab` in the `connector` field); the store path is
+attributed in each run's job log (`kvblockd store path: gathered-slots`) —
+a log line, not a committed-JSONL stamp, stated so the evidence chain is
+honest about which claims the committed artifacts can and cannot carry.
 
 | prefix | recompute (no connector)² | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
 |---|---|---|---|---|---|
-| 1k  | 269 ms  | 286 ms  | **78 ms**  | **3.4×** | 3.7× |
-| 4k  | 1070 ms | 1124 ms | **178 ms** | **6.0×** | 6.3× |
-| 8k  | 2212 ms | 2318 ms | **304 ms** | **7.3×** | 7.6× |
-| 16k | 5045 ms | 5260 ms | **576 ms** | **8.8×** | 9.1× |
+| 1k  | 269 ms  | 285 ms  | **78 ms**  | **3.4×** | 3.6× |
+| 4k  | 1070 ms | 1125 ms | **178 ms** | **6.0×** | 6.3× |
+| 8k  | 2212 ms | 2321 ms | **264 ms** | **8.4×** | 8.8× |
+| 16k | 5045 ms | 5261 ms | **497 ms** | **10.2×** | 10.6× |
 
 ² baseline is n=1 (its measured rep spread is <1%; an n=3 baseline rides the
-next paid session). Movements vs the previous n=3 table, stated plainly:
-the cold arm dropped a further ~30% — **store-on-miss overhead is now
-1.04–1.06× vs pure recompute** (was 1.45–1.51×), i.e. filling the cache
-costs ~4–6% of a request, receipt-attributed to the gathered-slots staging
-path that replaced ~2×L×blocks blocking host copies with batched gathers
-and async pinned DMA. The "vs serving" column shrank as a RESULT (the
-serving baseline got faster); vs-pure is the stable comparison. The warm
-arm recovered ~4% of the earlier wave's regression (599 → 576 at 16k,
-spread 1.7%) after the per-recv deadline re-arm was hoisted off the hot
-loop; the pipelined-load wave targets a floor well below it.
+next paid session). Movements vs the previous n=3 table
+(`a10g-postwave-run{1,2,3}`: 78/178/304/576), stated plainly: the warm arm
+improved a further 13–14% at 8k/16k (304 → 264, 576 → 497) —
+receipt-attributed to the pipelined-slab load path that replaced
+chunked-slab's serial copy-then-scatter with overlapped halves — and is
+unchanged within noise at 1k/4k, where one slab half already covers the
+transfer. The recompute columns are unchanged within noise, as they must
+be. **Store-on-miss overhead stays 1.04–1.06× vs pure recompute** (was
+1.45–1.51× before the gathered-slots wave): filling the cache costs ~4–6%
+of a request. The "vs serving" column stays close to "vs pure" as a RESULT
+(the serving baseline stopped paying a cache tax); vs-pure is the stable
+comparison.
 
-The warm column improved 3.6–4.8× between run 4 and run 5 by rebuilding the
-connector's load path (pinned staging, chunked DMA, sharded drain — commit
-8b29f83); the recompute columns are unchanged within noise, as they must be.
-Effective reload bandwidth at 16k: ~3.8 GB/s through a Python client with
-per-block xxh3 verification on. Run-5 hit verification uses the exact-count
-gate: every rep's `kvb_hits_total` delta equals its expected block count
-(16k: four reps at 1023/1023 and one at 1024/1024 — that rep's prompt
-calibrated one filler unit longer, and the gate tracks each rep's own
-measured token count, not a nominal target), recorded per-rep in the JSONL.
+The warm column's earlier history, every file still committed: run 4's
+per-block loads → run 5's chunked-slab rebuild (pinned staging, chunked
+DMA, sharded drain — commit 8b29f83; a 3.6–4.8× improvement) → the
+gathered-slots store wave (`a10g-postwave`, load path still chunked-slab)
+→ the pipelined-slab table above. Effective reload bandwidth at 16k: ~4.2 GB/s through a Python client
+with per-block xxh3 verification on. Hit verification uses the exact-count
+gate in every run: each rep's `kvb_hits_total` delta must equal its own
+expected block count (a rep whose prompt calibrates one filler unit longer
+is gated at 1024, not a nominal 1023 — the gate tracks each rep's measured
+token count), recorded per-rep in the JSONL.
 
 ¹ the cold arm of the two-phase run serves WITH the connector, so every miss
 also pays the synchronous store-on-miss write — the steady-state serving
@@ -153,10 +155,11 @@ shape. The no-connector column is the separate control run. Quote the
 conservative "vs pure" column unless the serving context is explicit.
 
 **Attribution is arithmetic, not inferred:** `kvb_hits_total` grew by
-exactly each rep's own expected block count at every length (16k: 1023+
-1023+1023+1024+1023 = 5116 hits — one rep's prompt calibrated one block
-longer, and the gate is per-rep against the measured token count, never
-a nominal target). A warm rep that fails to grow the counter is
+exactly each rep's own expected block count at every length in every run —
+per rep in each run's JSONL as `pairs[].hit_delta`, gated against that
+rep's `expected_hit_blocks` (never a nominal target), with
+`kvb_hit_delta_total` as the record's run total. A
+warm rep that fails to grow the counter is
 recorded `warm_hits_verified: false`, drawn red, and fails the job — the
 harness cannot emit an unattributed warm number (`run_ttft.py --selftest`
 proves the gates; an earlier run's 16× "speedup" with zero store hits was
@@ -180,19 +183,22 @@ emulated link) stays OPEN until the AWS rig runs.
 
 Same harness, same gates, KV-lighter model (56 KiB/token GQA-4) at its
 NATIVE 32k context — no rope scaling, no config overrides. Raw JSONL:
-`bench/results/rig-e/chart2-ttft-qwen32k{,-baseline}.jsonl`; chart:
-`chart2-qwen32k.png`. Every warm rep passed the exact-count gate — 1024
-blocks per rep @16k, 1999–2000 per rep @32k (per-prompt calibration lands
-within a token, so reps differ by one block; the gate is exact against each
-rep's own measured count) — and every record is path-stamped `chunked-slab`.
+`bench/results/rig-e/chart2-ttft-qwen-final-run{1,2,3}.jsonl` with
+`chart2-ttft-qwen32k-baseline.jsonl` (the superseded single-run
+`chart2-ttft-qwen32k.jsonl` stays for history); chart: `chart2-qwen32k.png`.
+Every warm rep passed the exact-count gate — 1024 blocks per rep @16k,
+1999–2000 per rep @32k (per-prompt calibration lands within a token, so
+reps differ by one block; the gate is exact against each rep's own measured
+count).
 
 **n=3 independent runs**, gathered-slots cold arm + pipelined-slab warm arm
-(both stamped in every run's receipts), same protocol as above:
+(load path stamped `path=pipelined-slab` in every committed record; the
+store path is attributed in each run's job log), same protocol as above:
 
 | prefix | recompute (no connector)² | recompute, connector on¹ | **kvblockd reload** | vs pure | vs serving¹ |
 |---|---|---|---|---|---|
 | 16k | 4,588 ms | 4,701 ms | **300 ms** (294–319) | **15.3×** | 15.7× |
-| 32k | 10,923 ms | 10,941 ms | **535 ms** (522–536) | **20.4×** | 20.5× |
+| 32k | 10,923 ms | 10,941 ms | **535 ms** (522–536) | **20.4×** | 20.4× |
 
 **The fp8 cells (kv_cache_dtype=fp8_e4m3, n=3, token-identity certified):**
 halving the KV bytes halves the reload — every arm of these runs (baseline,
@@ -225,7 +231,7 @@ Why the multiple grows vs the Llama table above: the speedup is
 reload grows linearly with KV bytes, and this model carries less than half
 the KV per token. Same physics every vendor's 100k-context headline runs
 on; stated here with the formula instead of hidden behind it. The same
-loopback and single-run disclosures apply as above.
+loopback disclosure applies as above; baselines are n=1 as above.
 
 ### The faster-GPU cells (measured 2026-07-27, NVIDIA A100-SXM4-80GB)
 

@@ -60,23 +60,34 @@ artifact render — can currently falsify or confirm it.
 
 ---
 
-## 2. TTFT, Llama-3.1-8B @16k: 9.1× vs pure recompute (16.2× vs serving-shape recompute)
+## 2. TTFT, Llama-3.1-8B @16k: 10.2× vs pure recompute (10.6× vs serving-shape recompute)
 
 **Claim.** Reloading a 16k-token prefix's KV from kvblockd into a FRESH vLLM
-engine takes **552 ms** vs **5,045 ms** to recompute it with no connector
-installed (9.1×), and vs **8,925 ms** for the connector-on cold arm that
-also pays the synchronous store-on-miss write (16.2×). Full sweep
-(1k/4k/8k/16k): 3.5–9.1× vs pure, 6.6–16.2× vs serving.
+engine takes **497 ms** (median of n=3 independent runs) vs **5,045 ms** to
+recompute it with no connector installed (10.2×), and vs **5,261 ms** for
+the connector-on cold arm that also pays the store-on-miss write (10.6×).
+Full sweep (1k/4k/8k/16k): 3.4–10.2× vs pure, 3.6–10.6× vs serving.
+Supersedes the single-run 552 ms/9.1×/16.2× (2026-07-26) and the
+gathered-slots-wave 576 ms/8.8× n=3 table — the serving-shape column shrank
+because store-on-miss now costs 1.04–1.06× of pure recompute (the cold arm
+got faster, not the reload slower); history stays in BENCHMARKS.md and git.
 
 **Rig + commands.** NVIDIA A10G (HF Jobs `a10g-large`), vLLM 0.25.1, native
-connector `vllm_kvblockd` 0.1.0, bf16, loopback:
+connector `vllm_kvblockd` 0.1.0 — pipelined-slab load path, stamped
+`path=pipelined-slab` in every committed record's `connector` field; the
+gathered-slots store path is attributed in each run's job log, not the
+committed JSONL — bf16, loopback:
 ```
-MODEL=meta-llama/Llama-3.1-8B-Instruct bench/rigs/hf-gpu/submit.sh      # two-phase run
+N=3 MODEL=meta-llama/Llama-3.1-8B-Instruct bench/rigs/hf-gpu/submit-n.sh # 3 independent two-phase runs
 BASELINE_ONLY=1 MODEL=meta-llama/Llama-3.1-8B-Instruct bench/rigs/hf-gpu/submit.sh
-python3 bench/report/plot.py chart2 --in bench/results/rig-e/chart2-ttft-run5.jsonl \
-    bench/results/rig-e/chart2-ttft-baseline.jsonl --out chart2.png
+python3 bench/report/plot.py chart2 \
+    --in bench/results/rig-e/chart2-ttft-a10g-final-run1.jsonl \
+         bench/results/rig-e/chart2-ttft-a10g-final-run2.jsonl \
+         bench/results/rig-e/chart2-ttft-a10g-final-run3.jsonl \
+         bench/results/rig-e/chart2-ttft-baseline.jsonl --out chart2.png
 ```
-Raw JSONL: `bench/results/rig-e/chart2-ttft-{run5,baseline}.jsonl`.
+Raw JSONL: `bench/results/rig-e/chart2-ttft-a10g-final-run{1,2,3}.jsonl`
+plus `chart2-ttft-baseline.jsonl`.
 
 **Definitions.** TTFT = clock start immediately before the streaming request
 is sent, stop at the first SSE event carrying a completion token. **Warm** =
@@ -84,17 +95,18 @@ the exact populated prompt served by a vLLM that was RESTARTED after
 populate, `--no-enable-prefix-caching` in both phases — the KV's only
 possible source is kvblockd over TCP, and claim 5's counter gate proves it
 per rep. **Cold (serving)** = fresh-nonce prompt on the connector-on engine:
-full prefill plus the synchronous store-on-miss write. **Pure recompute** =
-fresh-nonce prompt on a separate engine with NO connector configured.
-p50 of n=5 reps per point, warmup discarded.
+full prefill plus the store-on-miss write. **Pure recompute** = fresh-nonce
+prompt on a separate engine with NO connector configured. p50 of n=5 reps
+per point per run, median across n=3 runs, warmup discarded.
 
 **Disclosed.** The link is loopback — network transfer time ≈ 0; a real NIC
 adds wire time (~0.7 s for the 16k prefix's ~2 GB at 25 GbE — inside the 5 s
-recompute budget, but that number must be measured, not asserted). The table
-is a SINGLE run of 5 reps per point until the pre-registered n≥3 reruns land
-(`bench/rigs/hf-gpu/submit-n.sh`); per-rep values are published in
-`ttft_all_ms`. Quote the conservative "vs pure" column unless the serving
-context is explicit — the 16.2× column includes the miss's store cost.
+recompute budget, but that number must be measured, not asserted). The pure
+baseline is n=1 (rep spread <1%; an n=3 baseline rides the next paid
+session). Cross-run p50 spread is gated at ≤10% by
+`bench/report/aggregate.py`; the worst cell in this table is 7.4% (16k
+warm), per-run values and min/max published in the aggregate output. Quote
+the conservative "vs pure" column unless the serving context is explicit.
 
 **This claim is false if** rendering the committed JSONL yields different
 medians; if a warm rep's `kvb_hits_total` delta did not equal its expected
@@ -105,17 +117,22 @@ that being disclosed next to the number.
 
 ---
 
-## 3. TTFT, Qwen2.5-7B long context: 14.3×/22.6× @16k and 17.2×/25.1× @32k
+## 3. TTFT, Qwen2.5-7B long context: 15.3× @16k and 20.4× @32k (15.7×/20.4× vs serving)
 
 **Claim.** Same harness, same gates, KV-lighter model (56 KiB/token GQA-4)
-at its NATIVE 32k context (no rope scaling, no config overrides): warm
-reload **321 ms vs 4,588 ms** pure recompute @16k (**14.3×**; 22.6× vs
-serving-shape 7,271 ms) and **636 ms vs 10,923 ms** @32k (**17.2×**; 25.1×
-vs 15,998 ms).
+at its NATIVE 32k context (no rope scaling, no config overrides), median of
+n=3 independent runs: warm reload **300 ms vs 4,588 ms** pure recompute
+@16k (**15.3×**; 15.7× vs serving-shape 4,701 ms) and **535 ms vs
+10,923 ms** @32k (**20.4×**; 20.4× vs 10,941 ms — the two ratios agree to
+one decimal from the unrounded medians). Supersedes the single-run
+321/636 ms cells and their 22.6×/25.1× serving-shape columns — the serving
+baseline stopped paying a cache tax (store-on-miss is now 1.00–1.02× on
+this model), which is why "vs serving" collapsed toward "vs pure".
 
 **Rig + commands.** Identical to claim 2 with
 `MODEL=Qwen/Qwen2.5-7B-Instruct LENGTHS=16384,32000`. Raw JSONL:
-`bench/results/rig-e/chart2-ttft-qwen32k{,-baseline}.jsonl`; chart
+`bench/results/rig-e/chart2-ttft-qwen-final-run{1,2,3}.jsonl` plus
+`chart2-ttft-qwen32k-baseline.jsonl`; chart
 `bench/results/rig-e/chart2-qwen32k.png`.
 
 **Definitions.** As claim 2. Why the multiple grows with context: speedup =
@@ -124,11 +141,14 @@ KV bytes, and this model carries less than half the KV per token of
 Llama-3.1-8B. That is the same physics every vendor's 100k-context headline
 runs on — stated with the formula, not hidden behind it.
 
-**Disclosed.** Loopback and single-run, exactly as claim 2. Every warm rep
-passed the exact-count hit gate — 1024 blocks per rep @16k and 1999–2000
-per rep @32k (per-prompt calibration lands within a token, so reps differ
-by one block; the gate is exact against each rep's own measured count, never
-a nominal target) — and every record is path-stamped `chunked-slab`.
+**Disclosed.** Loopback and n=1 pure baseline, exactly as claim 2. Worst
+cross-run p50 spread: 8.6% @16k warm (2.7% @32k), inside the 10% gate.
+Every warm rep passed the exact-count hit gate — 1024 blocks per rep @16k
+and 1999–2000 per rep @32k (per-prompt calibration lands within a token, so
+reps differ by one block; the gate is exact against each rep's own measured
+count, never a nominal target). The load path is stamped
+`path=pipelined-slab` in every committed record; the gathered-slots store
+path is attributed in each run's job log, not the committed JSONL.
 
 **This claim is false if** any condition in claim 2's falsification line
 holds for these files, or if the model config used differs from the stock HF
@@ -203,12 +223,20 @@ check that the harness cannot do this.
 
 ---
 
-## 6. fp8 KV arm — pre-registered disclosure checklist (no headline number yet)
+## 6. fp8 KV arm: 26.4× @32k vs same-dtype recompute — under the pre-registered disclosure checklist
 
-**Status: PRE-REGISTERED.** No fp8 TTFT multiple ships until a measured
-campaign run satisfies every statement below from committed JSONL. The
-planning projections (warm ~350–450 ms @16k, tax ~1.2–1.3×) are sizing
-estimates, never quotable claims. Submission is one command:
+**Status: MEASURED AND CERTIFIED (2026-07-27), against the gate below,
+which was pre-registered before any fp8 measurement existed.** The standing
+rule is unchanged: no fp8 TTFT multiple ships unless a campaign run
+satisfies every statement below from committed JSONL. The measured result,
+n=3 independent runs plus a same-dtype baseline
+(`bench/results/rig-e/chart2-ttft-qwen-fp8-{run1,run2,run3,baseline}.jsonl`,
+Qwen2.5-7B, `kv_cache_dtype=fp8_e4m3`): warm reload **216 ms vs 4,536 ms**
+fp8 recompute @16k (**21.0×**) and **399 ms vs 10,538 ms** @32k
+(**26.4×**), all five witnesses plus the amendment's kernel-determinism
+control satisfied per-run — one prompt in one run was stamped
+kernel-nondeterministic, excluded and disclosed per the amendment; that
+run certified 7/7 gated prompts token-identical. Submission is one command:
 `FP8_CAMPAIGN=1 bench/rigs/hf-gpu/submit.sh` (two jobs: the two-phase
 cold+warm run and the pure-recompute baseline, all under one
 `kv_cache_dtype`).
