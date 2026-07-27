@@ -90,7 +90,7 @@ cd /tmp
 echo "=== box: $(nproc) vCPU, $(free -g | awk "/Mem:/{print \$2}") GiB, $(uname -r) ==="
 
 # --- daemon + ceiling server up for the whole session ---
-KVBLOCKD_DRAM_ARENA_BYTES=6442450944 KVBLOCKD_METRICS_ADDR=127.0.0.1:19442 \
+KVBLOCKD_DRAM_ARENA_BYTES=6442450944 KVBLOCKD_METRICS_ADDR=127.0.0.1:19442 KVBLOCKD_PPROF_ADDR=127.0.0.1:19443 \
   ./kvblockd -listen 127.0.0.1:19440 -namespaces /tmp/ns.yaml 2>/tmp/daemon.log &
 DPID=$!
 ./xferspike -mode server -addr 127.0.0.1:19999 >/dev/null 2>&1 &
@@ -111,7 +111,7 @@ echo "=== G3: allocs profile under a 40s GET storm (15s capture) ==="
 ./getbench -addr 127.0.0.1:19440 -streams 8 -blocks 32 -block-kib 1024 -pool 4096 -secs 40 -noverify >/tmp/storm.log 2>&1 &
 GP=$!
 sleep 5
-curl -s -o /tmp/allocs.pb.gz 'http://127.0.0.1:19442/debug/pprof/allocs?seconds=15'
+curl -sf -o /tmp/allocs.pb.gz 'http://127.0.0.1:19443/debug/pprof/allocs?seconds=15'
 curl -s 'http://127.0.0.1:19442/healthz'; echo " <- healthz"
 wait $GP; tail -1 /tmp/storm.log
 kill -TERM $DPID $SPID 2>/dev/null; sleep 2

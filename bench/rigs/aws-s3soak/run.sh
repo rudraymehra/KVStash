@@ -47,6 +47,7 @@ EOF
 cat > "$BINS/s3soak-daemon.yaml" <<'EOF'
 listen_addr: "127.0.0.1:9440"
 metrics_addr: "127.0.0.1:9442"
+pprof_addr: "127.0.0.1:9443"
 dram_arena_bytes: 6442450944   # 6 GiB (room for MinIO on the 16 GiB box)
 dram_hugepages: true
 pinned_bytes_cap: 268435456
@@ -139,8 +140,8 @@ nohup bash -c '
   for h in $(seq 1 26); do
     sleep 3600
     ts=$(date -u +%Y%m%dT%H%M)
-    curl -s -o /var/soakout/heap-$ts.pb.gz  "http://127.0.0.1:9442/debug/pprof/heap" || true
-    curl -s -o /var/soakout/goro-$ts.txt "http://127.0.0.1:9442/debug/pprof/goroutine?debug=1" || true
+    curl -sf -o /var/soakout/heap-$ts.pb.gz  "http://127.0.0.1:9443/debug/pprof/heap" || true
+    curl -sf -o /var/soakout/goro-$ts.txt "http://127.0.0.1:9443/debug/pprof/goroutine?debug=1" || true
     curl -s "http://127.0.0.1:9442/metrics" | grep -E "^(kvb_|go_goroutines|process_resident)" > /var/soakout/metrics-$ts.txt || true
     ps -o rss= -p $(cat /var/soakout/daemon.pid) >> /var/soakout/rss.log || true
     du -sb /var/minio-data >> /var/soakout/minio-usage.log || true

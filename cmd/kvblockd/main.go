@@ -276,12 +276,9 @@ func run() (err error) {
 		fmt.Fprintln(os.Stderr, "kvblockd: admin on", aBound)
 	}
 	if cfg.MetricsAddr != "" {
-		if host, _, herr := net.SplitHostPort(cfg.MetricsAddr); herr == nil {
-			if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
-				fmt.Fprintln(os.Stderr, "kvblockd: WARNING: metrics_addr", cfg.MetricsAddr,
-					"is not loopback — /debug/pprof (heap, CPU, cmdline) is exposed unauthenticated on it")
-			}
-		}
+		// A wide metrics bind is fine now: the ops mux carries only
+		// /metrics and /healthz — pprof lives on its own loopback-enforced
+		// listener below.
 		bound, wait, serr := set.Serve(ctx, cfg.MetricsAddr)
 		if serr != nil {
 			return fmt.Errorf("metrics endpoint: %w", serr)
@@ -291,6 +288,17 @@ func run() (err error) {
 		// deadlocks in wait() with nothing ever cancelling ctx.
 		cleanup.push(func() { stop(); wait() })
 		fmt.Fprintln(os.Stderr, "kvblockd: metrics on", bound)
+	}
+
+	// pprof surface (loopback-enforced, same trust boundary as admin):
+	// remote captures tunnel in via ssh -L / kubectl port-forward.
+	if cfg.PprofAddr != "" {
+		pBound, pWait, pErr := set.ServePprof(ctx, cfg.PprofAddr)
+		if pErr != nil {
+			return fmt.Errorf("pprof endpoint: %w", pErr)
+		}
+		cleanup.push(func() { stop(); pWait() })
+		fmt.Fprintln(os.Stderr, "kvblockd: pprof on", pBound)
 	}
 
 	// S3-compat endpoint (s3compat_addr set): the NIXL obj / vLLM obj
@@ -327,6 +335,15 @@ func run() (err error) {
 		fmt.Fprintln(os.Stderr, "kvblockd: s3compat on", bound)
 	}
 
+	// The data plane speaks plaintext KVB1 with bearer-token auth — the same
+	// cleartext posture the s3compat warning names. Loud, not fatal: k8s and
+	// multi-host rigs legitimately bind wide inside a trusted perimeter.
+	if host, _, herr := net.SplitHostPort(cfg.ListenAddr); herr == nil {
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			fmt.Fprintln(os.Stderr, "kvblockd: WARNING: listen_addr", cfg.ListenAddr,
+				"is not loopback — namespace tokens and block bytes cross it in cleartext; keep it on a private network (and replace any demo-token namespace before exposing it)")
+		}
+	}
 	if _, serr := srv.Start(ctx); serr != nil {
 		return serr
 	}

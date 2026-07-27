@@ -3,9 +3,10 @@
 # --config at all) yields exactly this configuration. Byte sizes are plain
 # integers; the arithmetic lives in the comments.
 
-listen_addr: ":9440"          # data plane (KVB1 frames)
+listen_addr: ":9440"          # data plane (KVB1 frames); plaintext + bearer tokens — the daemon warns on a non-loopback bind, keep it on a private network
 admin_addr: "127.0.0.1:9441"  # ops plane (namespace add / quota set); loopback ONLY — a non-loopback address is refused at startup
-metrics_addr: "127.0.0.1:9442" # ops endpoint: /metrics, /healthz, /debug/pprof ("" = disabled)
+metrics_addr: "127.0.0.1:9442" # ops endpoint: /metrics, /healthz ("" = disabled)
+pprof_addr: ""                # /debug/pprof on its own listener; loopback ONLY (refused otherwise), "" = disabled — tunnel in for remote captures
 s3compat_addr: ""             # S3-subset endpoint for NIXL obj / vLLM obj (bucket = namespace, bearer auth); "" = disabled (e.g. "127.0.0.1:9500")
 
 max_conns: 1024               # global accept cap (cheap DoS floor)

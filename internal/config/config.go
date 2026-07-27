@@ -27,12 +27,16 @@ import (
 type Config struct {
 	// ListenAddr is the data-plane TCP listener ("host:port").
 	ListenAddr string `yaml:"listen_addr"`
-	// MetricsAddr serves the ops endpoint (/metrics, /healthz, /debug/pprof);
-	// empty disables it. AdminAddr serves the namespace/quota admin surface —
+	// MetricsAddr serves the ops endpoint (/metrics, /healthz); empty
+	// disables it. AdminAddr serves the namespace/quota admin surface —
 	// LOOPBACK ONLY (enforced at bind: shell trust, same boundary as editing
-	// the namespaces file); empty disables it.
+	// the namespaces file); empty disables it. PprofAddr serves /debug/pprof
+	// on its own listener — LOOPBACK ONLY like the admin surface (profiling
+	// hands the caller stop-the-world captures and heap/cmdline recon; a
+	// remote profiler tunnels in); empty (the default) disables it.
 	AdminAddr   string `yaml:"admin_addr"`
 	MetricsAddr string `yaml:"metrics_addr"`
+	PprofAddr   string `yaml:"pprof_addr"`
 	// S3CompatAddr serves the S3-subset endpoint (PutObject/GetObject/
 	// HeadObject; bucket = namespace, bearer-token auth — see
 	// internal/server/s3compat.go). Empty (the default) disables it.
@@ -200,6 +204,7 @@ var envTable = []struct {
 }{
 	{"KVBLOCKD_LISTEN_ADDR", func(c *Config, v string) error { c.ListenAddr = v; return nil }},
 	{"KVBLOCKD_METRICS_ADDR", func(c *Config, v string) error { c.MetricsAddr = v; return nil }},
+	{"KVBLOCKD_PPROF_ADDR", func(c *Config, v string) error { c.PprofAddr = v; return nil }},
 	{"KVBLOCKD_S3COMPAT_ADDR", func(c *Config, v string) error { c.S3CompatAddr = v; return nil }},
 	{"KVBLOCKD_NAMESPACES", func(c *Config, v string) error { c.NamespacesPath = v; return nil }},
 	{"KVBLOCKD_MAX_CONNS", func(c *Config, v string) error {
@@ -340,6 +345,7 @@ func (c Config) Validate() error {
 		{"listen_addr", c.ListenAddr},
 		{"admin_addr", c.AdminAddr},
 		{"metrics_addr", c.MetricsAddr},
+		{"pprof_addr", c.PprofAddr},
 		{"s3compat_addr", c.S3CompatAddr},
 	} {
 		if a.addr == "" {

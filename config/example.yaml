@@ -5,8 +5,11 @@
 # ceilings) lives at internal/config/example.yaml and in
 # docs/deployment-guide.md.
 
-listen_addr: ":9440"           # data plane (KVB1 frames)
-metrics_addr: "127.0.0.1:9442" # /metrics, /healthz, /debug/pprof
+# Loopback by default: the wire is plaintext KVB1 with bearer tokens, so a
+# wider bind belongs on a private network (the daemon warns if you widen it).
+listen_addr: "127.0.0.1:9440"  # data plane (KVB1 frames)
+metrics_addr: "127.0.0.1:9442" # /metrics, /healthz
+# pprof_addr: "127.0.0.1:9443" # /debug/pprof — loopback only (enforced); off by default
 
 # The hot tier: one mmap'd arena outside the Go heap. Size it to the KV
 # blocks you want resident; 1 GiB is a laptop demo, production runs 10s-100s

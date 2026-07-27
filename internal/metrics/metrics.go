@@ -1,7 +1,10 @@
 // Package metrics is the daemon's observability surface: a dedicated
 // Prometheus registry carrying the kvb_* instrument set, and the ops HTTP
-// endpoint mounting /metrics, /healthz (503 until the daemon is ready), and
-// /debug/pprof — the zero-alloc proof's capture point.
+// endpoint mounting /metrics and /healthz (503 until the daemon is ready).
+// /debug/pprof — the zero-alloc proof's capture point — lives on its OWN
+// loopback-enforced listener (ServePprof), never on the scrape port: the
+// scrape port must be reachable by a Prometheus fleet, and pprof handlers
+// hand any caller stop-the-world profiling plus heap/cmdline recon.
 //
 // The store stays decoupled: tier gauges are read at scrape time from the
 // store's Stats() JSON document (the same document the wire STATS verb
@@ -12,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -421,8 +425,10 @@ func (c *storeCollector) Collect(ch chan<- prometheus.Metric) {
 // ---------------------------------------------------------------------------
 // The ops HTTP endpoint.
 
-// Handler mounts /metrics, /healthz, and /debug/pprof on a fresh mux (never
-// http.DefaultServeMux — nothing else leaks onto the ops port).
+// Handler mounts /metrics and /healthz on a fresh mux (never
+// http.DefaultServeMux — nothing else leaks onto the ops port). pprof is
+// deliberately NOT here: the scrape port is often cluster-reachable, and
+// pprof on it hands any pod DoS-grade profiling — see PprofHandler.
 func (s *Set) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(s.reg, promhttp.HandlerOpts{}))
@@ -433,6 +439,15 @@ func (s *Set) Handler() http.Handler {
 		}
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	return mux
+}
+
+// PprofHandler mounts the /debug/pprof suite on its own fresh mux, for the
+// dedicated loopback listener (ServePprof). Remote profiling goes through a
+// tunnel (ssh -L / kubectl port-forward) — the same trust boundary as the
+// admin surface.
+func (s *Set) PprofHandler() http.Handler {
+	mux := http.NewServeMux()
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
@@ -447,11 +462,33 @@ func (s *Set) Handler() http.Handler {
 // func BLOCKS until shutdown completes — shutdown itself is driven only by
 // the ctx cancel, so cancel before waiting.
 func (s *Set) Serve(ctx context.Context, addr string) (bound string, wait func(), err error) {
+	return s.serve(ctx, addr, s.Handler(), "ops")
+}
+
+// ServePprof runs the /debug/pprof listener with the same lifecycle as
+// Serve, loopback enforced at bind (same boundary as the admin surface):
+// profiling is shell-trust — a remote profiler tunnels in, it is never
+// offered to the network.
+func (s *Set) ServePprof(ctx context.Context, addr string) (bound string, wait func(), err error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", nil, fmt.Errorf("pprof_addr %q: %w", addr, err)
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		return "", nil, fmt.Errorf("pprof_addr %q must be a loopback IP literal (127.0.0.1 / [::1]) — profiling is shell-trust only (tunnel in for remote captures)", addr)
+	}
+	return s.serve(ctx, addr, s.PprofHandler(), "pprof")
+}
+
+// surface names the listener in the death log; only the ops surface flips
+// kvb_ops_serve_failed (its help text promises the SCRAPE endpoint is gone
+// — a dead loopback pprof listener must not fire that alert).
+func (s *Set) serve(ctx context.Context, addr string, h http.Handler, surface string) (bound string, wait func(), err error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return "", nil, err
 	}
-	srv := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -460,8 +497,10 @@ func (s *Set) Serve(ctx context.Context, addr string) (bound string, wait func()
 			// but never SILENTLY: /metrics and /healthz vanishing looks
 			// identical to the daemon being down. Log it and flip the gauge
 			// so the LAST successful scrape carries the hint.
-			slog.Error("metrics: ops endpoint accept loop died", "addr", addr, "err", serr)
-			s.serveFailed.Set(1)
+			slog.Error("metrics: "+surface+" endpoint accept loop died", "addr", addr, "err", serr)
+			if surface == "ops" {
+				s.serveFailed.Set(1)
+			}
 		}
 	}()
 	go func() { //nolint:gosec // G118: shutdown must outlive the cancelled ctx; the fresh timeout context is the point

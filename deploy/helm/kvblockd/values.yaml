@@ -14,7 +14,9 @@ replicaCount: 1
 image:
   repository: ghcr.io/rudraymehra/kvblockd
   # Defaults to the chart appVersion. The image is FROM scratch: no shell,
-  # ca-certificates baked in for the S3 tier's TLS.
+  # ca-certificates baked in for the S3 tier's TLS. The ghcr package must be
+  # public (or reachable via imagePullSecrets) — a private package fails the
+  # pull with "unauthorized", which kubelet reports as ImagePullBackOff.
   tag: ""
   pullPolicy: IfNotPresent
 
@@ -25,7 +27,7 @@ fullnameOverride: ""
 service:
   type: ClusterIP
   dataPort: 9440    # KVB1 frames (never expose to the internet — same-AZ/VPC only)
-  metricsPort: 9442 # /metrics, /healthz, /debug/pprof
+  metricsPort: 9442 # /metrics, /healthz (pprof is a separate loopback-only listener, off by default — `kubectl port-forward` + pprof_addr to profile a pod)
 
 serviceAccount:
   create: true

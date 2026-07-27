@@ -78,9 +78,33 @@ func TestEndpointAndReadiness(t *testing.T) {
 		t.Error("DRAM-only scrape leaked nvme families")
 	}
 
-	// /debug/pprof reachable (the zero-alloc proof's capture point).
+	// /debug/pprof must NOT ride the scrape port — it hands any caller
+	// stop-the-world profiling; it lives on its own loopback listener.
+	if code := httpCode(t, addr, "/debug/pprof/"); code != http.StatusNotFound {
+		t.Fatalf("pprof on the scrape port: %d (want 404)", code)
+	}
+}
+
+// TestPprofSeparateListener: the pprof suite serves from its own listener
+// (the zero-alloc proof's capture point), and that listener refuses any
+// non-loopback bind — the admin surface's trust boundary.
+func TestPprofSeparateListener(t *testing.T) {
+	set := New(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, wait, err := set.ServePprof(ctx, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); wait() }()
 	if code := httpCode(t, addr, "/debug/pprof/"); code != http.StatusOK {
-		t.Fatalf("pprof index: %d", code)
+		t.Fatalf("pprof index on dedicated listener: %d", code)
+	}
+	// And nothing else leaks onto it.
+	if code := httpCode(t, addr, "/metrics"); code != http.StatusNotFound {
+		t.Fatalf("metrics on the pprof listener: %d (want 404)", code)
+	}
+	if _, _, err := set.ServePprof(ctx, "0.0.0.0:0"); err == nil {
+		t.Fatal("non-loopback pprof bind accepted")
 	}
 }
 

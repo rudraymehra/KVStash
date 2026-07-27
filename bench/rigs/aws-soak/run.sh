@@ -39,6 +39,7 @@ EOF
 cat > "$BINS/soak-daemon.yaml" <<'EOF'
 listen_addr: "127.0.0.1:9440"
 metrics_addr: "127.0.0.1:9442"
+pprof_addr: "127.0.0.1:9443"
 dram_arena_bytes: 8589934592   # 8 GiB
 dram_hugepages: true
 pinned_bytes_cap: 268435456    # 256 MiB per ns
@@ -99,8 +100,8 @@ nohup bash -c '
   for h in $(seq 1 26); do
     sleep 3600
     ts=$(date -u +%Y%m%dT%H%M)
-    curl -s -o /tmp/soakout/heap-$ts.pb.gz  "http://127.0.0.1:9442/debug/pprof/heap" || true
-    curl -s -o /tmp/soakout/goro-$ts.txt "http://127.0.0.1:9442/debug/pprof/goroutine?debug=1" || true
+    curl -sf -o /tmp/soakout/heap-$ts.pb.gz  "http://127.0.0.1:9443/debug/pprof/heap" || true
+    curl -sf -o /tmp/soakout/goro-$ts.txt "http://127.0.0.1:9443/debug/pprof/goroutine?debug=1" || true
     curl -s "http://127.0.0.1:9442/metrics" | grep -E "^(kvb_|go_goroutines|process_resident)" > /tmp/soakout/metrics-$ts.txt || true
     ps -o rss= -p $(cat /tmp/soakout/daemon.pid) >> /tmp/soakout/rss.log || true
   done' > /dev/null 2>&1 &
