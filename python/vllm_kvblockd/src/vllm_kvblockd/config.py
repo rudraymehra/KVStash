@@ -52,7 +52,34 @@ WIRE_KEY_LEN = 32
 # import — the connector imports it and packs it into every blob prefix.
 # Bumping it forks the keyspace (clean misses) AND fails the prefix decode
 # of old blobs; both degrade to recompute, never to a wrong byte.
-BLOB_VERSION = 1
+# v2 (item 6 keystone): one pad byte became codec_id — every v1 reader
+# rejects v2 blobs (and vice versa) as a clean miss, never a misread field.
+# The orphaning is deliberate and paid NOW, before any fleet is large.
+BLOB_VERSION = 2
+
+# Resolved KV-cache dtypes the connector can serve CORRECTLY. The store path
+# is a raw uint8 page copy with no scale metadata in the blob: any dtype
+# whose numeric meaning lives partly in auxiliary buffers OUTSIDE the paged
+# block (per-token int8 scales, fp8_inc, fp8_ds_mla, ...) would round-trip
+# its payload bytes but not its VALUE — refused at boot, never served wrong.
+# float32 stays in per the skeptic: the CPU rigs (bench/e2e/cpu) resolve
+# auto -> a float32 model dtype and must keep booting.
+KV_CACHE_DTYPE_ALLOW = frozenset(
+    {"float32", "float16", "bfloat16", "fp8_e4m3", "fp8_e5m2"})
+
+# Alias table, applied BEFORE fingerprinting: vLLM spells the same e4m3 KV
+# cache both 'fp8' and 'fp8_e4m3' (the bare alias resolves to e4m3 on CUDA).
+# Unnormalized, identical semantics minted DISJOINT keyspaces — a 100%-miss
+# footgun, not tenancy. An existing 'fp8' fleet re-keys once when this
+# lands: clean misses (write-once cache repopulates), never a wrong byte.
+KV_CACHE_DTYPE_ALIASES = {"fp8": "fp8_e4m3"}
+
+
+def normalize_kv_cache_dtype(name: object) -> str:
+    """Canonical resolved kv-cache dtype: torch. prefix stripped, aliases
+    collapsed (fp8 == fp8_e4m3). One semantic, one keyspace."""
+    n = str(name).replace("torch.", "")
+    return KV_CACHE_DTYPE_ALIASES.get(n, n)
 
 
 def _lp(b: bytes) -> bytes:
@@ -162,6 +189,7 @@ class AdapterConfig:
         "async_lookup",
         "async_store",
         "block_size",
+        "codec",
         "connect_timeout",
         "dtype",
         "fingerprint",
@@ -352,6 +380,14 @@ class AdapterConfig:
                 f"kvblockd_store_dedupe_keys must be >= 0, got {c.store_dedupe_keys}")
         c.store_dedupe_ttl_s = float(
             get_extra_config(ktc, "kvblockd_store_dedupe_ttl_s", 30.0))
+        # Blob codec this connector encodes/decodes. Only "raw" exists: the
+        # blob-prefix codec FIELD is forward compat (item 6 keystone), and
+        # every non-raw codec is refused at boot until its serde lands BEHIND
+        # the pre-registered lossy quality gate — validated below, once the
+        # resolved KV dtype is known (codec + engine-fp8 stacking has its own
+        # refusal). Codec identity deliberately never enters key derivation:
+        # split fleets are a namespace concern, not a keyspace one.
+        c.codec = str(get_extra_config(ktc, "kvblockd_codec", "raw") or "raw")
 
         cache = getattr(vllm_config, "cache_config", None)
         c.block_size = int(getattr(cache, "block_size", 16) or 16)
@@ -363,10 +399,58 @@ class AdapterConfig:
         # Without this field a bf16-KV and an fp8-KV engine over the same
         # model dtype mint IDENTICAL keys and cross-serve blobs whose 32B
         # prefix only rejects them at load time (permanent silent miss storm).
-        kv_dtype = str(getattr(cache, "cache_dtype", "auto") or "auto").replace("torch.", "")
+        # Alias-normalized ('fp8' == 'fp8_e4m3') so one semantic mints ONE
+        # keyspace, then allowlisted: a dtype we cannot round-trip VALUES for
+        # is a boot refusal, never a quiet fallback.
+        kv_dtype = normalize_kv_cache_dtype(getattr(cache, "cache_dtype", "auto") or "auto")
         if kv_dtype in ("auto", ""):
-            kv_dtype = str(getattr(model, "dtype", "auto")).replace("torch.", "")
+            kv_dtype = normalize_kv_cache_dtype(getattr(model, "dtype", "auto"))
         c.kv_cache_dtype = kv_dtype
+        if kv_dtype not in KV_CACHE_DTYPE_ALLOW:
+            raise ValueError(
+                f"kvblockd connector: kv_cache_dtype={kv_dtype!r} is unsupported — "
+                "the connector stores raw paged-block bytes with NO scale metadata "
+                "in the blob, so a dtype whose scales live in auxiliary buffers "
+                "(per-token int8, fp8_inc, fp8_ds_mla, ...) would round-trip its "
+                "bytes but not its values: silent numeric corruption on reload. "
+                f"Supported (resolved) dtypes: {sorted(KV_CACHE_DTYPE_ALLOW)}; "
+                "'fp8' is accepted as an alias of fp8_e4m3."
+            )
+        # Refuse calculate_kv_scales outright (same posture as the world_size
+        # guard below): vLLM derives those fp8 scales from the FIRST forward
+        # pass and bakes them into the page bytes with no scale metadata in
+        # the blob — two engine boots then produce byte-INCOMPATIBLE blobs
+        # under IDENTICAL keys, and the blob prefix is shape-symmetric, so
+        # nothing downstream can catch it. Static scales (vLLM's default
+        # scale=1.0, or scales shipped in the checkpoint) are deterministic
+        # per config and remain supported.
+        if bool(getattr(cache, "calculate_kv_scales", False)):
+            raise ValueError(
+                "kvblockd connector: calculate_kv_scales=True is unsupported — "
+                "first-forward-pass-derived KV scales bake into the page bytes "
+                "with no scale metadata in the blob, so blocks stored by one "
+                "engine boot are byte-incompatible with the next boot under "
+                "IDENTICAL keys (silent numeric corruption no prefix check can "
+                "see). Use vLLM's static scales (the default scale=1.0, or "
+                "checkpoint-provided scales) with kv-cache dtype fp8_e4m3/"
+                "fp8_e5m2 instead."
+            )
+        # Codec refusals need the resolved dtype (stacking check first so the
+        # fp8+codec combination names ITS reason, not the generic one).
+        if c.codec != "raw":
+            if kv_dtype.startswith("fp8"):
+                raise ValueError(
+                    f"kvblockd connector: kvblockd_codec={c.codec!r} on top of an "
+                    f"fp8 engine KV cache (kv_cache_dtype={kv_dtype}) is refused: "
+                    "double quantization is unvalidated anywhere — pick ONE of "
+                    "engine fp8 KV or a lossy blob codec, never both."
+                )
+            raise ValueError(
+                f"kvblockd connector: kvblockd_codec={c.codec!r} is not available — "
+                "no codec serde has landed; lossy codecs ship only behind the "
+                "pre-registered quality gate (docs/CLAIMS.md, 'Codec quality "
+                "gate' section). Only 'raw' is valid today."
+            )
         # Tokenizer identity: the same model path served through two different
         # tokenizers yields different token-id streams — same ids, different
         # text. vLLM's ModelConfig exposes .tokenizer (defaults to the model
@@ -482,6 +566,8 @@ def require_pinned_hashseed() -> None:
 
 __all__ = [
     "BLOB_VERSION",
+    "KV_CACHE_DTYPE_ALIASES",
+    "KV_CACHE_DTYPE_ALLOW",
     "WIRE_KEY_LEN",
     "AdapterConfig",
     "DeterminismError",
@@ -489,6 +575,7 @@ __all__ = [
     "chain_seed",
     "fingerprint",
     "get_extra_config",
+    "normalize_kv_cache_dtype",
     "parse_endpoint",
     "require_pinned_hashseed",
     "tier_fingerprint_fields",

@@ -6,6 +6,7 @@ never a refactor. One vector is ALSO recomputed from first principles
 from __future__ import annotations
 
 import json
+import re
 import struct
 from pathlib import Path
 from typing import ClassVar
@@ -239,11 +240,13 @@ def test_tier_fields_resolve_auto_dtype_and_fold_groups():
 
 
 def _vc(cache_dtype="auto", model_dtype="torch.bfloat16", tokenizer=None,
-        tokenizer_revision=None, revision=None, model="facebook/opt-125m"):
+        tokenizer_revision=None, revision=None, model="facebook/opt-125m",
+        calculate_kv_scales=None, extra=None):
     """Stub VllmConfig with the knobs the fingerprint-completion tests turn."""
 
     class KTC:
-        kv_connector_extra_config: ClassVar[dict] = {"kvblockd_token": "t"}
+        kv_connector_extra_config: ClassVar[dict] = {"kvblockd_token": "t",
+                                                     **(extra or {})}
 
         def get_from_extra_config(self, key, default):
             return self.kv_connector_extra_config.get(key, default)
@@ -256,9 +259,13 @@ def _vc(cache_dtype="auto", model_dtype="torch.bfloat16", tokenizer=None,
     if revision is not None:
         mattrs["revision"] = revision
 
+    cattrs = {"block_size": 16, "cache_dtype": cache_dtype}
+    if calculate_kv_scales is not None:
+        cattrs["calculate_kv_scales"] = calculate_kv_scales
+
     class VC:
         kv_transfer_config = KTC()
-        cache_config = type("C", (), {"block_size": 16, "cache_dtype": cache_dtype})()
+        cache_config = type("C", (), cattrs)()
         model_config = type("M", (), mattrs)()
         parallel_config = type("P", (), {"world_size": 1})()
 
@@ -278,6 +285,97 @@ def test_fingerprint_folds_resolved_kv_cache_dtype():
     # ...and auto == the dtype it resolves to: one identity, not two.
     explicit = AdapterConfig.from_vllm_config(_vc(cache_dtype="bfloat16"))
     assert auto.fingerprint == explicit.fingerprint
+
+
+def test_fp8_alias_normalized_before_fingerprinting():
+    """'fp8' and 'fp8_e4m3' are the SAME e4m3 KV cache in vLLM (the bare
+    alias resolves to e4m3 on CUDA). Before the alias table they minted
+    DISJOINT keyspaces — two fleets with identical semantics that never share
+    one block, a 100%-miss footgun with zero errors."""
+    alias = AdapterConfig.from_vllm_config(_vc(cache_dtype="fp8"))
+    canon = AdapterConfig.from_vllm_config(_vc(cache_dtype="fp8_e4m3"))
+    assert alias.kv_cache_dtype == "fp8_e4m3"  # one canonical spelling
+    assert alias.fingerprint == canon.fingerprint
+    # e5m2 stays its own identity: different byte semantics, different keys.
+    e5m2 = AdapterConfig.from_vllm_config(_vc(cache_dtype="fp8_e5m2"))
+    assert e5m2.fingerprint != canon.fingerprint
+
+
+def test_kv_cache_dtype_allowlist_refuses_scale_carrying_dtypes():
+    """The connector's store path is a raw uint8 page copy: a dtype whose
+    numeric meaning lives partly in auxiliary scale buffers (per-token int8,
+    fp8_inc, fp8_ds_mla, ...) would round-trip its payload bytes but not its
+    VALUE. Refused loudly at boot, never served wrong."""
+    for bad in ("int8", "fp8_inc", "fp8_ds_mla"):
+        with pytest.raises(ValueError, match="kv_cache_dtype"):
+            AdapterConfig.from_vllm_config(_vc(cache_dtype=bad))
+    # The full supported set boots: float32 kept per the skeptic — the CPU
+    # rigs (bench/e2e/cpu) resolve auto -> float32 model dtype.
+    for ok in ("auto", "float16", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"):
+        AdapterConfig.from_vllm_config(_vc(cache_dtype=ok))
+    cpu = AdapterConfig.from_vllm_config(
+        _vc(cache_dtype="auto", model_dtype="torch.float32"))
+    assert cpu.kv_cache_dtype == "float32"
+
+
+def test_calculate_kv_scales_refused_at_boot():
+    """calculate_kv_scales derives fp8 scales from the FIRST forward pass and
+    bakes them into the page bytes with no scale metadata in the blob — two
+    engine boots then produce byte-INCOMPATIBLE blobs under IDENTICAL keys,
+    invisible to the shape-symmetric blob prefix. Refuse at CONFIG time
+    (same posture as the world_size guard), never fall back quietly."""
+    with pytest.raises(ValueError, match="calculate_kv_scales"):
+        AdapterConfig.from_vllm_config(
+            _vc(cache_dtype="fp8_e4m3", calculate_kv_scales=True))
+    # vLLM's default (False, static scale=1.0 / checkpoint scales) boots.
+    cfg = AdapterConfig.from_vllm_config(
+        _vc(cache_dtype="fp8_e4m3", calculate_kv_scales=False))
+    assert cfg.kv_cache_dtype == "fp8_e4m3"
+
+
+def test_codec_knob_defaults_raw_and_refuses_everything_else():
+    """Item 6 keystone: the blob-prefix codec FIELD exists for forward compat,
+    but no codec serde has landed — every non-raw codec is refused at boot
+    (behind the pre-registered lossy quality gate, not before it), and codec +
+    engine-fp8 stacking is refused with its OWN reason (double quantization is
+    unvalidated anywhere). Codec identity must never enter key derivation."""
+    cfg = AdapterConfig.from_vllm_config(_vc())
+    assert cfg.codec == "raw"
+    # The knob never partitions the keyspace (namespaces are the tool).
+    assert cfg.fingerprint == AdapterConfig.from_vllm_config(
+        _vc(extra={"kvblockd_codec": "raw"})).fingerprint
+    with pytest.raises(ValueError, match="quality gate"):
+        AdapterConfig.from_vllm_config(_vc(extra={"kvblockd_codec": "fp8-cast"}))
+    with pytest.raises(ValueError, match="double quantization"):
+        AdapterConfig.from_vllm_config(
+            _vc(cache_dtype="fp8_e4m3", extra={"kvblockd_codec": "fp8-cast"}))
+
+
+def test_codec_refusal_cites_a_quality_gate_that_actually_exists():
+    """The non-raw-codec refusal points the operator at the pre-registered
+    codec quality gate in docs/CLAIMS.md. A pointer to a section that does
+    not exist is a broken promise — the honesty story depends on the gate
+    being written down BEFORE any codec measurement, so assert the cited
+    section exists and pre-registers the load-bearing conditions: fixed
+    prompt set, deterministic exact-match scoring with no LLM judge, a pass
+    threshold at 16k and 32k, and lossy arms as separately-labeled rows."""
+    claims = Path(__file__).resolve().parents[3] / "docs" / "CLAIMS.md"
+    assert claims.is_file(), f"refusal message cites {claims}, which is missing"
+    text = claims.read_text(encoding="utf-8")
+    assert re.search(r"^##.*Codec quality gate", text, re.MULTILINE), (
+        "docs/CLAIMS.md has no 'Codec quality gate' section, but the codec "
+        "refusal message cites one")
+    for needle in (
+        "Fixed prompt set",
+        "exact-match",
+        "NO LLM judge",
+        "16384",
+        "32768",
+        "separately-labeled rows",
+    ):
+        assert needle in text, (
+            f"codec quality gate in docs/CLAIMS.md lost its pre-registered "
+            f"condition: {needle!r}")
 
 
 def test_fingerprint_folds_tokenizer_identity():

@@ -203,5 +203,104 @@ check that the harness cannot do this.
 
 ---
 
+## 6. fp8 KV arm — pre-registered disclosure checklist (no headline number yet)
+
+**Status: PRE-REGISTERED.** No fp8 TTFT multiple ships until a measured
+campaign run satisfies every statement below from committed JSONL. The
+planning projections (warm ~350–450 ms @16k, tax ~1.2–1.3×) are sizing
+estimates, never quotable claims. Submission is one command:
+`FP8_CAMPAIGN=1 bench/rigs/hf-gpu/submit.sh` (two jobs: the two-phase
+cold+warm run and the pure-recompute baseline, all under one
+`kv_cache_dtype`).
+
+**The five statements every published fp8 number must carry** — each names
+its machine-checkable witness, greppable from the run's own artifacts:
+
+1. **Static scales, worst case.** The run used vLLM's static fp8 scale path
+   (scale=1.0 default, or checkpoint-provided scales) — the conservative
+   configuration for the cited accuracy. `calculate_kv_scales` is REFUSED at
+   connector boot: first-forward-pass-derived scales bake into the page
+   bytes with no scale metadata in the blob, so two boots would produce
+   byte-incompatible blobs under identical keys. *Witness:* the engine boots
+   at all (`tests/test_config.py::test_calculate_kv_scales_refused_at_boot`
+   is the executable form), plus the `kv_cache_dtype` stamp on every record.
+2. **Accuracy cited, not remeasured.** fp8-e4m3 KV-cache model quality is
+   vLLM's published accuracy campaign's result, cited as such; this repo
+   proves BYTE and TOKEN fidelity of the store, not model quality. e4m3 is
+   the default because that campaign backs it.
+3. **Key isolation by fingerprint.** fp8 and bf16 blobs can never
+   cross-serve: the resolved kv-cache dtype folds into the config
+   fingerprint, alias-normalized (`fp8` == `fp8_e4m3`) so one semantic mints
+   exactly one keyspace. *Witness:*
+   `tests/test_config.py::test_fp8_alias_normalized_before_fingerprinting`.
+4. **Same-dtype arms, fresh stores.** All three chart arms — baseline (no
+   connector), cold (connector, store-on-miss), warm (kvblockd reload) — ran
+   the same `kv_cache_dtype`, each job against its own fresh daemon, so the
+   multiple measures the store and never the quantizer. *Witness:* the
+   `kv_cache_dtype` stamp on every JSONL record; `bench/report/plot.py` and
+   `bench/report/aggregate.py` REFUSE mixed-dtype inputs outright.
+5. **Machine-checked token identity, fp8-vs-fp8.** `bench/e2e/equivalence.py`
+   runs around the same engine restart (greedy decode, batch=1
+   `--max-num-seqs 1`, hard fail before anything is measured); every record
+   carries `equivalence_scope: "fp8-vs-fp8 (...)"`, and the compare phase
+   REFUSES a state/engine dtype mismatch — "fp8 outputs match bf16
+   recompute" is a claim the harness cannot emit. *Witness:* the
+   `token_identity` stamp in the TTFT JSONL and the run's EQUIVJSONL
+   records.
+
+**Load-bearing phrasing rule.** The fp8 multiple is NEVER phrased "vs bf16
+recompute". It is fp8-warm vs fp8-recompute — a store claim inside vLLM's
+own fp8 KV mode, with that mode's (cited) accuracy trade owned by the
+engine, not hidden inside our speedup.
+
+**This section is violated if** an fp8 number appears anywhere without all
+five witnesses in its committed artifacts, or phrased against a bf16 arm —
+that number comes down before any fix goes up.
+
+---
+
+## 7. Codec quality gate — pre-registered (no codec has landed)
+
+**Status: PRE-REGISTERED, registered before any codec measurement exists.**
+The blob prefix carries a codec field for forward compatibility, but only
+`codec=raw` (bit-exact bytes) is valid today: the connector REFUSES every
+non-raw `kvblockd_codec` at boot and cites this section (*witness:*
+`tests/test_config.py::test_codec_knob_defaults_raw_and_refuses_everything_else`).
+No lossy codec serde merges — let alone publishes a number — until it passes
+every condition below, all fixed in advance so the gate cannot drift toward
+whatever the codec happens to score:
+
+1. **Fixed prompt set.** A committed, checksummed prompt file
+   (RULER/needle-in-a-haystack style retrieval prompts) at context lengths
+   16384 and 32768, run on the existing two-phase rig
+   (`bench/rigs/hf-gpu/`). The set is frozen when the harness lands —
+   changing it after a codec has been measured voids the gate.
+2. **Deterministic exact-match scoring, NO LLM judge.** Greedy decode,
+   batch=1 (`--max-num-seqs 1`), pinned seeds; a prompt scores 1 iff the
+   generated answer string exactly matches the expected needle, else 0.
+   Nothing subjective, nothing model-graded, nothing a rerun can move.
+3. **Pre-registered pass threshold.** At EACH length (16k and 32k
+   separately): the codec arm's exact-match score must be within
+   **2 percentage points absolute** of the raw arm's score from the same
+   run, same prompt set, same engine config. Registered now, before any
+   codec bytes exist; if a future codec needs a looser bar, that is a FAIL,
+   not a renegotiation.
+4. **Lossy arms publish as separately-labeled rows.** A codec arm never
+   merges into, averages with, or silently replaces a raw row. It appears as
+   its own row, labeled lossy (e.g. `codec=fp8-cast (lossy)`), citing its
+   measured quality delta from this gate in the same table row as its speed
+   number.
+5. **No codec on top of engine fp8.** `kvblockd_codec != raw` combined with
+   `kv_cache_dtype=fp8*` is refused at boot — double quantization is
+   unvalidated anywhere (*witness:* the stacking refusal in the same
+   test).
+
+**This section is violated if** a lossy-codec number ships without a passing
+gate run in its committed artifacts, without the lossy label and quality
+delta on its own row, or against a threshold that changed after the first
+codec measurement.
+
+---
+
 *Changing any number above requires updating its section in the same commit
 — a claim without its conditions and falsification line does not ship.*
