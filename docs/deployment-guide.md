@@ -90,7 +90,68 @@ Notes that matter:
 - With `ProtectSystem=strict` in the systemd unit, add every volume dir to
   `ReadWritePaths`.
 
-## 5. Tenants (namespaces)
+## 5. The S3 cold tier
+
+Inert until `s3_bucket` is set; requires the NVMe tier (cold objects are
+sealed NVMe segments). The headline configuration — DRAM → NVMe → S3 — is
+these keys:
+
+```yaml
+s3_bucket: "my-kvb-cold"       # enables the tier
+s3_region: "us-east-1"
+s3_node_id: "node-a"           # REQUIRED: object keys are node-namespaced —
+                               # unique per daemon, stable across restarts
+# s3_endpoint_override: ""     # MinIO-compatible targets (+ s3_path_style: true)
+# s3_spill_queue: 8            # bounded write-back depth
+# s3_read_timeout_ms: 2000     # cold ranged-GET deadline
+```
+
+Credentials are ambient only (env / shared config / IMDS instance role) —
+they never live in a kvblockd config file. The IAM policy needs
+`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` on the bucket's objects
+and nothing wider.
+
+**A bucket lifecycle expiration rule is REQUIRED, not optional.** Dead
+objects are garbage-collected asynchronously, but every GC channel is
+one-shot by design: a failed delete (`object_gc_errors_total`), a full or
+latch-busy pass (`object_gc_skips_total`), and — routinely — a restart
+(spilled-state liveness is memory-only, so objects the previous life owned
+are re-spilled fresh) each orphan an object. An orphan costs storage
+dollars, never correctness — and without a lifecycle rule that cost grows
+without bound in NORMAL operation, not just failure. Set an expiration a
+few multiples of your working set's churn (start at 7 days and watch):
+
+```json
+{"Rules": [{"ID": "kvb-orphan-backstop", "Status": "Enabled",
+            "Filter": {"Prefix": ""},
+            "Expiration": {"Days": 7}}]}
+```
+
+The daemon re-spills live segments idempotently (same key, same bytes), so
+an expired-then-needed object is a cold miss, never corruption — but an
+expiry shorter than your reload horizon turns the cold tier into a leak of
+misses; size it generously.
+
+Failure and recovery, honestly stated:
+
+- **Restart:** every sealed segment re-spills (one duplicate upload per
+  segment, write-once idempotent); entries that had been retire-flipped to
+  S3-residency are LOST at restart — a miss, never corruption. Cold state
+  is per-life; the bucket is a spill target, not a backup.
+- **NVMe device loss:** that device's blocks are misses after restart —
+  recovery rebuilds only from local checkpoints and footers, and S3-resident
+  entries do not outlive the process either (previous bullet). Replace the
+  device, keep `nvme_paths` positional order, restart; the dead life's
+  objects age out via the lifecycle rule.
+- **Node replacement:** a NEW `s3_node_id` starts a clean cold namespace;
+  the old node's objects age out via the lifecycle rule. Reusing an id is
+  safe only for the same daemon's continuation.
+- **Watch:** the `kvb_s3_*` Prometheus families — spill/restore/hit
+  counters, put/read errors — plus the GC counters in the STATS document
+  (`kvbctl stats`): `object_gc_errors_total` / `object_gc_skips_total`
+  growing faster than the lifecycle reaps is the leak signal.
+
+## 6. Tenants (namespaces)
 
 Auth model: a connection presents `(namespace, token)` once at HELLO and
 lives inside that namespace. **No namespaces file = no one can connect**
@@ -106,17 +167,20 @@ namespaces:
 enforcement ships v0.2. Transport is plaintext TCP in v1 — run on a trusted
 segment or behind a TCP-terminating proxy; do not expose 9440 to the internet.
 
-## 6. Metrics + health
+## 7. Metrics + health
 
 `metrics_addr` (default `127.0.0.1:9442`) serves:
 
 - `/metrics` — Prometheus (`kvb_*` instruments + process collector)
 - `/healthz` — readiness (used by the systemd/docker examples)
-- `/debug/pprof` — keep it on loopback; the daemon warns if you bind wider
+
+`/debug/pprof` lives on its own listener, `pprof_addr` (default off,
+loopback-only — a wider bind is refused at startup). To profile a remote
+box, tunnel: `ssh -L 9443:127.0.0.1:9443 host` or `kubectl port-forward`.
 
 Scrape config: `job_name: kvblockd`, `static_configs: [{targets: ["host:9442"]}]`.
 
-## 7. Sizing quick reference
+## 8. Sizing quick reference
 
 | Deployment | Arena | NVMe | Notes |
 |---|---|---|---|
