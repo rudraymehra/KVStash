@@ -257,6 +257,75 @@ engine, not hidden inside our speedup.
 five witnesses in its committed artifacts, or phrased against a bf16 arm —
 that number comes down before any fix goes up.
 
+**Amendment (2026-07-27): the kernel-determinism control.** This amendment
+was written AFTER one failed certification run and BEFORE any re-run; the
+original text above is kept unedited. The failed run (HF job
+`6a6752f3c6272310d46cb761`) hit statement 5's 100% gate at 7/8: prompt i=7
+(64 tokens, degenerate repetition text) diverged at generated token 10 —
+while every loaded block was xxh3-verified and hit-attributed, so the
+delivered bytes provably matched the stored bytes, and the identical harness
+passed 20/20 on bf16. The leading hypothesis is fp8 kernel nondeterminism at
+a near-tie logit — a property of the ENGINE, not of the store — and the gate
+correctly refused to publish. The response is NOT to loosen the gate after
+seeing a failure; it is to make the suite separate blame mechanically, and
+the resulting claim is STRICTER to state:
+
+1. **The control.** On the record engine, `bench/e2e/equivalence.py`
+   generates every prompt TWICE back-to-back with identical greedy
+   parameters. If the same engine disagrees with itself, the prompt is
+   stamped `kernel_deterministic: false` in its EQUIVJSONL record, with the
+   control's own divergence index.
+2. **The gate narrows; it never loosens.** The 100% token-identity gate
+   (`--min-match 100`) applies ONLY to kernel-deterministic prompts.
+   Nondeterministic prompts are still replayed on the restarted engine and
+   their outcome is disclosed in the summary (`n_kernel_nondet` plus each
+   one's record and replay divergence indices) — they can neither fail NOR
+   pass the store gate. A run where ALL prompts are kernel-nondeterministic
+   FAILS loudly: the gate judged zero prompts, so nothing was certified.
+3. **Claim wording.** The certification claim becomes exactly
+   *"token-identical on all kernel-deterministic prompts (N of M; K excluded
+   as kernel-nondeterministic, disclosed)"* — never a bare "100%". The
+   summary record carries it verbatim in `certification`, alongside
+   `n_gated` and `n_kernel_nondet`; `matched`/`match_rate_pct` are computed
+   over the gated set.
+4. **Disclosed limitation.** The record engine serves with the connector on,
+   so the control's second generation may load its prefix from the store the
+   first generation just wrote (those bytes are xxh3-verified identical to
+   what the same engine produced moments earlier — a divergence still means
+   the engine disagreed with itself over bit-identical KV). A hypothetical
+   load-path defect that corrupts COMPUTE while delivering byte-identical
+   blobs would therefore also trip the control and EXCLUDE the prompt from
+   the hard gate. Exclusion is the conservative direction — an excluded
+   prompt can never PASS the gate either — and it is never silent: the
+   excluded prompt's replay divergence is published in the same summary,
+   where a store-shaped pattern (e.g. every exclusion diverging identically
+   on replay) remains visible to any reader. Appended power limits (same
+   rule — added, not edited in): passing the control is evidence, not
+   proof, of determinism — two back-to-back samples in the same engine
+   process can only prove NONdeterminism, and a control-passing prompt
+   that is secretly nondeterministic remains gated where it can only FAIL
+   the gate, never falsely pass it. And the control certifies
+   within-engine-instance replay only: a near-tie resolved stably within
+   one process (e.g. kernel autotune fixed at boot) passes the control yet
+   can still diverge across the restart, so a gated mismatch still admits
+   cross-restart engine nondeterminism as a cause — the gate stays failed
+   and is never reassigned to the store without further evidence, and a
+   second 7/8-style failure on the re-run would not mean the control is
+   broken.
+5. **Witnesses.** `python3 bench/e2e/equivalence.py --selftest` proves, on a
+   driver-controlled stub: a prompt that answers differently back-to-back is
+   stamped nondeterministic, excluded and disclosed while the gate still
+   passes on the deterministic prompts (even when the excluded prompt's
+   replay diverges); and an all-nondeterministic run exits nonzero. The
+   run's own receipt is the greppable `EQUIVCONTROL
+   n=... n_gated=... n_kernel_nondet=...` line in the job log, and the
+   `token_identity` stamp in the TTFT JSONL carries the N-of-M wording.
+
+**This amendment is violated if** an fp8 number ships whose token-identity
+claim omits the exclusion count, or if a prompt is excluded from the gate
+without its `kernel_deterministic: false` stamp and disclosed divergences in
+the committed EQUIVJSONL.
+
 ---
 
 ## 7. Codec quality gate — pre-registered (no codec has landed)

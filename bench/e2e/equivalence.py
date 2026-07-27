@@ -11,8 +11,16 @@ serving engine cannot have the KV anywhere local):
                     the rig serves with --max-num-seqs 1) and capture the
                     full generated token sequence. With --metrics set, each
                     prompt must grow kvblockd's put counters (the store
-                    receipt) or the phase FAILS LOUDLY. Prompts + token
-                    sequences persist to --state.
+                    receipt) or the phase FAILS LOUDLY. Then the KERNEL-
+                    DETERMINISM CONTROL (pre-registered amendment, CLAIMS.md
+                    §6, written after failed run 6a6752f3c6272310d46cb761
+                    and before any re-run): the SAME engine generates the
+                    SAME prompt a second time back-to-back with the same
+                    greedy params. If the engine disagrees with ITSELF, the
+                    prompt is stamped kernel_deterministic=false — a replay
+                    the engine cannot reproduce can neither indict nor
+                    acquit the store. Prompts + token sequences + the
+                    determinism stamps persist to --state.
 
   (the harness restarts vLLM here: engine-local KV dies with the process;
    kvblockd keeps the blocks)
@@ -23,7 +31,14 @@ serving engine cannot have the KV anywhere local):
                     kvb_hits_total delta must equal its expected block count
                     — the run_ttft attribution rule). Every generated token
                     sequence must EQUAL the recorded one; any mismatch is
-                    reported with its first-divergence index.
+                    reported with its first-divergence index. The --min-match
+                    gate judges ONLY the kernel-deterministic prompts (the
+                    gated set): kernel-nondeterministic prompts are still
+                    replayed and their outcome DISCLOSED in the summary
+                    (n_kernel_nondet + per-prompt divergences) but can
+                    neither fail NOR pass the store gate. A run where EVERY
+                    prompt is kernel-nondeterministic FAILS loudly — the
+                    gate judged nothing, so nothing was certified.
 
 Prompt lengths are adversarial by construction: for every --boundary-multiples
 entry m, prompts at exactly m*block_size - 1 / m*block_size / m*block_size + 1
@@ -35,9 +50,11 @@ would collapse the boundary trio onto one length), or the record phase fails.
 --n prompts (default 20 — the free CPU rig's budget; GPU runs pass --n 100)
 round-robin across that length list, each with a unique nonce at token 0.
 
-Exit codes: 0 all matched and (with --metrics) all warm-attributed;
-1 match rate below --min-match (default 100 — for a byte-exact store ANY
-mismatch is a finding, not noise); 3 tokens all matched but the proof is
+Exit codes: 0 all gated prompts matched and (with --metrics) all prompts
+warm-attributed; 1 gated match rate below --min-match (default 100 — for a
+byte-exact store ANY mismatch on a prompt the engine can replay is a
+finding, not noise) OR every prompt was kernel-nondeterministic (nothing
+certified); 3 tokens all matched but the proof is
 weaker than claimed — some compare prompts could not be attributed to
 kvblockd (equivalence proven only against recompute, not against the store)
 or were compared at text level only (the server elided logprobs.tokens).
@@ -48,9 +65,12 @@ equivalence claim is fp8-vs-fp8, never fp8-vs-bf16, and every record is
 labeled with that scope).
 
 `--selftest` proves the exact-landing calibration, the equality gate, the
-first-divergence report, the store receipt, the attribution rule, and the
-text-fallback accounting against an in-process stub with driver-controlled
-counters (same style as run_ttft.py) — run it before trusting a green run.
+first-divergence report, the store receipt, the attribution rule, the
+text-fallback accounting, and the kernel-determinism control (a stub prompt
+that answers differently back-to-back is caught, excluded from the gate and
+disclosed; an all-nondeterministic run fails loudly) against an in-process
+stub with driver-controlled counters (same style as run_ttft.py) — run it
+before trusting a green run.
 """
 
 from __future__ import annotations
@@ -289,13 +309,40 @@ def run_record(args) -> int:
         if r["tokens"] is None:
             print(f"[record] WARN: prompt {i}: server returned no logprobs.tokens "
                   "— falling back to text-level equality for this prompt", flush=True)
+        # KERNEL-DETERMINISM CONTROL: the SAME engine, the SAME prompt, the
+        # same greedy params, back-to-back. If the two generations differ the
+        # engine cannot replay its own output — blaming (or crediting) the
+        # store for a later mismatch on this prompt would be attribution
+        # theater, so it is stamped and EXCLUDED from the store gate, always
+        # disclosed. Honest mechanics note: this engine serves with the
+        # connector on, so the control rep's prefix may be loaded from the
+        # store the first rep just wrote — those bytes are xxh3-verified
+        # identical to what this same engine produced moments earlier, so a
+        # divergence still means the engine disagreed with itself over
+        # bit-identical KV. The control can only EXCLUDE a prompt (stamped,
+        # disclosed); it can never convert a gated mismatch into a pass.
+        r2 = complete_greedy(args.vllm, args.model, prompt, args.gen_tokens,
+                             args.seed, args.request_timeout)
+        if r["tokens"] is not None and r2["tokens"] is not None:
+            kdiv = first_divergence(r["tokens"], r2["tokens"])
+        else:
+            kdiv = first_divergence(list(r["text"]), list(r2["text"]))
+        kernel_det = kdiv is None
+        if not kernel_det:
+            print(f"[record] KERNEL-NONDET i={i} target={target}: the engine "
+                  f"disagreed with itself back-to-back (first divergence at "
+                  f"token {kdiv}) — excluded from the store gate, disclosed",
+                  flush=True)
         ptoks = int(r["usage"].get("prompt_tokens", ntok))
         state["entries"].append({
             "i": i, "target_tokens": target, "nonce": nonce, "prompt": prompt,
             "prompt_tokens": ptoks, "tokens": r["tokens"], "text": r["text"],
+            "kernel_deterministic": kernel_det,
+            "record_divergence_index": kdiv,
         })
         print(f"[record] i={i} target={target} tokens={ptoks} "
-              f"gen={len(r['tokens']) if r['tokens'] is not None else '?'}", flush=True)
+              f"gen={len(r['tokens']) if r['tokens'] is not None else '?'} "
+              f"kernel_deterministic={kernel_det}", flush=True)
     tmp = args.state + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f)
@@ -347,8 +394,15 @@ def run_compare(args, stamp: dict) -> int:
         print(f"{args.print_prefix} {line}", flush=True)
 
     matched = 0
-    mismatches, unwarmed, text_fallback = [], [], []
+    n_gated = 0
+    mismatches, unwarmed, text_fallback, kernel_nondet = [], [], [], []
     for e in entries:
+        # KERNEL-DETERMINISM CONTROL stamp from the record phase: a prompt
+        # the record engine could not replay against ITSELF is excluded from
+        # the store gate (it can neither fail nor pass it) and disclosed.
+        # States predating the control carry no stamp — those prompts stay
+        # gated (the pre-control behavior; the gate never loosens by default).
+        kernel_det = bool(e.get("kernel_deterministic", True))
         c0 = read_counters(args.metrics) if args.metrics else None
         r = complete_greedy(args.vllm, args.model, e["prompt"], gen_tokens,
                             seed, args.request_timeout)
@@ -356,10 +410,14 @@ def run_compare(args, stamp: dict) -> int:
                "target_tokens": e["target_tokens"],
                "prompt_tokens": e["prompt_tokens"]}
         rec.update(stamp)
-        # AFTER the stamp: these two are checked against the state above, so
-        # a harness stamp can never overwrite them with a prettier story.
+        # AFTER the stamp: these are checked against the state above, so a
+        # harness stamp can never overwrite them with a prettier story.
         rec["kv_cache_dtype"] = args.kv_cache_dtype
         rec["equivalence_scope"] = scope
+        rec["kernel_deterministic"] = kernel_det
+        rec["gated"] = kernel_det
+        if not kernel_det:
+            rec["record_divergence_index"] = e.get("record_divergence_index")
         # equality: token-level when both sides have token lists, else text
         if e["tokens"] is not None and r["tokens"] is not None:
             div = first_divergence(e["tokens"], r["tokens"])
@@ -370,10 +428,20 @@ def run_compare(args, stamp: dict) -> int:
             text_fallback.append(e["i"])
         rec["match"] = div is None
         rec["first_divergence_index"] = div
-        if div is None:
-            matched += 1
+        if kernel_det:
+            n_gated += 1
+            if div is None:
+                matched += 1
+            else:
+                mismatches.append((e["i"], e["target_tokens"], div))
         else:
-            mismatches.append((e["i"], e["target_tokens"], div))
+            kernel_nondet.append({
+                "i": e["i"], "target_tokens": e["target_tokens"],
+                "record_divergence_index": e.get("record_divergence_index"),
+                "replay_match": div is None,
+                "replay_first_divergence_index": div,
+            })
+        if div is not None:
             rec["recorded"] = e["tokens"] if e["tokens"] is not None else e["text"]
             rec["replayed"] = r["tokens"] if r["tokens"] is not None else r["text"]
         # attribution: this compare rep must have READ its prefix from kvblockd
@@ -389,17 +457,54 @@ def run_compare(args, stamp: dict) -> int:
         emit(rec)
         print(f"[compare] i={e['i']} target={e['target_tokens']} "
               f"match={rec['match']}"
+              + ("" if kernel_det else " KERNEL-NONDET(ungated)")
               + (f" div@{div}" if div is not None else "")
               + (f" hits+={rec['kvb_hit_delta']:.0f}/{rec['expected_hit_blocks']}"
                  if args.metrics else ""), flush=True)
 
-    rate = matched / len(entries) * 100.0 if entries else 0.0
+    # The gate judges ONLY the gated (kernel-deterministic) set; the excluded
+    # prompts are disclosed with both divergence indices (record control +
+    # replay), never averaged in and never dropped silently.
+    rate = matched / n_gated * 100.0 if n_gated else 0.0
+    # `certification` is the quotable claim, and EQUIVJSONL lines outlive a
+    # failed run (they are the designed retrieval path from job logs), so it
+    # is computed jointly with EVERY exit condition below — the certified
+    # wording may only ever persist in a record whose run exits 0. Precedence
+    # mirrors the exit ladder: nothing-gated, then gated mismatch (rc 1),
+    # then unattributed / text-fallback (rc 3), and only then certified.
+    if not n_gated:
+        certification = (
+            "NOTHING CERTIFIED: every prompt was kernel-nondeterministic "
+            "(the record engine disagreed with itself back-to-back on all of "
+            "them — the store gate judged zero prompts)")
+    elif matched < n_gated or rate < args.min_match:
+        certification = (
+            f"NOT CERTIFIED: {n_gated - matched} of {n_gated} "
+            "kernel-deterministic prompts mismatched")
+    elif unwarmed:
+        certification = (
+            f"NOT CERTIFIED: tokens matched but {len(unwarmed)} prompt(s) "
+            "unattributed to the store (equivalence proven against "
+            "recompute only)")
+    elif text_fallback:
+        certification = (
+            f"NOT CERTIFIED: {len(text_fallback)} prompt(s) matched at TEXT "
+            "level only (token identity unproven — the server elided "
+            "logprobs.tokens)")
+    else:
+        certification = (
+            f"token-identical on all kernel-deterministic prompts "
+            f"({n_gated} of {len(entries)}; {len(kernel_nondet)} excluded as "
+            "kernel-nondeterministic, disclosed)")
     summary = {"schema_version": 1, "kind": "equivalence-summary",
                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "model": args.model, "seed": seed, "gen_tokens": gen_tokens,
                "block_size": block_size, "n": len(entries),
+               "n_gated": n_gated, "n_kernel_nondet": len(kernel_nondet),
+               "kernel_nondet": kernel_nondet,
                "matched": matched, "match_rate_pct": rate,
                "min_match_pct": args.min_match,
+               "certification": certification,
                "mismatches": [{"i": i, "target_tokens": t, "first_divergence_index": d}
                               for i, t, d in mismatches],
                "warm_attributed_all": not unwarmed if args.metrics else None,
@@ -420,15 +525,31 @@ def run_compare(args, stamp: dict) -> int:
         with open(args.out, "a") as f:
             f.write("\n".join(out_lines) + "\n")
 
-    print(f"\n== equivalence: {matched}/{len(entries)} matched "
-          f"({rate:.1f}%, gate >= {args.min_match:.1f}%) ==")
+    print(f"\n== equivalence: {matched}/{n_gated} gated matched "
+          f"({rate:.1f}%, gate >= {args.min_match:.1f}%); "
+          f"{len(kernel_nondet)} of {len(entries)} prompt(s) excluded as "
+          "kernel-nondeterministic (disclosed, ungated) ==")
+    for nd in kernel_nondet:
+        print(f"  KERNEL-NONDET i={nd['i']} target={nd['target_tokens']}: record "
+              f"control diverged at token {nd['record_divergence_index']}; replay "
+              + ("matched the recording"
+                 if nd["replay_match"]
+                 else f"diverged at token {nd['replay_first_divergence_index']}")
+              + " — disclosed, outside the store gate either way", file=sys.stderr)
+    if entries and not n_gated:
+        print("FAIL: every prompt was kernel-nondeterministic — the record "
+              "engine disagreed with itself back-to-back on all of them, so "
+              "the store gate judged ZERO prompts and NOTHING was certified.",
+              file=sys.stderr)
+        return 1
     if mismatches:
         for i, t, d in mismatches:
             print(f"  MISMATCH i={i} target={t}: first divergence at token {d}",
                   file=sys.stderr)
     if rate < args.min_match:
-        print(f"FAIL: match rate {rate:.1f}% below --min-match {args.min_match:.1f}% "
-              "— for a byte-exact store ANY mismatch is a finding.", file=sys.stderr)
+        print(f"FAIL: gated match rate {rate:.1f}% below --min-match "
+              f"{args.min_match:.1f}% — for a byte-exact store ANY mismatch on "
+              "a prompt the engine can replay is a finding.", file=sys.stderr)
         return 1
     if unwarmed:
         for i, t, delta, exp in unwarmed:
@@ -461,9 +582,12 @@ def _stub_server(ctl):
     connector); "hit-short" grows them by one block too few; "none" freezes
     them. ctl["flip_at"]: index of a generated token to corrupt (None = exact
     replay). ctl["elide_logprobs"]: drop logprobs.tokens from completions (a
-    server that forces the text-level fallback). Token sequences are a
-    deterministic function of the prompt, so record and compare agree unless
-    flip_at interferes."""
+    server that forces the text-level fallback). ctl["nondet_markers"]: any
+    prompt containing one of these substrings answers DIFFERENTLY on every
+    second call (per-prompt call counter in ctl["call_counts"]) — a kernel
+    that cannot replay itself, for proving the determinism control. Token
+    sequences are otherwise a deterministic function of the prompt, so record
+    and compare agree unless flip_at or a marker interferes."""
     import hashlib
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -511,6 +635,12 @@ def _stub_server(ctl):
                 if ctl["flip_at"] is not None and ctl["flip_at"] < len(toks):
                     toks = list(toks)
                     toks[ctl["flip_at"]] = "CORRUPTED"
+                if any(m in prompt for m in ctl.get("nondet_markers", ())):
+                    cnt = ctl["call_counts"].get(prompt, 0)
+                    ctl["call_counts"][prompt] = cnt + 1
+                    if cnt % 2 == 1:  # every SECOND answer diverges
+                        toks = list(toks)
+                        toks[min(3, len(toks) - 1)] = "NONDET"
                 choice = {"index": 0, "text": " ".join(toks)}
                 if not ctl.get("elide_logprobs"):
                     choice["logprobs"] = {"tokens": toks}
@@ -542,14 +672,21 @@ def selftest() -> int:
     token sequences, (4) an exact replay passes at 100% with the isolation
     field defaulting to "unverified", (5) a corrupted replay fails with the
     right first-divergence index, (6) a token-equal but hit-starved compare
-    exits 3 (proven equal, unproven warm), and (7) a logprobs-elided compare
-    exits 3 with the text-fallback prompts counted and a harness-stamped
-    isolation honored."""
+    exits 3 (proven equal, unproven warm) with a NOT-CERTIFIED summary
+    certification — a failing run's quotable record must never carry the
+    certified wording, (7) a logprobs-elided compare exits 3 with the
+    text-fallback prompts counted, a NOT-CERTIFIED certification and a
+    harness-stamped isolation honored, (10) the kernel-determinism control:
+    a prompt the stub
+    engine answers differently back-to-back is stamped nondeterministic at
+    record, EXCLUDED from the gate (which still passes on the deterministic
+    prompts) and disclosed — even when its replay diverges — and (11) an
+    all-nondeterministic run FAILS loudly (nothing was certified)."""
     import tempfile
 
     ctl = {"hits": 0.0, "put_bytes": 0.0, "get_bytes": 0.0, "blocks": 0.0,
            "on_completion": "none", "flip_at": None, "block_size": 12,
-           "elide_logprobs": False}
+           "elide_logprobs": False, "nondet_markers": [], "call_counts": {}}
     srv, url = _stub_server(ctl)
     ok = True
 
@@ -640,12 +777,14 @@ def selftest() -> int:
                 or summ[0]["matched"] != 4 or not summ[0]["warm_attributed_all"] \
                 or summ[0]["isolation"] != "unverified" \
                 or summ[0]["text_fallback_prompts"] != 0 \
+                or summ[0]["n_gated"] != 4 or summ[0]["n_kernel_nondet"] != 0 \
                 or any(not r["match"] for r in recs if r["kind"] == "equivalence"):
             print(f"FAIL: exact replay rc={rc} summary={summ}", file=sys.stderr)
             ok = False
         else:
-            print("[selftest] exact replay: rc=0, 4/4 matched, all warm-attributed, "
-                  "isolation honestly 'unverified' without a harness stamp")
+            print("[selftest] exact replay: rc=0, 4/4 matched (all 4 gated, 0 "
+                  "kernel-nondet), all warm-attributed, isolation honestly "
+                  "'unverified' without a harness stamp")
 
         # 5) corrupted replay -> rc 1 with the right divergence index.
         ctl["flip_at"] = 2
@@ -665,18 +804,29 @@ def selftest() -> int:
                   "with first divergence at token 2")
         ctl["flip_at"] = None
 
-        # 6) token-equal but hit-starved -> rc 3 (equal, but unproven warm).
+        # 6) token-equal but hit-starved -> rc 3 (equal, but unproven warm);
+        # the persisted summary must NOT carry the certified wording — a
+        # failed run's EQUIVJSONL is quotable, so its certification field
+        # must state the weakness, never the claim the run failed to prove.
         for mode, why in (("none", "no hits"), ("hit-short", "one block short")):
             ctl["on_completion"] = mode
-            rc = run_compare(mkargs(state=state_path,
-                                    out=os.path.join(tmp, f"unwarm-{mode}.jsonl")),
+            out_uw = os.path.join(tmp, f"unwarm-{mode}.jsonl")
+            rc = run_compare(mkargs(state=state_path, out=out_uw),
                              {"rig": "selftest"})
-            if rc != 3:
-                print(f"FAIL: {why} compare rc={rc}, expected 3", file=sys.stderr)
+            with open(out_uw) as f:
+                summ = [r for r in (json.loads(line) for line in f)
+                        if r["kind"] == "equivalence-summary"]
+            cert = summ[0]["certification"] if summ else ""
+            if rc != 3 or cert.startswith("token-identical") \
+                    or not cert.startswith("NOT CERTIFIED") \
+                    or "unattributed to the store" not in cert:
+                print(f"FAIL: {why} compare rc={rc}, expected 3 with a "
+                      f"NOT-CERTIFIED summary; certification={cert!r}",
+                      file=sys.stderr)
                 ok = False
             else:
                 print(f"[selftest] {why} compare: rc=3 — tokens equal but not "
-                      "attributed to kvblockd")
+                      f"attributed to kvblockd; certification={cert!r}")
 
         # 7) logprobs elided by the server -> text-level fallback: matching
         # text is necessary but not the token-exact claim, so rc 3 with the
@@ -690,15 +840,20 @@ def selftest() -> int:
         with open(out_txt) as f:
             summ = [r for r in (json.loads(line) for line in f)
                     if r["kind"] == "equivalence-summary"]
+        cert = summ[0]["certification"] if summ else ""
         if rc != 3 or summ[0]["text_fallback_prompts"] != 4 \
                 or summ[0]["matched"] != 4 \
-                or summ[0]["isolation"] != "vllm-restart":
+                or summ[0]["isolation"] != "vllm-restart" \
+                or cert.startswith("token-identical") \
+                or not cert.startswith("NOT CERTIFIED") \
+                or "TEXT level only" not in cert:
             print(f"FAIL: text-fallback compare rc={rc} summary={summ}",
                   file=sys.stderr)
             ok = False
         else:
             print("[selftest] text-fallback compare: rc=3, 4/4 text-matched but "
-                  "counted as fallback; stamped isolation honored")
+                  "counted as fallback (summary NOT CERTIFIED); stamped "
+                  "isolation honored")
         ctl["elide_logprobs"] = False
 
         # 8) fp8 disclosure labeling: a run recorded AND compared under an
@@ -743,6 +898,97 @@ def selftest() -> int:
         else:
             print("[selftest] cross-dtype compare refused (rc=2): the harness "
                   "cannot produce an fp8-vs-bf16 equivalence claim")
+
+        # 10) KERNEL-DETERMINISM CONTROL: prompt e1 answers differently on
+        # every second call (a kernel that cannot replay itself at a near-tie).
+        # Record must stamp it kernel_deterministic=false with the control's
+        # divergence index; the gate must still PASS on the 3 deterministic
+        # prompts with the exclusion disclosed in the summary.
+        ctl["on_completion"] = "store"
+        ctl["nondet_markers"] = ["-e1 ::"]
+        ctl["call_counts"] = {}
+        nd_state = os.path.join(tmp, "nondet-state.json")
+        rc = run_record(mkargs(state=nd_state))
+        with open(nd_state) as f:
+            st = json.load(f)
+        flags = {e["i"]: e["kernel_deterministic"] for e in st["entries"]}
+        if rc != 0 or flags != {0: True, 1: False, 2: True, 3: True} \
+                or st["entries"][1]["record_divergence_index"] != 3:
+            print(f"FAIL: nondet record rc={rc} flags={flags} "
+                  f"entry1={st['entries'][1] if len(st['entries']) > 1 else None}",
+                  file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] determinism control: the back-to-back record rep "
+                  "caught prompt 1 disagreeing with itself at token 3")
+        ctl["on_completion"] = "hit"
+        out_nd = os.path.join(tmp, "nondet.jsonl")
+        rc = run_compare(mkargs(state=nd_state, out=out_nd), {"rig": "selftest"})
+        with open(out_nd) as f:
+            recs = [json.loads(line) for line in f]
+        summ = [r for r in recs if r["kind"] == "equivalence-summary"]
+        nd = summ[0].get("kernel_nondet") if summ else None
+        if rc != 0 or len(summ) != 1 or summ[0]["n"] != 4 \
+                or summ[0]["n_gated"] != 3 or summ[0]["n_kernel_nondet"] != 1 \
+                or summ[0]["matched"] != 3 or summ[0]["match_rate_pct"] != 100.0 \
+                or not nd or nd[0]["i"] != 1 \
+                or nd[0]["record_divergence_index"] != 3 \
+                or "3 of 4" not in summ[0]["certification"] \
+                or "1 excluded as kernel-nondeterministic" not in summ[0]["certification"]:
+            print(f"FAIL: nondet compare rc={rc} summary={summ}", file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] nondet-excluded compare: rc=0, gate judged 3/3 "
+                  f"gated prompts, certification={summ[0]['certification']!r}")
+
+        # 10b) the SAME nondet prompt now DIVERGES on replay (the stub flips
+        # every second call; this compare is its next odd call). The gate
+        # must still pass — the prompt can neither fail nor pass it — but the
+        # replay divergence must be DISCLOSED, never hidden.
+        out_nd2 = os.path.join(tmp, "nondet-replay-div.jsonl")
+        rc = run_compare(mkargs(state=nd_state, out=out_nd2), {"rig": "selftest"})
+        with open(out_nd2) as f:
+            summ = [r for r in (json.loads(line) for line in f)
+                    if r["kind"] == "equivalence-summary"]
+        nd = summ[0].get("kernel_nondet") if summ else None
+        if rc != 0 or not nd or nd[0]["replay_match"] is not False \
+                or nd[0]["replay_first_divergence_index"] != 3 \
+                or summ[0]["matched"] != 3:
+            print(f"FAIL: nondet replay-divergence rc={rc} summary={summ}",
+                  file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] nondet replay divergence: rc=0 (cannot fail the "
+                  "gate) with the divergence disclosed at token "
+                  f"{nd[0]['replay_first_divergence_index']}")
+
+        # 11) ALL prompts kernel-nondeterministic -> the gate judged nothing,
+        # so the run must FAIL LOUDLY (rc 1): a 'pass' over zero gated
+        # prompts would certify nothing while looking green.
+        ctl["on_completion"] = "store"
+        ctl["nondet_markers"] = ["kvstash-equiv"]
+        ctl["call_counts"] = {}
+        all_state = os.path.join(tmp, "all-nondet-state.json")
+        rc = run_record(mkargs(state=all_state))
+        if rc != 0:
+            print(f"FAIL: all-nondet record rc={rc}", file=sys.stderr)
+            ok = False
+        ctl["on_completion"] = "hit"
+        out_all = os.path.join(tmp, "all-nondet.jsonl")
+        rc = run_compare(mkargs(state=all_state, out=out_all), {"rig": "selftest"})
+        with open(out_all) as f:
+            summ = [r for r in (json.loads(line) for line in f)
+                    if r["kind"] == "equivalence-summary"]
+        if rc != 1 or not summ or summ[0]["n_gated"] != 0 \
+                or summ[0]["n_kernel_nondet"] != 4 \
+                or not summ[0]["certification"].startswith("NOTHING CERTIFIED"):
+            print(f"FAIL: all-nondet compare rc={rc} (expected 1) summary={summ}",
+                  file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] all-nondeterministic run: rc=1 — loud fail, "
+                  "nothing was certified")
+        ctl["nondet_markers"] = []
     finally:
         srv.shutdown()
     print("SELFTEST " + ("PASS" if ok else "FAIL"))

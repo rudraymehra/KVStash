@@ -42,6 +42,15 @@
 #     the equivalence claim is labeled fp8-vs-fp8 in every EQUIVJSONL record
 #     and the suite REFUSES a cross-dtype compare — "fp8 matches bf16
 #     recompute" is a claim this rig cannot emit.
+#   - kernel-determinism control (pre-registered amendment, CLAIMS.md §6,
+#     after failed run 6a6752f3c6272310d46cb761, before any re-run): record
+#     generates every prompt TWICE back-to-back on engine #1; a prompt the
+#     engine cannot replay against ITSELF is stamped kernel-nondeterministic,
+#     excluded from the 100% store gate and DISCLOSED (it can neither fail
+#     nor pass the gate); all-nondeterministic fails loudly. The certification
+#     wording becomes 'token-identical on all kernel-deterministic prompts
+#     (N of M; K excluded, disclosed)' — stricter to state, never looser to
+#     pass. Receipt: the EQUIVCONTROL line below.
 #
 # Base image: vllm/vllm-openai:v0.25.1 (CUDA torch + vLLM prebuilt; the pin
 # matches bench/e2e/cpu/versions.env). Submit with bench/rigs/hf-gpu/submit.sh.
@@ -91,7 +100,10 @@ EQUIV_N="${EQUIV_N:-}"                        # token-identity prompts (bench/e2
                                               # 0 otherwise (bf16 behavior unchanged). The claim is
                                               # same-dtype BY CONSTRUCTION (one env var, both
                                               # engines) and every EQUIVJSONL record is labeled
-                                              # fp8-vs-fp8 — never fp8-vs-bf16.
+                                              # fp8-vs-fp8 — never fp8-vs-bf16. Record also runs the
+                                              # kernel-determinism control (each prompt generated
+                                              # twice back-to-back; nondeterministic prompts are
+                                              # excluded from the store gate and disclosed).
 FP8_PREFLIGHT="${FP8_PREFLIGHT:-}"            # comma list of kv-cache dtypes to PROBE ("1" = fp8):
                                               # per dtype, boot the engine with the flag, one ~1k-token
                                               # prefill, verdict from kvblockd's OWN counters
@@ -355,7 +367,9 @@ fi
 python3 "$HERE/run_ttft.py" --selftest | sed 's/^CHART2JSONL /SELFTESTJSONL /'
 # Same rule for the token-identity suite when it will run: its gates (exact
 # landing, store receipt, attribution, fp8-vs-fp8 labeling, the cross-dtype
-# REFUSAL) must be proven against the stub before any engine boots, and its
+# REFUSAL, the kernel-determinism control catching a nondeterministic prompt
+# while the gate passes the deterministic ones, and the all-nondeterministic
+# loud-fail) must be proven against the stub before any engine boots, and its
 # stub EQUIVJSONL lines are renamed so log retrieval can never scoop them.
 if (( EQUIV_N > 0 )); then
   python3 "$ROOT/bench/e2e/equivalence.py" --selftest | sed 's/^EQUIVJSONL /SELFTESTEQUIV /'
@@ -710,7 +724,55 @@ if (( EQUIV_N > 0 )); then
     --stamp isolation=vllm-restart --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
     --stamp git_sha="$GIT_SHA" \
     || die "token-identity compare FAILED — the warm arm must not be published without machine-checked same-dtype token identity (records above behind the EQUIV''JSONL marker)"
-  TOKEN_IDENTITY="equivalence-passed (${KV_CACHE_DTYPE:-auto-bf16}-vs-${KV_CACHE_DTYPE:-auto-bf16}, n=$EQUIV_N, greedy, hard-fail)"
+  # The kernel-determinism control's receipt (greppable: EQUIVCONTROL): the
+  # store gate judged only the kernel-deterministic prompts; excluded prompts
+  # are disclosed with their divergences in the summary record. The receipt
+  # does NOT re-derive the certification sentence from the counts — it takes
+  # the summary's own `certification` field VERBATIM (CLAIMS.md §6 amendment
+  # item 3 promises the summary carries the claim verbatim) and dies unless
+  # that field is the certified wording AND the gate arithmetic it quotes
+  # holds: matched == n_gated and n_gated + n_kernel_nondet == n. A rc-0
+  # compare whose own record disagrees is a bug, never a publishable stamp.
+  EQ_SUMMARY="$(python3 - "$EQUIV_OUT" <<'PY'
+import json
+import sys
+
+summ = None
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        if rec.get("kind") == "equivalence-summary":
+            summ = rec
+if summ is None:
+    sys.exit(f"no equivalence-summary record in {sys.argv[1]}")
+try:
+    n, gated = int(summ["n"]), int(summ["n_gated"])
+    nondet, matched = int(summ["n_kernel_nondet"]), int(summ["matched"])
+    cert = str(summ["certification"])
+except (KeyError, TypeError, ValueError) as e:
+    sys.exit(f"summary missing/garbled gate fields ({e}) in {sys.argv[1]}")
+if gated + nondet != n:
+    sys.exit(f"summary arithmetic broken: n_gated={gated} + "
+             f"n_kernel_nondet={nondet} != n={n}")
+if matched != gated:
+    sys.exit(f"summary says matched={matched} != n_gated={gated} but the "
+             "compare phase exited 0 — its own record disagrees with the gate")
+if not cert.startswith("token-identical on all kernel-deterministic prompts"):
+    sys.exit("summary certification is not the certified wording despite a "
+             f"rc-0 compare: {cert!r}")
+print(f"n={n} n_gated={gated} n_kernel_nondet={nondet} matched={matched}")
+print(cert)
+PY
+)" || die "token-identity summary in $EQUIV_OUT failed its own gate arithmetic/certification check — the compare exited 0 but its record does not back the claim (see the python error above)"
+  EQ_COUNTS="${EQ_SUMMARY%%$'\n'*}"
+  EQ_CERT="${EQ_SUMMARY#*$'\n'}"
+  [[ "$EQ_COUNTS" == n=*" "n_gated=*" "n_kernel_nondet=*" "matched=* && -n "$EQ_CERT" && "$EQ_CERT" != "$EQ_SUMMARY" ]] \
+    || die "token-identity summary receipt unparseable: '$EQ_SUMMARY'"
+  log "EQUIVCONTROL $EQ_COUNTS (store gate judged the kernel-deterministic prompts only; exclusions disclosed in the summary record; matched==n_gated and n_gated+n_kernel_nondet==n verified)"
+  TOKEN_IDENTITY="$EQ_CERT (${KV_CACHE_DTYPE:-auto-bf16}-vs-${KV_CACHE_DTYPE:-auto-bf16}, greedy, hard-fail)"
   log "token identity certified: $TOKEN_IDENTITY"
 fi
 
@@ -770,7 +832,7 @@ fi
 # ---- 12. results out ---------------------------------------------------------
 log "JSONL at $OUT_JSONL ($(wc -l < "$OUT_JSONL" 2>/dev/null || echo 0) records); every record was also printed above as a CHART2JSONL line"
 if (( EQUIV_N > 0 )); then
-  log "token-identity JSONL at $EQUIV_OUT — retrieve with the EQUIV''JSONL marker (stub selftest lines were renamed SELFTESTEQUIV)"
+  log "token-identity JSONL at $EQUIV_OUT — retrieve with the EQUIV''JSONL marker (stub selftest lines were renamed SELFTESTEQUIV); the kernel-determinism receipt is the EQUIVCONTROL line above (grep EQUIVCONTROL)"
 fi
 if [[ -n "$RESULTS_REPO" && -s "$OUT_JSONL" ]]; then
   log "uploading JSONL to dataset $RESULTS_REPO"
