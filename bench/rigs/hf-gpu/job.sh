@@ -649,6 +649,20 @@ else
   log "WARN: no 'kvblockd load path:' line found in the engine logs — load path unattributed"
 fi
 
+# Store-side twin: the cold arm's serving tax is attributed to whichever
+# staging path ran (gathered-slots = pinned-slot gather fast path;
+# bytearray = the per-layer fallback). Loud WARN on the fallback, never a
+# failure — the numbers are honest, just attributed to the slow lane.
+STORE_PATH="$(grep -h -o 'kvblockd store path: [a-z-]*' "$WORK"/vllm-populate.log "$WORK"/vllm-measure.log 2>/dev/null | tail -1 | awk '{print $NF}')"
+if [[ -n "$STORE_PATH" ]]; then
+  log "connector store path: $STORE_PATH"
+  if [[ "$STORE_PATH" != "gathered-slots" ]]; then
+    log "WARN WARN WARN: stores ran on the '$STORE_PATH' path on a CUDA run — the pinned-slot gather did NOT serve the cold/serving numbers (pool alloc failed or the gather latched off). Attribute the serving tax to store_path=$STORE_PATH."
+  fi
+else
+  log "WARN: no 'kvblockd store path:' line found in the engine logs — store path unattributed (connector predates the stamp or stores never ran)"
+fi
+
 # ---- 12. results out ---------------------------------------------------------
 log "JSONL at $OUT_JSONL ($(wc -l < "$OUT_JSONL" 2>/dev/null || echo 0) records); every record was also printed above as a CHART2JSONL line"
 if [[ -n "$RESULTS_REPO" && -s "$OUT_JSONL" ]]; then
