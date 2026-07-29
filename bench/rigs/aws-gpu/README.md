@@ -1,73 +1,57 @@
-# Rig E (AWS leg) — shaped-link TTFT rig (future)
+# Rig G — EC2 L40S long-context TTFT rig
 
-**Status: SUPERSEDED for the loopback chart; PLANNED for the shaped-link
-matrix.** The published Chart-2 TTFT numbers were produced by
-`bench/rigs/hf-gpu/` (HF Jobs a10g-large, the NATIVE vLLM connector — not
-the LMCache stack this plan describes) and live in `bench/results/rig-e/`.
-This directory remains the plan for what only AWS root access can add:
-tc-shaped 25/10/5 Gbit links, the hit-rate sweep, and the Bailian-trace A4
-datapoint, on a two-node rig (GPU node + store node). Rewrite this plan
-against the native connector before the first session — the LMCache stack
-below predates the connector switch and its GPU leg is unvalidated.
+The EC2 leg of the Chart-2 methodology: same two-phase harness, same gates,
+same pinned engine image as `bench/rigs/hf-gpu/` (which produced every
+published A10G table), driven over SSH onto a single `g6e.2xlarge`
+(1× L40S 48 GB) instead of an HF Job. The measurement core —
+`run_ttft.py`, `equivalence.py`, `job.sh` — is reused byte-for-byte;
+`job.sh` stamps `rig=ec2-g6e-l40s` here via its `RIG`/`GPU_ANNOT` envs.
 
-## What it measures
+What this rig adds over the HF leg:
 
-Chart #2: **TTFT vs KV-cache hit rate** through the real stack — vLLM +
-LMCache + `lmcache_kvblockd` + a kvblockd daemon — answering the only
-question that matters for a remote KV cache: *at what hit rate does fetching
-beat recomputing, and by how much?* Series: recompute baseline,
-LMCache + Redis 7, LMCache + kvblockd at 25 Gbps and 50 Gbps emulated links.
+- **48 GB VRAM** → true long-context points: Qwen2.5-7B-Instruct-1M at
+  96k–262k tokens (served in the model-card-sanctioned standard-attention
+  mode: `dual_chunk_attention_config` is deleted from the local snapshot —
+  DCA has no backend on vLLM 0.25.x — and the identical edited snapshot
+  serves BOTH arms; disclosed in every JSONL row via the model path),
+  and Llama-3.1-8B up to its native 131,072.
+- **Root access** → the two-node real-NIC / tc-shaped sessions
+  (`iperf3 ceiling first, quote the ratio` — methodology rule 2).
 
-## Hardware
+## Flow
 
-- 1x `g5.xlarge` (NVIDIA A10G 24 GB, 4 vCPU). Llama-3.1-8B-Instruct fits in
-  bf16 with a capped `--max-model-len`. The GPU class is disclosed on-chart;
-  an A100/H100-class re-run would be a separate, labeled session.
-- kvblockd runs on the same host; the network is emulated with `tc` (tbf)
-  at 25 and 50 Gbps classes, and the class is written into every JSONL line
-  (emulated links are always disclosed — methodology rule 11).
-- G-instance vCPU quota is often 0 on a fresh AWS account; request the
-  increase first (`Service Quotas → EC2 → Running On-Demand G and VT
-  instances`, ≥4 vCPU — usually auto-approved in minutes).
+```sh
+DRY_RUN=1 bench/rigs/aws-gpu/provision.sh   # red-proof: print, launch nothing
+bench/rigs/aws-gpu/provision.sh             # launch (AZ ladder, dead-man armed)
+bench/rigs/aws-gpu/node-setup.sh            # GPU assert, image, models, repo
+bench/rigs/aws-gpu/run-arm.sh a0b run1      # calibration block first, always
+bench/rigs/aws-gpu/run-arm.sh arm9 run1     # then pre-registered arms
+bench/rigs/aws-gpu/teardown.sh              # session over only at ALL-CLEAR
+```
 
-## Discipline before any long metered run
+Arms are pre-registered in `arms.sh` (context points, REPS, dtype, engine
+flags, connector overrides — engine args are never tuned mid-session; the
+chunk-size knob is swept once to MINIMIZE THE BASELINE's TTFT, then frozen
+identically in both arms of every run). `run-arm.sh` pulls all artifacts
+back after every arm — a dead-man terminate never loses more than the
+in-flight rep — and judges the honesty gates from the pulled logs:
+exact-count hit verification, zero-occurrence deadline/degrade greps,
+path-stamp presence, baseline-purity, and the fp8 backend line.
 
-No long sweep until the pipeline yields **3 stable points on the same box**.
-Cuts pre-applied to keep the session small: 4 hit-rate points
-{0, 25, 50, 90}%, 2 runs + a spot-check third, and the LMCache-local-CPU
-series dropped from the headline chart.
+## Cost discipline
 
-## Runbook
+Every launch: `--instance-initiated-shutdown-behavior terminate`,
+`DeleteOnTermination` on the volume (both asserted post-launch), a
+`shutdown -h` dead-man armed from user-data, everything tagged `kvbench`.
+`run-arm.sh` appends wall-clock × rate to a local ledger; `teardown.sh`
+verifies $0 residue (instances, volumes, EIPs, capacity reservations,
+placement groups, NAT) and prints the session total.
 
-The provision/setup/sweep/teardown scripts are authored at session start on
-the box (they depend on the AMI's exact CUDA/driver versions) and committed
-alongside the results.
+Results bank to `bench/results/rig-g/`; render/aggregate with the same
+`bench/report/{plot,aggregate}.py` — rig-e (A10G) and rig-g (L40S) files
+are never co-globbed into one aggregate (a faster GPU shrinks the multiple;
+GPU change is always disclosed, never averaged away).
 
-1. `provision.sh` — g5.xlarge spot with on-demand fallback, Deep Learning
-   AMI (CUDA 12.4), tagged `kvbench=gpu`, `trap`-guarded teardown.
-2. `setup.sh` — pins from `bench/VERSIONS.lock`: vLLM 0.25.1, LMCache 0.5.1,
-   `lmcache_kvblockd` + a kvblockd static binary, CUDA torch (reuses the
-   `bench/e2e/cpu/install.sh` shape with the GPU index). Apply the `tc`
-   link classes.
-3. `ttft_sweep.sh` — for each hit-rate point: pre-seed kvblockd with that %
-   of each prompt's prefix blocks (via the connector's key-parity module),
-   flush vLLM's local prefix cache, drive `inference-perf` shared-prefix,
-   record p50/p99 TTFT per series.
-4. **Bailian datapoint** — replay `qwen_traceA` at realistic arrival rates;
-   record the hit rate the store actually achieves (expect 54–62%) and the
-   TTFT there. That is the quotable real-trace number.
-5. nsys capture while the GPU is up — verify fetch/compute overlap
-   (see `docs/notes/` for the overlap hooks).
-6. `run.sh` emits a PASS/FAIL line — remote TCP fetch beats recompute at the
-   measured Bailian hit rate → PASS; **publish the curve either way**, with
-   the shaded "recompute wins here" region.
-7. `economics.py` update — measured $/GB moved vs $/GPU-sec saved at the
-   measured hit rates (inputs to `bench/e2e/economics.py`).
-8. `teardown.sh` — terminate everything tagged `kvbench=gpu`; verify zero
-   tagged resources remain.
-
-`run.sh` stamps `gpu`/`model`/`vllm`/`lmcache`/`tc_link` into every JSONL
-line so `plot.py` reads the conditions box from data, never hardcoded.
-
-All JSONL → `bench/results/rig-e/`; render with
-`python bench/report/plot.py chart2 --in bench/results/rig-e/*.jsonl --out chart2.png`.
+*(The pre-2026-07-29 content of this file — the LMCache-era shaped-link
+plan — is superseded; its shaped-link and hit-rate-sweep goals move to the
+two-node session driven from this same rig, against the native connector.)*

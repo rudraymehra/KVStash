@@ -76,6 +76,27 @@ GEN_TOKENS="${GEN_TOKENS:-16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"            # empty -> derived: max(LENGTHS) + GEN_TOKENS + 384
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 GO_VERSION="${GO_VERSION:-1.26.5}"
+# Rig provenance stamps. This script also drives non-HF boxes (EC2 rigs) —
+# a JSONL that stamps rig=hf-jobs-* from anywhere else is a falsified
+# provenance record, so both stamps are overridable and default to the
+# HF-Jobs identity that produced every published table so far.
+RIG="${RIG:-hf-jobs-${FLAVOR:-a10g}}"
+GPU_ANNOT="${GPU_ANNOT:-hf-jobs ${FLAVOR:-flavor-unset}}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}" # empty -> vLLM's own default. FAIRNESS RULE: one env
+                                              # var feeds every engine boot of a run (both arms and the
+                                              # baseline job's), so the chunked-prefill chunk size can
+                                              # never differ between the arms of a charted pair. Tune it
+                                              # to MINIMIZE THE BASELINE's TTFT, then freeze (CLAIMS PR-2).
+REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-}"        # empty -> run_ttft.py default (600 s). 256k-class arms
+                                              # need ~900: a cold rep is a multi-minute prefill.
+# Optional connector overrides for long-context arms (empty -> package
+# defaults). Names must match python/vllm_kvblockd config.py exactly; the
+# generated kv_transfer.json is json.load-validated below either way.
+KVBD_STORE_DRAIN_WORKERS="${KVBD_STORE_DRAIN_WORKERS:-}"
+KVBD_STORE_FLUSH_TIMEOUT_S="${KVBD_STORE_FLUSH_TIMEOUT_S:-}"
+KVBD_LOAD_DEADLINE_S="${KVBD_LOAD_DEADLINE_S:-}"
+KVBD_EXISTS_TIMEOUT_S="${KVBD_EXISTS_TIMEOUT_S:-}"
+KVBD_GET_FANOUT="${KVBD_GET_FANOUT:-}"
 KV_BYTES_PER_TOKEN="${KV_BYTES_PER_TOKEN:-}"  # KV/token upper bound for the 7-8B class; empty ->
                                               # derived from the dtype below (131072 bf16, 65536 fp8).
                                               # Llama-3.1-8B measured 128KiB/token; Qwen2.5-7B is 56KiB.
@@ -321,6 +342,19 @@ EOF
 KVBD_VERIFY_JSON=true
 [[ "$KVBD_VERIFY" == "0" ]] && KVBD_VERIFY_JSON=false
 CONNECTOR_STAGING_BYTES=$((CONNECTOR_STAGING_GB * 1073741824))
+# Optional long-context overrides, appended only when set — the json.load
+# check below catches any malformed value before an engine ever boots.
+KVBD_EXTRA_JSON=""
+[[ -n "$KVBD_STORE_DRAIN_WORKERS" ]] && KVBD_EXTRA_JSON+=",
+   \"kvblockd_store_drain_workers\": $KVBD_STORE_DRAIN_WORKERS"
+[[ -n "$KVBD_STORE_FLUSH_TIMEOUT_S" ]] && KVBD_EXTRA_JSON+=",
+   \"kvblockd_store_flush_timeout_s\": $KVBD_STORE_FLUSH_TIMEOUT_S"
+[[ -n "$KVBD_LOAD_DEADLINE_S" ]] && KVBD_EXTRA_JSON+=",
+   \"kvblockd_load_deadline_s\": $KVBD_LOAD_DEADLINE_S"
+[[ -n "$KVBD_EXISTS_TIMEOUT_S" ]] && KVBD_EXTRA_JSON+=",
+   \"kvblockd_exists_timeout_s\": $KVBD_EXISTS_TIMEOUT_S"
+[[ -n "$KVBD_GET_FANOUT" ]] && KVBD_EXTRA_JSON+=",
+   \"kvblockd_get_fanout\": $KVBD_GET_FANOUT"
 cat > "$WORK/kv_transfer.json" <<EOF
 {"kv_connector": "KvblockdConnector", "kv_role": "kv_both",
  "kv_connector_module_path": "vllm_kvblockd.connector",
@@ -331,7 +365,7 @@ cat > "$WORK/kv_transfer.json" <<EOF
    "kvblockd_streams": $KVBD_STREAMS,
    "kvblockd_staging_bytes": $CONNECTOR_STAGING_BYTES,
    "kvblockd_store_queue_bytes": ${KVBD_STORE_QUEUE_BYTES:-1073741824},
-   "kvblockd_verify": $KVBD_VERIFY_JSON}}
+   "kvblockd_verify": $KVBD_VERIFY_JSON$KVBD_EXTRA_JSON}}
 EOF
 python3 -c "import json,sys; json.load(open('$WORK/kv_transfer.json'))" \
   || die "generated kv_transfer.json is not valid JSON"
@@ -402,6 +436,16 @@ start_vllm() {  # $1 = log file, $2 = health timeout seconds
   # phases (hf_overrides=), so a chart can never hide it.
   HF_OVR_ARGS=()
   if [[ -n "${HF_OVERRIDES:-}" ]]; then HF_OVR_ARGS=(--hf-overrides "$HF_OVERRIDES"); fi
+  # Engine-args fingerprint (CLAIMS PR-1): the canonical enumerate-and-pin
+  # string of every divergence-capable engine knob, sha256'd and stamped
+  # into every JSONL row. Both engine boots of a run derive it from the
+  # SAME env vars in this one function — hash inequality between the arms
+  # of a charted pair is therefore impossible unless the env changed
+  # mid-run, which is exactly what the stamp exists to catch.
+  ENGINE_ARGS_SHA=$(printf '%s' \
+    "model=$MODEL|dtype=bf16|kv_cache_dtype=${KV_CACHE_DTYPE:-auto}|max_model_len=$MAX_MODEL_LEN|max_num_seqs=1|gpu_mem_util=$GPU_MEM_UTIL|mnbt=${MAX_NUM_BATCHED_TOKENS:-engine-default}|prefix_caching=off|hybrid_kv=off|hf_overrides=${HF_OVERRIDES:-none}|pythonhashseed=0|gen_tokens=$GEN_TOKENS" \
+    | sha256sum | cut -c1-16)
+  export ENGINE_ARGS_SHA
   # ${KV_CACHE_DTYPE:+...}: the flag only exists when the knob is set; both
   # engine boots of a run read the same env var, so the two arms of a charted
   # pair can never disagree on KV dtype (the stamp makes it checkable).
@@ -410,6 +454,7 @@ start_vllm() {  # $1 = log file, $2 = health timeout seconds
     ${KV_CACHE_DTYPE:+--kv-cache-dtype "$KV_CACHE_DTYPE"} \
     --max-model-len "$MAX_MODEL_LEN" --max-num-seqs 1 \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
+    ${MAX_NUM_BATCHED_TOKENS:+--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"} \
     --no-enable-prefix-caching \
     --disable-hybrid-kv-cache-manager \
     "${HF_OVR_ARGS[@]}" \
@@ -616,15 +661,16 @@ if [[ "$BASELINE_ONLY" == "1" ]]; then
   log "baseline: lengths=$LENGTHS x $PAIRS pairs, NO connector — pure recompute control"
   rc=0
   python3 "$HERE/run_ttft.py" --phase baseline \
+  ${REQUEST_TIMEOUT:+--request-timeout "$REQUEST_TIMEOUT"} \
     --vllm "http://127.0.0.1:$VLLM_PORT" \
     --model "$MODEL" --lengths "$LENGTHS" --reps "$REPS" --warmup "$WARMUP" \
     --gen-tokens "$GEN_TOKENS" --out "$OUT_JSONL" \
-    --stamp gpu="$GPU_NAME (hf-jobs ${FLAVOR:-flavor-unset})" \
+    --stamp gpu="$GPU_NAME ($GPU_ANNOT)" \
     --stamp vllm="$VLLM_VER" --stamp connector="none (baseline control)" \
-    --stamp tc_link="$TC_LINK" --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
+    --stamp tc_link="$TC_LINK" --stamp rig="$RIG" \
     --stamp kv_cache_dtype="${KV_CACHE_DTYPE:-auto-bf16}" \
     ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \
-    --stamp git_sha="$GIT_SHA" || rc=$?
+    --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" || rc=$?
   log "JSONL at $OUT_JSONL ($(wc -l < "$OUT_JSONL" 2>/dev/null || echo 0) records)"
   [[ $rc -eq 0 ]] || { tail_logs; die "baseline driver exited rc=$rc"; }
   log "DONE (baseline)"
@@ -638,6 +684,7 @@ log "phase 1/2 populate: lengths=$LENGTHS x $PAIRS pairs; driver polls kvblockd'
 # for the connector's write-behind disclosure and ABORTS on a nonzero
 # `dropped=` — a lossy populate silently shrinks the warm set.
 python3 "$HERE/run_ttft.py" --phase populate \
+  ${REQUEST_TIMEOUT:+--request-timeout "$REQUEST_TIMEOUT"} \
   --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
   --model "$MODEL" --lengths "$LENGTHS" --reps "$REPS" --warmup "$WARMUP" \
   --state "$STATE_JSON" --put-wait-s "$PUT_WAIT_S" --drain-s "$DRAIN_S" \
@@ -721,8 +768,8 @@ if (( EQUIV_N > 0 )); then
     --model "$MODEL" --block-size 16 \
     --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" \
     --state "$EQUIV_STATE" --out "$EQUIV_OUT" \
-    --stamp isolation=vllm-restart --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
-    --stamp git_sha="$GIT_SHA" \
+    --stamp isolation=vllm-restart --stamp rig="$RIG" \
+    --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" \
     || die "token-identity compare FAILED — the warm arm must not be published without machine-checked same-dtype token identity (records above behind the EQUIV''JSONL marker)"
   # The kernel-determinism control's receipt (greppable: EQUIVCONTROL): the
   # store gate judged only the kernel-deterministic prompts; excluded prompts
@@ -789,17 +836,18 @@ log "phase 2/2 measure: reps=$REPS(+$WARMUP warmup) gen=$GEN_TOKENS link='$TC_LI
 # connector stamp, so every JSONL record names the path that produced it.
 rc=0
 python3 "$HERE/run_ttft.py" --phase measure \
+  ${REQUEST_TIMEOUT:+--request-timeout "$REQUEST_TIMEOUT"} \
   --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
   --model "$MODEL" --gen-tokens "$GEN_TOKENS" --block-size 16 \
   --state "$STATE_JSON" --out "$OUT_JSONL" --vllm-log "$WORK/vllm-measure.log" \
-  --stamp gpu="$GPU_NAME (hf-jobs ${FLAVOR:-flavor-unset})" \
+  --stamp gpu="$GPU_NAME ($GPU_ANNOT)" \
   --stamp vllm="$VLLM_VER" \
   --stamp connector="$CONNECTOR_STAMP" \
-  --stamp tc_link="$TC_LINK" --stamp rig="hf-jobs-${FLAVOR:-a10g}" \
+  --stamp tc_link="$TC_LINK" --stamp rig="$RIG" \
   --stamp kv_cache_dtype="${KV_CACHE_DTYPE:-auto-bf16}" \
   ${TOKEN_IDENTITY:+--stamp token_identity="$TOKEN_IDENTITY"} \
   ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \
-  --stamp git_sha="$GIT_SHA" || rc=$?
+  --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" || rc=$?
 
 # Path attribution receipt (the driver already stamped it into the JSONL):
 # on a CUDA run the fast path is chunked-slab — per-block means the pinned
