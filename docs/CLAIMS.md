@@ -399,5 +399,26 @@ codec measurement.
 
 ---
 
+## 8. EC2 L40S long-context sessions — pre-registered (no number exists yet)
+
+**Status: PRE-REGISTERED, frozen before any metered run.** The next
+measurement campaign (single-node L40S at 96k-262k tokens, then a two-node
+real-NIC session) publishes ONLY under the conditions below, registered in
+advance so the gate cannot drift toward whatever the session happens to
+score. Predictions for every cell were frozen in advance and the
+measured-vs-predicted table publishes for every cell, hit or miss.
+
+> **PR-1 (identical-engine-config).** Within every run, the recompute and reload arms boot the same vLLM 0.25.1 image digest with byte-identical flags, env (incl. PYTHONHASHSEED=0), hf snapshot, max-model-len, max-num-batched-tokens, gpu-memory-utilization, kv-cache-dtype, sampling params, and torch.compile cache state. The canonical enumerate-and-pin string of every divergence-capable engine knob (model, dtype, kv-cache dtype, max-model-len, max-num-seqs, gpu-mem-util, max-num-batched-tokens, prefix-caching, hybrid-kv, hf-overrides, PYTHONHASHSEED, gen-tokens) is sha256-stamped into every JSONL row as `engine_args_sha`; hash inequality between arms voids the run. The baseline is never crippled: no `--enforce-eager` asymmetry, no backend overrides, prefix caching off in ALL series.
+> **PR-2 (chunked-prefill disclosure).** Chunked prefill is on (V1 default; effectively cannot be off at these lengths). max_num_batched_tokens was tuned in a pre-registered sweep {8192, 16384, 32768} to MINIMIZE THE BASELINE's TTFT at the largest context, then frozen identically in both arms and stamped per-row. The warm arm is insensitive to chunk size because it computes only the tail block. This is the inverse of the vendor move. The previously published A10G multiples (10.2x/20.4x/26.4x) were measured with the engine default chunking at that pin (no explicit max_num_batched_tokens was set; the archived engine boot logs are the evidence of record and will be cited in the restating footnote); they are restated/footnoted with this methodology difference in the same release.
+> **PR-3 (loopback-vs-NIC split).** Every multiple is published twice where measured: loopback (single-host software ceiling, labeled) and real-NIC (deployable, labeled), each beside its same-rig iperf3 ceiling (METHODOLOGY rule 2), with tc state, ENA allowance counters, burst-window vs baseline-floor rows, and the shaped-egress asymmetry (GET shaped, PUT unshaped) disclosed on-chart.
+> **PR-4 (GPU-change disclosure).** The multiple scales inversely with GPU speed: a faster GPU shrinks it (reload is wire/CPU-bound; prefill is compute-bound). L40S numbers are not comparable to A10G numbers and are never mixed in one aggregate (aggregate.py's cell key omits gpu — rig-e and rig-g directories are never co-globbed). fp8 arms are served by FLASHINFER, bf16 arms by FLASH_ATTN, both by vLLM's own auto-selection; backend is stamped per-row and multiples are never quoted across the backend boundary without the label.
+> **PR-5 (baseline n and spread gates).** Headline (Tier A) cells: n=3 independent runs (fresh daemon + fresh engine boots per run); median reported; `report --check-repeat --tolerance 0.02` enforced; a cell still >2% spread after 5 total runs publishes WITH its spread disclosed, not re-rolled. Tier B curve cells: one run × 3 reps, labeled as such. The published multiple's denominator is the NO-connector baseline series (n=3); cold-with-connector is the disclosed secondary series (store-on-miss cost 1.00–1.06x published).
+> **PR-6 (model surgery disclosure).** Qwen2.5-7B-Instruct-1M runs with dual_chunk_attention_config deleted: DCA is impossible on mainline vLLM ≥0.11 (V0 backend removed), the vendor card certifies standard attention ≤262,144 tokens, all measured points ≤262,144, and both arms share the identical edited snapshot. The unmodified-model TypeError crash is archived as evidence. Any Llama point >98,304 that required rope handling would be labeled; none is planned (top Llama point 129,024, native).
+> **PR-7 (verification).** xxh3 per-block verify is ON in every published cell; one verify-off control cell is published, labeled "control, not a claim". Token-identity (equivalence) certification is fp8-vs-fp8 scoped, EQUIV_N=8 per fp8 job, with the EQUIVCONTROL receipt.
+> **PR-8 (competitor framing).** WEKA's 41x (105k, Llama-3.1-70B, 23.97→0.58 s, config only via NAND Research/later posts, no raw data, no n, no replication) is superseded by WEKA's own "up to 75x" @128k (TRT-LLM+GDS, 2025-06-20); both are cited whenever either is. DDN 27x→"up to 55x" (zero config) and Pure KVA 20x-NFS/6x-S3 (no token counts) are cited with their disclosure gaps. RDMA/GDS-tier numbers appear only in a "different league" table (rule 10). Pure's 6x-S3 is the honest direct comparison for the S3-tier story. All cited pages archived on publication day.
+> **PR-9 (pre-registered predictions).** The arm table's two predictor columns and the adopted conservative expectation were frozen before launch; A0-B/A0-F calibration re-anchors expectations and is itself logged; measured-vs-predicted is published for every cell, hit or miss.
+
+---
+
 *Changing any number above requires updating its section in the same commit
 — a claim without its conditions and falsification line does not ship.*
