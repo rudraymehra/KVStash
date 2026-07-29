@@ -313,6 +313,34 @@ GPU class is disclosed on every chart — a faster GPU shrinks the multiple
 of on-demand EC2 (3.72 box-hours × $1.212 + storage; the per-arm ledger is
 banked at `bench/results/rig-g/session-ledger.csv`).
 
+### The quarter-million-token cells (measured 2026-07-29 UTC, EC2 g6e.2xlarge, single L40S — Rig G)
+
+The pre-registered L40S session, run hours after the A10G table above — the
+same harness, gates, model surgery, fp8, loopback, and `mnbt=8192` freeze.
+Calibration first: the L40S prefills **2.8× faster** than the A10G at
+16k/32k (measured; the pre-registration's largest unknown), which per the
+disclosed formula shrinks every multiple — and stretches the reachable
+context to the model card's full certified window.
+
+| prefix | recompute (no connector)² | **kvblockd reload** | vs pure | best rep |
+|---|---|---|---|---|
+| 131k | 26,621 ms | **1,224 ms** (n=1) | **21.7×** | 21.9× |
+| 160k | 37,678 ms | **1,510 ms** (n=1) | **25.0×** | 25.1× |
+| **262,144** | **85,693 ms** | **2,474 ms** (n=2, 0.3%) | **34.6×** | 34.7× |
+
+² baseline: one run × (3+1) reps per point, five-point curve banked
+(`chart2-ttft-l40s-base-fp8-run1.jsonl`). The 262,144 cell runs at
+the model card's certified standard-attention ceiling — with a disclosed
+tokenizer overshoot: the prompt landed at 262,146 prefix tokens (+2 over
+target; the baseline row +4), visible in every banked record — resume a
+quarter-million-token session in 2.5 s. A third 256k run was refused by the
+token-identity gate (the fifth refusal of the campaign, a different prompt
+again; record banked under `refusals/`); the two certified runs agree
+within 0.3%. Read the two GPU tables together: the A10G carries the largest
+multiples (slower prefill), the L40S the largest contexts (more VRAM,
+faster prefill) — both corners published, per the pre-registration, with
+the same store underneath.
+
 ## When NOT to use kvblockd
 
 Below the crossover hit rate, recompute is cheaper than a remote fetch —

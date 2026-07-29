@@ -428,8 +428,15 @@ REFUSED by the PR-7 token-identity gate (refusal records banked under
 diverging on engine replay each time — engine-side; store bytes
 xxh3-verified exact in every run) and are disclosed in BENCHMARKS.md rather
 than re-rolled. 192k was refused by VRAM at boot (vLLM: max 179,392 tokens
-at these settings). The L40S 96k–262k table and the two-node real-NIC
-session remain pre-registered and OPEN under the same conditions.
+at these settings). **Second status update (2026-07-30, same-commit rule): the L40S session
+MEASURED.** Calibration: L40S/A10G prefill ratio 2.8× (the pre-registered
+band's largest unknown, now fixed). Cells (fp8, same conditions):
+21.7× @131k · 25.0× @160k · **34.6× @262,144 (n=2, 0.3% spread; best rep
+34.7×; a third run refused by the PR-7 gate, record banked)** — the 262,144
+point sits at the card's certified standard-attention ceiling: a
+quarter-million-token session resumed in 2.47 s vs 85.7 s recompute (actual prefix 262,146 tokens — a +2 tokenizer overshoot over the certified 262,144, disclosed), on
+plain TCP. Raw JSONL: `bench/results/rig-g/chart2-ttft-l40s-*.jsonl`. The
+two-node real-NIC session remains pre-registered and OPEN.
 
 > **PR-1 (identical-engine-config).** Within every run, the recompute and reload arms boot the same vLLM 0.25.1 image digest with byte-identical flags, env (incl. PYTHONHASHSEED=0), hf snapshot, max-model-len, max-num-batched-tokens, gpu-memory-utilization, kv-cache-dtype, sampling params, and torch.compile cache state. The canonical enumerate-and-pin string of every divergence-capable engine knob (model, dtype, kv-cache dtype, max-model-len, max-num-seqs, gpu-mem-util, max-num-batched-tokens, prefix-caching, hybrid-kv, hf-overrides, PYTHONHASHSEED, gen-tokens) is sha256-stamped into every JSONL row as `engine_args_sha`; hash inequality between arms voids the run. The baseline is never crippled: no `--enforce-eager` asymmetry, no backend overrides, prefix caching off in ALL series.
 > **PR-2 (chunked-prefill disclosure).** Chunked prefill is on (V1 default; effectively cannot be off at these lengths). max_num_batched_tokens was tuned in a pre-registered sweep {8192, 16384, 32768} to MINIMIZE THE BASELINE's TTFT at the largest context, then frozen identically in both arms and stamped per-row. The warm arm is insensitive to chunk size because it computes only the tail block. This is the inverse of the vendor move. The previously published A10G multiples (10.2x/20.4x/26.4x) were measured with the engine default chunking at that pin (no explicit max_num_batched_tokens was set; the archived engine boot logs are the evidence of record and will be cited in the restating footnote); they are restated/footnoted with this methodology difference in the same release.
