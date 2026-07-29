@@ -11,6 +11,7 @@ set -eu
 shutdown -h +150 "kvbench dead-man (bring-up window)"
 mountpoint -q /opt/dlami/nvme || exit 1   # the DLAMI mounts instance NVMe here; no mount = wrong image
 mkdir -p /opt/dlami/nvme/docker /opt/dlami/nvme/hf /opt/dlami/nvme/work
+chown -R ubuntu:ubuntu /opt/dlami/nvme/hf /opt/dlami/nvme/work   # user-data runs as root; the operator does not
 # MERGE the data-root in — the DLAMI's daemon.json carries the nvidia
 # runtime registration; clobbering it silently breaks `docker --gpus`.
 python3 - <<'PY'

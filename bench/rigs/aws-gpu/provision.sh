@@ -84,6 +84,7 @@ for AZ in us-east-1a us-east-1c us-east-1b us-east-1d; do
   if [[ $RC -eq 0 && "$IID" == i-* ]]; then
     log "LAUNCHED $IID in $AZ"
     echo "$IID" > "$STATE_DIR/gpu-instance-id"
+    echo "$INSTANCE_TYPE" > "$STATE_DIR/gpu-type"
     aws ec2 wait instance-running --region "$REGION" --instance-ids "$IID"
     IP=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
       --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)

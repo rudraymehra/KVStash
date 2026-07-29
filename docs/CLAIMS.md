@@ -399,7 +399,7 @@ codec measurement.
 
 ---
 
-## 8. EC2 L40S long-context sessions — pre-registered (no number exists yet)
+## 8. EC2 long-context sessions — pre-registered, first session MEASURED
 
 **Status: PRE-REGISTERED, frozen before any metered run.** The next
 measurement campaign (single-node L40S at 96k-262k tokens, then a two-node
@@ -407,6 +407,29 @@ real-NIC session) publishes ONLY under the conditions below, registered in
 advance so the gate cannot drift toward whatever the session happens to
 score. Predictions for every cell were frozen in advance and the
 measured-vs-predicted table publishes for every cell, hit or miss.
+
+**Status update (2026-07-29, same-commit rule): session 1 MEASURED — on an
+A10G (g5.2xlarge), not the planned L40S** (g6e was capacity-refused
+region-wide at run time; the GPU substitution is disclosed per PR-4 and the
+A10G is the multiple-friendlier, slower-prefill box). Measured, all
+conditions per this section, raw JSONL in
+`bench/results/rig-g/chart2-ttft-a10g-long-*.jsonl`: **31.2× @64k (n=3,
+0.8% spread) · 39.4× @96k (n=2, 0.5%) · 46.4× @131k (n=2, 1.9%; best rep
+47.0×) · 54.2× @160k (n=1, reps within 1.4%; best rep 55.0×)** — fp8_e4m3,
+Qwen2.5-7B-Instruct-1M in its card-sanctioned standard-attention mode
+(surgery stamped per PR-6), loopback, exact-count hit gate per rep.
+**PR-9 scoring, hits and misses:** the frozen prefill predictions hit
+within 5% at every length (27.7/51.8/82.9 s measured vs 29.0/54.3/86.8 s
+predicted); the frozen reload predictions MISSED optimistic (predicted
+multiples 40/52/64× at 64k/96k/128k assumed ~3.0 GB/s effective reload —
+realized ~2.0–2.1 GB/s at multi-GiB transfers on this host). Four run attempts (three run slots) were
+REFUSED by the PR-7 token-identity gate (refusal records banked under
+`bench/results/rig-g/refusals/`) (a different certification prompt
+diverging on engine replay each time — engine-side; store bytes
+xxh3-verified exact in every run) and are disclosed in BENCHMARKS.md rather
+than re-rolled. 192k was refused by VRAM at boot (vLLM: max 179,392 tokens
+at these settings). The L40S 96k–262k table and the two-node real-NIC
+session remain pre-registered and OPEN under the same conditions.
 
 > **PR-1 (identical-engine-config).** Within every run, the recompute and reload arms boot the same vLLM 0.25.1 image digest with byte-identical flags, env (incl. PYTHONHASHSEED=0), hf snapshot, max-model-len, max-num-batched-tokens, gpu-memory-utilization, kv-cache-dtype, sampling params, and torch.compile cache state. The canonical enumerate-and-pin string of every divergence-capable engine knob (model, dtype, kv-cache dtype, max-model-len, max-num-seqs, gpu-mem-util, max-num-batched-tokens, prefix-caching, hybrid-kv, hf-overrides, PYTHONHASHSEED, gen-tokens) is sha256-stamped into every JSONL row as `engine_args_sha`; hash inequality between arms voids the run. The baseline is never crippled: no `--enforce-eager` asymmetry, no backend overrides, prefix caching off in ALL series.
 > **PR-2 (chunked-prefill disclosure).** Chunked prefill is on (V1 default; effectively cannot be off at these lengths). max_num_batched_tokens was tuned in a pre-registered sweep {8192, 16384, 32768} to MINIMIZE THE BASELINE's TTFT at the largest context, then frozen identically in both arms and stamped per-row. The warm arm is insensitive to chunk size because it computes only the tail block. This is the inverse of the vendor move. The previously published A10G multiples (10.2x/20.4x/26.4x) were measured with the engine default chunking at that pin (no explicit max_num_batched_tokens was set; the archived engine boot logs are the evidence of record and will be cited in the restating footnote); they are restated/footnoted with this methodology difference in the same release.

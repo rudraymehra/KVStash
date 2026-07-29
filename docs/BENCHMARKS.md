@@ -264,6 +264,55 @@ now-configurable 4 GiB queue and recorded `dropped=0 failed=0`.
 
 ---
 
+### The long-context cells (measured 2026-07-29, EC2 g5.2xlarge, single A10G — Rig G)
+
+Same harness, same gates, driven onto a rented EC2 box by `bench/rigs/aws-gpu/`
+(the HF-Jobs measurement core reused byte-for-byte; `rig=ec2-g5-a10g` stamped
+per record). Model: Qwen2.5-7B-Instruct-1M served in its model-card-sanctioned
+standard-attention mode — `dual_chunk_attention_config` and the companion
+`sparse_attention_config.json` are removed from a local snapshot (DCA has no
+backend on vLLM 0.25.x; the card certifies standard attention ≤ 262,144
+tokens), the IDENTICAL snapshot serves both arms, and the surgery is stamped
+`model_surgery=` in every record. fp8_e4m3 KV, `max_num_batched_tokens=8192`
+frozen across every engine boot, loopback (disclosed), per-rep exact-count hit
+gate, token-identity certification around every restart.
+
+| prefix | recompute (no connector)² | **kvblockd reload** | vs pure | best rep |
+|---|---|---|---|---|
+| 64k  | 27,666 ms  | **886 ms** (n=3, 0.8%) | **31.2×** | 31.8× |
+| 96k  | 51,820 ms  | **1,317 ms** (n=2, 0.5%) | **39.4×** | 39.6× |
+| 131k | 82,883 ms  | **1,787 ms** (n=2, 1.9%) | **46.4×** | 47.0× |
+| 160k | 120,831 ms | **2,228 ms** (n=1, reps within 1.4% of median; 2.7% peak-to-peak) | **54.2×** | 55.0× |
+
+² baselines are one run × (2+1) reps (rep spreads ≤0.1%); calibration on the
+same box first reproduced the published HF-Jobs 16k/32k fp8 cells within
+8–13% (233.7 ms / 451.3 ms warm; ~2.4 points of the 32k gap is prompt length
+— this cell ran 32,768 tokens vs the published 32,000), proving the ported
+stack before any long cell was measured. Spreads above are peak-to-peak of
+run medians over the cell median, the same convention throughout. Raw JSONL: `bench/results/rig-g/chart2-ttft-a10g-long-*.jsonl`.
+
+**Why some cells are n<3, stated plainly:** the token-identity gate REFUSED
+four run attempts across three run slots (96k run3, 128k run3 twice, 160k
+run2) — in each refusal a DIFFERENT certification prompt diverged on engine
+replay (and the kernel-determinism control excluded 1–4 prompts per run,
+typically 1–2, disclosed in each record's token_identity stamp and in the
+banked refusal records: `bench/results/rig-g/refusals/` carries each refused
+run's EQUIVJSONL — the 128k retry overwrote its first attempt's log under
+the same tag, so the second attempt's records are the ones banked). The
+refused runs' warm timings were never recorded; the store's byte delivery was xxh3-verified
+exact in refused and certified runs alike. We publish the refusals rather
+than loosen a pre-registered gate. 192k was attempted and REFUSED BY VRAM at
+boot (vLLM: max feasible 179,392 tokens on 24 GB at these settings — the
+boot-log excerpt is banked at `bench/results/rig-g/refusals/192k-vram-refusal.log`)
+— 160k is this GPU's top rung, and the refusal cost $0.20.
+
+The multiple grows with context by the same physics as every table above
+(`speedup = prefill(L)/reload(L)`); the GPU is deliberately modest and the
+GPU class is disclosed on every chart — a faster GPU shrinks the multiple
+(see the A100 rows). The entire session that produced this table cost ~$4.7
+of on-demand EC2 (3.72 box-hours × $1.212 + storage; the per-arm ledger is
+banked at `bench/results/rig-g/session-ledger.csv`).
+
 ## When NOT to use kvblockd
 
 Below the crossover hit rate, recompute is cheaper than a remote fetch —

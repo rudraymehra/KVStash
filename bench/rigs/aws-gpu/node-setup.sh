@@ -28,7 +28,8 @@ log "GPU + docker-root assertions"
 "${SSH[@]}" bash -s <<'REMOTE'
 set -euo pipefail
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
-nvidia-smi --query-gpu=name --format=csv,noheader | grep -q L40S || { echo "NOT AN L40S"; exit 1; }
+# Accept either session GPU; the arm table binds RIG/GPU_ANNOT to the type.
+nvidia-smi --query-gpu=name --format=csv,noheader | grep -qE 'L40S|A10G' || { echo "NOT AN L40S/A10G"; exit 1; }
 sudo docker info 2>/dev/null | grep -i 'docker root dir' | grep -q /opt/dlami/nvme/docker || { echo "docker root not on NVMe"; exit 1; }
 # Wait out the user-data pull (backgrounded at boot):
 for i in $(seq 1 60); do
@@ -39,27 +40,16 @@ done
 # pass nvidia-smi on the host and still fail every arm):
 sudo docker run --rm --gpus all --entrypoint nvidia-smi \
   vllm/vllm-openai@sha256:f0b9a0dc75a9fca3b6811e3279367b2d6a448055a000bfd13859587d74cef268 \
-  --query-gpu=name --format=csv,noheader | grep -q L40S \
+  --query-gpu=name --format=csv,noheader | grep -qE 'L40S|A10G' \
   || { echo "GPU not visible inside docker"; exit 1; }
 REMOTE
 
-log "Qwen2.5-7B-Instruct-1M download + DCA strip (ungated, no token)"
+log "Qwen2.5-7B-Instruct-1M cache warm (ungated, no token; job.sh STRIP_DCA does the disclosed surgery per arm from this cache)"
 "${SSH[@]}" bash -s <<'REMOTE'
 set -euo pipefail
 export HF_HUB_ENABLE_HF_TRANSFER=1 HF_HOME=/opt/dlami/nvme/hf
 pip install -q -U "huggingface_hub[hf_transfer]" 2>/dev/null || pip install -q -U huggingface_hub
-python3 - <<'PY'
-from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen2.5-7B-Instruct-1M', local_dir='/opt/dlami/nvme/hf/qwen1m')
-PY
-python3 - <<'PY'
-import json
-p = '/opt/dlami/nvme/hf/qwen1m/config.json'
-c = json.load(open(p))
-removed = c.pop('dual_chunk_attention_config', None)
-json.dump(c, open(p, 'w'), indent=2)
-print('dual_chunk_attention_config removed:', removed is not None)
-PY
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-7B-Instruct-1M')"
 REMOTE
 
 if [[ "${SKIP_LLAMA:-0}" != "1" ]]; then

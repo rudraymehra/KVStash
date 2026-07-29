@@ -69,8 +69,14 @@ grep '^CHART2JSONL ' "$DEST/job.log" | sed 's/^CHART2JSONL //' > "$STATE_DIR/res
 N_REC=$(wc -l < "$STATE_DIR/results/$ARM-$TAG.jsonl" 2>/dev/null || echo 0)
 
 # Budget ledger line (console lags a day; wall-clock x rate is the truth).
+# Rate follows the box actually provisioned, not an assumed type.
+case "$(cat "$STATE_DIR/gpu-type" 2>/dev/null)" in
+  g5.2xlarge)  RATE=1.212 ;;
+  g6e.xlarge)  RATE=1.861 ;;
+  *)           RATE=2.242 ;;
+esac
 printf '%s,%s,%s,%d,%.2f\n' "$ARM" "$TAG" "$(date -u +%FT%TZ)" "$WALL_MIN" \
-  "$(echo "$WALL_MIN * 2.242 / 60" | bc -l)" >> "$STATE_DIR/ledger.csv"
+  "$(echo "$WALL_MIN * $RATE / 60" | bc -l)" >> "$STATE_DIR/ledger.csv"
 
 # ---- honesty gates (runbook §5), judged from the pulled logs ----------------
 GATE_FAIL=0
