@@ -15,6 +15,9 @@ die() { log "FATAL: $*"; exit 1; }
 run() { if [[ "${DRY_RUN:-0}" == "1" ]]; then { printf 'DRY-RUN>'; printf ' %q' "$@"; printf '\n'; } >&2; else "$@"; fi; }
 
 REGION=us-east-1
+# The G/VT quota lives on the kvbench account — every call in this rig must
+# use that profile, never the shell's ambient default.
+export AWS_PROFILE="${AWS_PROFILE:-kvbench}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-g6e.2xlarge}"
 KEY_NAME="${KEY_NAME:-kvbench}"
 VOLUME_GB="${VOLUME_GB:-100}"

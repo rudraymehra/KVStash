@@ -3,6 +3,7 @@
 # session is not over until this prints ALL-CLEAR.
 set -euo pipefail
 log() { printf '[teardown %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+export AWS_PROFILE="${AWS_PROFILE:-kvbench}"
 REGION=us-east-1
 STATE_DIR="${STATE_DIR:-$HOME/kvbench-dday}"
 

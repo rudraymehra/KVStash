@@ -13,12 +13,14 @@ set -euo pipefail
 log() { printf '[arm %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { log "FATAL: $*"; exit 1; }
 
+export AWS_PROFILE="${AWS_PROFILE:-kvbench}"
 ARM="${1:?usage: run-arm.sh <arm> <runtag>}"
 TAG="${2:?usage: run-arm.sh <arm> <runtag>}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${STATE_DIR:-$HOME/kvbench-dday}"
 IP=$(cat "$STATE_DIR/gpu-ip") || die "no gpu-ip — provision first"
-SSH=(ssh -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "ubuntu@$IP")
+SSH_KEY="${SSH_KEY:-$STATE_DIR/kvbench.pem}"
+SSH=(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "ubuntu@$IP")
 IMG="vllm/vllm-openai@sha256:f0b9a0dc75a9fca3b6811e3279367b2d6a448055a000bfd13859587d74cef268"
 DEST="$STATE_DIR/results/$ARM-$TAG"
 mkdir -p "$DEST"
@@ -60,9 +62,9 @@ T1=$(date +%s); WALL_MIN=$(( (T1 - T0) / 60 ))
 # Pull EVERYTHING back before judging anything. The engine logs are the
 # gates' EVIDENCE — for a connector arm their absence is itself a gate
 # failure (a missing log must never read as "no bad strings").
-scp -q -r "ubuntu@$IP:/opt/dlami/nvme/work/ttft-$ARM-$TAG/results" "$DEST/" 2>/dev/null || true
+scp -q -i "$SSH_KEY" -r "ubuntu@$IP:/opt/dlami/nvme/work/ttft-$ARM-$TAG/results" "$DEST/" 2>/dev/null || true
 VLLM_LOGS_OK=1
-scp -q "ubuntu@$IP:/opt/dlami/nvme/work/ttft-$ARM-$TAG/vllm-*.log" "$DEST/" 2>/dev/null || VLLM_LOGS_OK=0
+scp -q -i "$SSH_KEY" "ubuntu@$IP:/opt/dlami/nvme/work/ttft-$ARM-$TAG/vllm-*.log" "$DEST/" 2>/dev/null || VLLM_LOGS_OK=0
 grep '^CHART2JSONL ' "$DEST/job.log" | sed 's/^CHART2JSONL //' > "$STATE_DIR/results/$ARM-$TAG.jsonl" || true
 N_REC=$(wc -l < "$STATE_DIR/results/$ARM-$TAG.jsonl" 2>/dev/null || echo 0)
 

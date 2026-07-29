@@ -198,6 +198,57 @@ if [[ -n "$FP8_PREFLIGHT" && "$BASELINE_ONLY" == "1" ]]; then
   die "FP8_PREFLIGHT and BASELINE_ONLY=1 are mutually exclusive: the baseline control runs no daemon/connector, so there is nothing for the probe to witness — submit them as two separate jobs"
 fi
 
+# ---- 1b. STRIP_DCA: serve a long-context Qwen from a stripped local snapshot
+# Qwen2.5-*-1M ships dual-chunk attention (DCA) in two places: the
+# dual_chunk_attention_config key in config.json AND a companion
+# sparse_attention_config.json. DCA has no backend on vLLM >= 0.11 (the V0
+# engine it required was removed), so the unmodified repo dies at boot with a
+# layer_idx TypeError — and `--hf-overrides '{"dual_chunk_attention_config":
+# null}'` does NOT save it, because vLLM still reads the companion file from
+# the repo. The field-proven path is to serve from a LOCAL snapshot with both
+# removed, which is the model card's sanctioned standard-attention mode
+# (certified <= 262,144 tokens).
+#
+# HONESTY: this is model surgery and it is disclosed, not hidden — the stamp
+# below lands in every JSONL record, the run REFUSES if a measured length
+# exceeds the card's certified window, and the SAME stripped snapshot serves
+# both arms of a charted pair (one snapshot, both engine boots).
+MODEL_SURGERY=""
+if [[ "${STRIP_DCA:-0}" == "1" ]]; then
+  SNAP="$WORK/model-stripped"
+  log "STRIP_DCA=1: snapshotting $MODEL -> $SNAP (standard-attention mode)"
+  python3 - "$MODEL" "$SNAP" <<'PY' || die "snapshot download failed"
+import sys
+from huggingface_hub import snapshot_download
+snapshot_download(sys.argv[1], local_dir=sys.argv[2])
+PY
+  python3 - "$SNAP" <<'PY' || die "DCA strip failed"
+import json, os, sys
+d = sys.argv[1]
+cfg = os.path.join(d, 'config.json')
+c = json.load(open(cfg))
+had_key = c.pop('dual_chunk_attention_config', None) is not None
+json.dump(c, open(cfg, 'w'), indent=2)
+comp = os.path.join(d, 'sparse_attention_config.json')
+had_file = os.path.exists(comp)
+if had_file:
+    os.remove(comp)
+print(f"stripped: config_key={had_key} companion_file={had_file}")
+# Both must have been present, or this is not the model we think it is:
+if not (had_key and had_file):
+    sys.exit("STRIP_DCA on a model without DCA artifacts — refusing to fake a disclosure")
+PY
+  # The certified standard-attention window (model card). A measured point
+  # beyond it would be an undisclosed quality claim, so refuse outright.
+  MAXLEN_CERTIFIED=262144
+  for L in ${LENGTHS//,/ }; do
+    (( L <= MAXLEN_CERTIFIED )) || die "LENGTHS contains $L > $MAXLEN_CERTIFIED, the card's certified standard-attention window — refusing"
+  done
+  MODEL_SURGERY="dca-stripped from $MODEL (dual_chunk_attention_config key + sparse_attention_config.json removed; model-card standard-attention mode, certified <= ${MAXLEN_CERTIFIED}; identical snapshot serves both arms)"
+  MODEL="$SNAP"
+  log "MODEL now $MODEL — surgery disclosed in every JSONL record"
+fi
+
 # fp8 alias: vLLM spells the same e4m3 KV cache 'fp8' and 'fp8_e4m3', and the
 # connector normalizes them into ONE keyspace at boot (config.py's alias
 # table). Normalize the stamp too, or aggregate.py/plot.py would see 'fp8'
@@ -670,7 +721,7 @@ if [[ "$BASELINE_ONLY" == "1" ]]; then
     --stamp tc_link="$TC_LINK" --stamp rig="$RIG" \
     --stamp kv_cache_dtype="${KV_CACHE_DTYPE:-auto-bf16}" \
     ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \
-    --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" || rc=$?
+    --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" ${MODEL_SURGERY:+--stamp model_surgery="$MODEL_SURGERY"} || rc=$?
   log "JSONL at $OUT_JSONL ($(wc -l < "$OUT_JSONL" 2>/dev/null || echo 0) records)"
   [[ $rc -eq 0 ]] || { tail_logs; die "baseline driver exited rc=$rc"; }
   log "DONE (baseline)"
@@ -769,7 +820,7 @@ if (( EQUIV_N > 0 )); then
     --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" \
     --state "$EQUIV_STATE" --out "$EQUIV_OUT" \
     --stamp isolation=vllm-restart --stamp rig="$RIG" \
-    --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" \
+    --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" ${MODEL_SURGERY:+--stamp model_surgery="$MODEL_SURGERY"} \
     || die "token-identity compare FAILED — the warm arm must not be published without machine-checked same-dtype token identity (records above behind the EQUIV''JSONL marker)"
   # The kernel-determinism control's receipt (greppable: EQUIVCONTROL): the
   # store gate judged only the kernel-deterministic prompts; excluded prompts
@@ -847,7 +898,7 @@ python3 "$HERE/run_ttft.py" --phase measure \
   --stamp kv_cache_dtype="${KV_CACHE_DTYPE:-auto-bf16}" \
   ${TOKEN_IDENTITY:+--stamp token_identity="$TOKEN_IDENTITY"} \
   ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \
-  --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" || rc=$?
+  --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" ${MODEL_SURGERY:+--stamp model_surgery="$MODEL_SURGERY"} || rc=$?
 
 # Path attribution receipt (the driver already stamped it into the JSONL):
 # on a CUDA run the fast path is chunked-slab — per-block means the pinned

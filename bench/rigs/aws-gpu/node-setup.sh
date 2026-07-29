@@ -14,9 +14,11 @@ set -euo pipefail
 log() { printf '[setup %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { log "FATAL: $*"; exit 1; }
 
+export AWS_PROFILE="${AWS_PROFILE:-kvbench}"
 STATE_DIR="${STATE_DIR:-$HOME/kvbench-dday}"
 IP=$(cat "$STATE_DIR/gpu-ip") || die "no gpu-ip in $STATE_DIR — run provision.sh first"
-SSH=(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "ubuntu@$IP")
+SSH_KEY="${SSH_KEY:-$STATE_DIR/kvbench.pem}"
+SSH=(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "ubuntu@$IP")
 GIT_SHA=$(git -C "$(dirname "${BASH_SOURCE[0]}")/../../.." rev-parse HEAD)
 
 log "waiting for SSH on $IP"
