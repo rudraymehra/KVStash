@@ -341,6 +341,43 @@ multiples (slower prefill), the L40S the largest contexts (more VRAM,
 faster prefill) — both corners published, per the pre-registration, with
 the same store underneath.
 
+### The real-network cells (measured 2026-07-30, two nodes over a real NIC — Rig G)
+
+The loopback caveat, retired. A separate network-optimized store node
+(r6in.2xlarge) ran kvblockd; a g6e.2xlarge GPU node ran vLLM and the
+connector; every reload byte crossed a real VPC NIC between them. The
+harness refuses to enter this mode unless the store is on another host
+(a 127.x / same-host address dies at boot), and each run's log proves it
+entered external-daemon mode or the run is voided. iperf3 ceiling measured
+FIRST on the same pair, store→GPU (the reload direction), banked as its own
+artifact and quoted beside every cell. **bf16** (fp8 kernels are nondeterministic on these GPUs and the
+token-identity gate rightly refused them — the refusal record is banked
+under `refusals/`; bf16 certified cleanly, and the larger payload makes the
+wire matter *more*, not less). Qwen2.5-7B-1M, standard-attention mode,
+per-rep exact-count hit gate, token-identity certified.
+
+| context | link (iperf3 ceiling) | recompute² | **kvblockd reload** | vs pure |
+|---|---|---|---|---|
+| 32k  | ~19 Gbit burst (2.40 GB/s) | 3,608 ms  | **968 ms**    | **3.7×** |
+| 128k | ~19 Gbit burst (2.40 GB/s) | 30,562 ms | **4,030 ms**  | **7.6×** |
+| 128k | shaped 5 Gbit (0.61 GB/s)  | 30,562 ms | **12,586 ms** | **2.4×** |
+
+² bf16 pure-recompute baseline on the GPU node, one run × (2+1) reps.
+Raw JSONL: `bench/results/rig-g/chart2-ttft-twonode-bf16-*.jsonl`. The iperf3
+ceilings are banked as `bench/results/rig-g/iperf3-twonode-{unshaped,shaped5g}-store2gpu.json`
+(2.40 / 0.61 GB/s, store→GPU); tc state rides each record's `tc_link` stamp.
+
+**What this shows, stated plainly.** Reload beats recompute over a real
+network at every point, and the multiple **compresses as the link narrows**
+— 7.6× on a burst link, 2.4× when shaped to 5 Gbit — because reload is
+wire-bound while recompute is not (`speedup = prefill / reload`, and reload
+= KV bytes / link rate). This is the honest deployable number the loopback
+tables (10–54×) could not give: a customer reproduces *these* on their own
+NIC. The effective reload rate (~1.9 GB/s against the banked 2.40 GB/s
+ceiling at 32k) localizes the bottleneck to the connector, not the store:
+both the reload timing and the iperf3 ceiling it is measured against are
+committed artifacts, so the ratio is checkable, not asserted.
+
 ## When NOT to use kvblockd
 
 Below the crossover hit rate, recompute is cheaper than a remote fetch —
