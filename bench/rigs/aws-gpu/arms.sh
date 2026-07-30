@@ -73,6 +73,41 @@ REQUEST_TIMEOUT=900
 AEOF
 }
 
+# Two-node real-NIC arms: the store lives on the store node, so the connector
+# is pointed across the NIC (job.sh EXTERNAL_DAEMON mode), the arena is the
+# store host's RAM, and TC_LINK carries whatever shaping the session applied.
+# fp8 keeps the payload honest-sized for a 5-12 Gbit link.
+nic_common() { # $1 = LENGTHS
+  # Refuse to emit a nic arm without its two required session facts: where
+  # the store is, and what the link was shaped to ("unshaped" is explicit).
+  : "${STORE_PRIVATE_IP:?nic arms need STORE_PRIVATE_IP (from kvbench-dday/store-private-ip)}"
+  : "${STORE_TC_GBIT:?nic arms need STORE_TC_GBIT set to a gbit number or the word unshaped - the link rate is the independent variable}"
+  cat <<NEOF
+MODEL=Qwen/Qwen2.5-7B-Instruct-1M
+STRIP_DCA=1
+HF_HOME=/nvme/hf
+KV_CACHE_DTYPE=fp8_e4m3
+KV_BYTES_PER_TOKEN=28672
+LENGTHS=$1
+GEN_TOKENS=16
+GPU_MEM_UTIL=0.92
+MAX_NUM_BATCHED_TOKENS=8192
+RIG=ec2-twonode-nic
+GPU_ANNOT=ec2 g5.2xlarge + r6in.2xlarge store
+EXTERNAL_DAEMON=$STORE_PRIVATE_IP:9440
+EXTERNAL_METRICS=$STORE_PRIVATE_IP:9442
+TC_LINK=two-node real NIC, store egress ${STORE_TC_GBIT} (htb+fq; iperf3 ceiling in session artifacts)
+KVBD_STREAMS=8
+KVBD_STORE_DRAIN_WORKERS=4
+KVBD_STORE_FLUSH_TIMEOUT_S=180
+KVBD_LOAD_DEADLINE_S=300
+KVBD_EXISTS_TIMEOUT_S=3.0
+KVBD_GET_FANOUT=$KVB_FANOUT
+KVBD_STORE_QUEUE_BYTES=4294967296
+REQUEST_TIMEOUT=900
+NEOF
+}
+
 arm_env() {
   case "$1" in
     # ---- calibration block (runs first; re-anchors predictions) ----
@@ -129,6 +164,10 @@ arm_env() {
     a10g-base-192k) a10g_common 196608 | sed 's/^GPU_MEM_UTIL=.*/GPU_MEM_UTIL=0.93/'; echo "BASELINE_ONLY=1"; echo "REPS=2"; echo "WARMUP=1" ;;
     a10g-base) a10g_common 65536,98304,131072; echo "BASELINE_ONLY=1"; echo "REPS=2"; echo "WARMUP=1" ;;
     a10g-base-cal) a10g_common 16384,32768; echo "BASELINE_ONLY=1"; echo "REPS=3"; echo "WARMUP=1" ;;
+    # ---- two-node real-NIC (Session 2) ----
+    nic-32k)  nic_common 32768;  echo "REPS=3"; echo "WARMUP=1" ;;
+    nic-64k)  nic_common 65536;  echo "REPS=2"; echo "WARMUP=1" ;;
+    nic-128k) nic_common 131072; echo "REPS=2"; echo "WARMUP=1" ;;
     *) echo "unknown arm: $1" >&2; return 1 ;;
   esac
 }

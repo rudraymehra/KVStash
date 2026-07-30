@@ -29,6 +29,11 @@ mkdir -p "$DEST"
 # arms.sh exit status is checked EXPLICITLY: process-substitution failures
 # escape set -e, and a typo'd arm silently launching a full default job
 # (stamped hf-jobs-*) from this box would be spend + falsified provenance.
+# nic arms: default the store ip from the session state so a forgotten
+# export refuses in arms.sh rather than dialing a host named "unset".
+if [[ "$ARM" == nic-* && -z "${STORE_PRIVATE_IP:-}" && -s "$STATE_DIR/store-private-ip" ]]; then
+  export STORE_PRIVATE_IP; STORE_PRIVATE_IP=$(cat "$STATE_DIR/store-private-ip")
+fi
 ENV_LINES=$(bash "$HERE/arms.sh" "$ARM") || die "arms.sh rejected arm '$ARM'"
 [[ -n "$ENV_LINES" ]] || die "arms.sh emitted nothing for '$ARM'"
 ENV_ARGS=()
@@ -97,6 +102,14 @@ if [[ $IS_BASELINE -eq 0 ]]; then
     || log "WARN: store-queue shutdown line absent (known teardown race) — check populate gate output above"
 else
   grep -q 'Creating v1 connector' "$DEST"/vllm-*.log 2>/dev/null && gate "BASELINE run booted a connector — run voided"
+fi
+# Two-node arms: the run must PROVE it entered external-daemon mode — a
+# stale job.sh on the node would silently measure loopback under a NIC stamp.
+if printf '%s\n' "${ENV_ARGS[@]}" | grep -q 'EXTERNAL_DAEMON='; then
+  grep -q 'using EXTERNAL kvblockd at' "$DEST/job.log" \
+    || gate "nic arm never entered external-daemon mode — loopback measured, run voided"
+  grep -q 'starting kvblockd (DRAM arena' "$DEST/job.log" \
+    && gate "nic arm started a LOCAL daemon — loopback measured, run voided"
 fi
 if [[ $IS_FP8 -eq 1 && $IS_BASELINE -eq 0 ]]; then
   grep -qi 'flashinfer' "$DEST"/vllm-*.log 2>/dev/null || gate "fp8 arm without a FlashInfer boot line — backend gate"

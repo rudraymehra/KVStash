@@ -150,9 +150,29 @@ DRAIN_S="${DRAIN_S:-5}"                       # populate: put counters must be q
 TC_RATE_GBIT="${TC_RATE_GBIT:-}"              # optional loopback shaping; HF Jobs likely lack NET_ADMIN — detected, not assumed
 RESULTS_REPO="${RESULTS_REPO:-}"              # optional HF DATASET repo for the JSONL (e.g. binarybhakt/kvstash-bench)
 VLLM_PORT="${VLLM_PORT:-8000}"
-KVBD_ADDR="127.0.0.1:9440"
-KVBD_METRICS="127.0.0.1:9442"
-KVBD_TOKEN="hf-gpu-token"
+# EXTERNAL_DAEMON: point the connector at a kvblockd on ANOTHER HOST — the
+# two-node real-NIC arm. When set, this script builds no daemon config, starts
+# no daemon, and never assumes loopback: the store lives across a NIC, so
+# every byte of every reload crosses the wire.
+#   EXTERNAL_DAEMON=<host>:<data-port>  EXTERNAL_METRICS=<host>:<ops-port>
+EXTERNAL_DAEMON="${EXTERNAL_DAEMON:-}"
+EXTERNAL_METRICS="${EXTERNAL_METRICS:-}"
+if [[ -n "$EXTERNAL_DAEMON" ]]; then
+  [[ -n "$EXTERNAL_METRICS" ]] || { printf '[job] FATAL: EXTERNAL_DAEMON set without EXTERNAL_METRICS — the hit gate reads the daemon metrics endpoint\n' >&2; exit 1; }
+  [[ -n "$TC_RATE_GBIT" ]] && { printf '[job] FATAL: TC_RATE_GBIT shapes LOOPBACK and would stamp a loopback link onto a two-node run — shape the store host egress instead (store-node.sh shape)\n' >&2; exit 1; }
+  case "${EXTERNAL_DAEMON%%:*}" in
+    127.*|localhost|::1) printf '[job] FATAL: EXTERNAL_DAEMON points at THIS box (%s) — that is a loopback run wearing a two-node stamp\n' "$EXTERNAL_DAEMON" >&2; exit 1 ;;
+  esac
+  if command -v hostname >/dev/null 2>&1 && hostname -I 2>/dev/null | tr ' ' '\n' | grep -qx "${EXTERNAL_DAEMON%%:*}"; then
+    printf '[job] FATAL: EXTERNAL_DAEMON host %s is one of this box'"'"'s own addresses — same-host, not two-node\n' "$EXTERNAL_DAEMON" >&2; exit 1
+  fi
+  KVBD_ADDR="$EXTERNAL_DAEMON"
+  KVBD_METRICS="$EXTERNAL_METRICS"
+else
+  KVBD_ADDR="127.0.0.1:9440"
+  KVBD_METRICS="127.0.0.1:9442"
+fi
+KVBD_TOKEN="${KVBD_TOKEN:-hf-gpu-token}"
 OUT_JSONL="$WORK/results/chart2-ttft.jsonl"
 STATE_JSON="$WORK/results/chart2-state.json"
 
@@ -310,8 +330,11 @@ if [[ "$KV_CACHE_DTYPE" == fp8* && "$KV_BYTES_PER_TOKEN" == "131072" ]]; then
 fi
 
 PAIRS=$((REPS + WARMUP))
-if [[ "$BASELINE_ONLY" == "1" ]]; then
-  KVBD_ARENA_BYTES=0   # no daemon in this mode; silence the derivation below
+if [[ "$BASELINE_ONLY" == "1" || -n "$EXTERNAL_DAEMON" ]]; then
+  # No LOCAL daemon in either mode: baseline runs none at all, and the
+  # external-daemon arm's arena is the remote store host's RAM (sized by the
+  # session driver there), so this box budgets only staging + vLLM.
+  KVBD_ARENA_BYTES=0
 fi
 # Equivalence prompts live in the SAME arena across the restart: boundary
 # cells top out at 257 tokens (multiples 4,16 at block 16) + 32 gen + slack.
@@ -370,6 +393,12 @@ cat > "$WORK/namespaces.yaml" <<EOF
 namespaces:
   - { name: vllm, id: 1, token: $KVBD_TOKEN }
 EOF
+# In external-daemon mode nothing local reads this file (the store runs on
+# another host, configured there) — it is written anyway so the run's work dir
+# records the arena arithmetic that WOULD have applied, marked inert.
+if [[ -n "$EXTERNAL_DAEMON" ]]; then
+  log "external mode: local kvblockd.yaml is INERT (store configured on $EXTERNAL_DAEMON's host)"
+fi
 cat > "$WORK/kvblockd.yaml" <<EOF
 # DRAM-only daemon for the TTFT rig (single box; NVMe/S3 tiers not exercised
 # here). The arena must hold the ENTIRE populated sweep across the vLLM
@@ -423,7 +452,13 @@ python3 -c "import json,sys; json.load(open('$WORK/kv_transfer.json'))" \
 fi  # BASELINE_ONLY skip of build/pip/configs
 
 # ---- 5. link shaping: attempt only if asked; record the truth either way ----
-TC_LINK="unshaped-loopback (tc shaping not attempted)"
+if [[ -n "$EXTERNAL_DAEMON" ]]; then
+  # A two-node arm crosses a real NIC: the stamp says so, and the session
+  # driver passes the shaped rate it applied on the store host via TC_LINK.
+  TC_LINK="${TC_LINK:-real-NIC two-node (store at $EXTERNAL_DAEMON, shaping per session driver)}"
+else
+  TC_LINK="unshaped-loopback (tc shaping not attempted)"
+fi
 if [[ -n "$TC_RATE_GBIT" ]]; then
   if command -v tc >/dev/null 2>&1 \
      && tc qdisc replace dev lo root tbf rate "${TC_RATE_GBIT}gbit" burst 32mbit latency 1ms 2>/dev/null; then
@@ -437,10 +472,19 @@ fi
 
 # ---- 6. start kvblockd (stays up across BOTH vLLM lifetimes) -----------------
 if [[ "$BASELINE_ONLY" != "1" ]]; then
-  log "starting kvblockd (DRAM arena $KVBD_ARENA_BYTES bytes)"
-  "$WORK/bin/kvblockd" -config "$WORK/kvblockd.yaml" > "$WORK/kvbd.log" 2>&1 &
-  KVBD_PID=$!
-  bash "$ROOT/scripts/wait-healthz.sh" "$KVBD_METRICS" 30
+  if [[ -n "$EXTERNAL_DAEMON" ]]; then
+    # Store on another host: prove it is reachable and healthy ACROSS THE NIC
+    # before a GPU-minute is spent. A two-node number measured against an
+    # unreachable store would silently be a recompute number.
+    log "using EXTERNAL kvblockd at $KVBD_ADDR (metrics $KVBD_METRICS) — no local daemon"
+    bash "$ROOT/scripts/wait-healthz.sh" "$KVBD_METRICS" 30 \
+      || die "external kvblockd at $KVBD_METRICS is not healthy — refusing to measure a two-node arm against an unreachable store"
+  else
+    log "starting kvblockd (DRAM arena $KVBD_ARENA_BYTES bytes)"
+    "$WORK/bin/kvblockd" -config "$WORK/kvblockd.yaml" > "$WORK/kvbd.log" 2>&1 &
+    KVBD_PID=$!
+    bash "$ROOT/scripts/wait-healthz.sh" "$KVBD_METRICS" 30
+  fi
 fi
 
 # ---- 7. driver selftest BEFORE spending GPU-minutes on requests -------------
