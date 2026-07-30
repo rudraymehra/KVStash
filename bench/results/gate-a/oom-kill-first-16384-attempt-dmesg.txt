@@ -1,0 +1,2 @@
+[Thu Jul 30 20:03:53 2026] oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=user.slice,mems_allowed=0,global_oom,task_memcg=/user.slice/user-1000.slice/session-6.scope,task=kvblockd,pid=6575,uid=1000
+[Thu Jul 30 20:03:53 2026] Out of memory: Killed process 6575 (kvblockd) total-vm:37672136kB, anon-rss:35403452kB, file-rss:1152kB, shmem-rss:0kB, UID:1000 pgtables:69548kB oom_score_adj:0
