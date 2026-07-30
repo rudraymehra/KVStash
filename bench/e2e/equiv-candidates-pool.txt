@@ -1,0 +1,70 @@
+# CANDIDATE POOL for margin calibration — NOT a frozen certification corpus.
+#
+# These are candidates only. The frozen corpus is built from the subset that a
+# MEASURED calibration pass (bench/e2e/equivalence.py --phase calibrate) finds
+# both self-consistent on the target engine and above the pre-registered margin
+# floor. Selection uses only those two ENGINE properties; the calibration phase
+# never runs a store comparison, so it cannot select for a passing gate.
+#
+# Why a pool at all: the first hand-written corpus was designed from intuition
+# and measurement disproved it — 10 of 16 of its prompts were near-ties on the
+# target model, and 6 more were prompts the engine could not even replay against
+# itself (HF jobs 6a6b7a5623ed89c748ec7f73 and 6a6b7c1023ed89c748ec7fa1, both
+# committed as refusals). Guessing which prompts are greedy-stable does not
+# work; measuring does.
+#
+# Bias of the pool, stated: these lean on verbatim continuation, counting and
+# mechanical patterns, because those are where an LLM's argmax is furthest from
+# a tie. That is deliberate — a certification prompt exists to be reproducible,
+# not to be interesting. Store faults remain fully detectable on them: wrong
+# bytes, a wrong slot or a stale block change the continuation regardless of how
+# wide the winning margin was.
+
+Repeat this exact list and stop: one, two, three, four, five, six, seven,
+Copy the following digits exactly and then stop: 1 2 3 4 5 6 7 8 9
+Echo this sequence verbatim: A B C D E F G H
+Continue counting by ones and stop at twelve: 1, 2, 3, 4, 5, 6, 7, 8,
+Continue counting by tens: 10, 20, 30, 40, 50, 60, 70,
+Continue counting by fives: 5, 10, 15, 20, 25, 30,
+Continue this pattern exactly: ab ab ab ab ab ab
+Continue this pattern exactly: xy xy xy xy xy xy
+Repeat after me exactly: red green blue red green blue
+Write the digits of the number one hundred twenty three in order: 1 2
+The next three integers after ten are eleven, twelve and
+Complete the sequence: Monday, Tuesday, Wednesday, Thursday,
+Complete the sequence: January, February, March, April,
+Complete: first, second, third, fourth, fifth,
+Fill in: a, b, c, d, e, f,
+Fill in: 2, 4, 8, 16, 32,
+Fill in: 1, 4, 9, 16, 25,
+Multiplication table of two: 2, 4, 6, 8, 10, 12,
+Multiplication table of three: 3, 6, 9, 12, 15,
+Multiplication table of ten: 10, 20, 30, 40,
+Count down and stop at one: 10, 9, 8, 7, 6, 5,
+Count down and stop at one: 5, 4, 3,
+Spell the word HELLO one letter per token: H E L L
+Spell the word WORLD one letter per token: W O R L
+Repeat the word yes five times: yes yes yes yes
+Repeat the word no four times: no no no
+Say the following exactly once and stop: the answer is forty two
+Output exactly this and nothing else: status ok
+Output exactly this and nothing else: count 1
+Output exactly this list and nothing else: 1, 2, 3
+Two plus two equals four. Three plus three equals six. Four plus four equals
+One times one is one. Two times two is four. Three times three is
+Ten minus one is nine. Nine minus one is eight. Eight minus one is
+Half of ten is five. Half of eight is four. Half of six is
+Double two is four. Double four is eight. Double eight is
+The capital of France is Paris. The capital of Japan is Tokyo. The capital of Italy is
+Water is H2O. Salt is NaCl. Carbon dioxide is
+Cats say meow. Dogs say woof. Cows say
+Red, orange, yellow, green, blue, indigo,
+The four cardinal directions are north, south, east and
+In Python, 2 + 2 evaluates to 4. In Python, 3 * 3 evaluates to
+The first three lines print 1, then 2, then
+A loop over range(3) prints 0, then 1, then
+The function returns 1. The second function returns
+If x is 1 and y is 2 then x plus y is
+True and True is True. True and False is
+The binary of two is 10. The binary of four is 100. The binary of eight is
+A week has seven days. A fortnight has fourteen days. Two fortnights have

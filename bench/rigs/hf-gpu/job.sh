@@ -112,6 +112,11 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"          # optional --kv-cache-dtype for vL
                                               # plot.py/aggregate.py refuse mixed-dtype inputs. On an
                                               # explicit KV_BYTES_PER_TOKEN that still looks like the
                                               # bf16 default under fp8, WARN below.
+MARGIN_CALIBRATE="${MARGIN_CALIBRATE:-}"      # path to a CANDIDATE pool: boot one engine,
+                                              # measure each candidate's greedy stability
+                                              # (margin + self-consistency), print CALIBJSONL,
+                                              # exit. No daemon, no connector, no store — so it
+                                              # cannot select on a store outcome it never sees.
 EQUIV_PROMPT_SET="${EQUIV_PROMPT_SET:-}"   # frozen high-margin corpus (CLAIMS.md fp8
                                               # amendment 2). Empty -> the legacy
                                               # length-calibrated filler prompts;
@@ -796,6 +801,25 @@ if [[ "$BASELINE_ONLY" == "1" ]]; then
   [[ $rc -eq 0 ]] || { tail_logs; die "baseline driver exited rc=$rc"; }
   log "DONE (baseline)"
   exit 0
+fi
+
+# ---- 6b. MARGIN CALIBRATION (optional, terminal): measure candidate prompts
+# against a real engine and stop. This is how the frozen certification corpus
+# gets chosen by measurement instead of by intuition.
+if [[ -n "$MARGIN_CALIBRATE" ]]; then
+  [[ -f "$MARGIN_CALIBRATE" ]] || die "MARGIN_CALIBRATE=$MARGIN_CALIBRATE not found"
+  start_vllm "$WORK/vllm-calibrate.log" 900
+  log "margin calibration against $MARGIN_CALIBRATE (no store involved)"
+  rc_cal=0
+  python3 "$ROOT/bench/e2e/equivalence.py" --phase calibrate \
+    --vllm "http://127.0.0.1:$VLLM_PORT" --model "$MODEL" \
+    --prompt-set "$MARGIN_CALIBRATE" \
+    --gen-tokens "${EQUIV_GEN_TOKENS:-8}" \
+    --margin-floor "${EQUIV_MARGIN_FLOOR:-2.0}" \
+    --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" || rc_cal=$?
+  log "margin calibration finished rc=$rc_cal (CALIBJSONL lines above)"
+  kill "$VLLM_PID" 2>/dev/null || true
+  exit "$rc_cal"
 fi
 
 # ---- 9. PHASE 1: populate (vLLM #1 stores every sweep prompt into kvblockd) --

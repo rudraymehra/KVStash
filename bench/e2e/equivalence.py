@@ -380,6 +380,73 @@ def load_prompt_corpus(path: str) -> tuple[list[str], str]:
     return prompts, digest
 
 
+# ------------------------------------------------------ phase: margin-calibrate
+
+def run_calibrate(args) -> int:
+    """Measure each CANDIDATE prompt's greedy stability on this engine and
+    print one CALIBJSONL line per prompt.
+
+    Why this phase exists, and why it is not cherry-picking: the frozen corpus
+    must contain prompts whose argmax is robust to fp8 numerical noise, and the
+    honest way to know that is to MEASURE it rather than assume it (the first
+    corpus was written from intuition; 10 of 16 of its prompts turned out to be
+    near-ties on the target model). This phase looks at exactly two engine
+    properties — the top1-top2 logprob gap over the frozen horizon, and whether
+    the engine reproduces itself back-to-back — and never at whether a reload
+    matched. It cannot select for a passing store gate because it never runs
+    one: no store, no restart, no comparison. The selected set is then frozen
+    and checksummed before any certification run, and the calibration output is
+    committed beside it so the selection is auditable."""
+    candidates, sha = load_prompt_corpus(args.prompt_set)
+    print(f"[calibrate] {len(candidates)} candidates from {args.prompt_set} "
+          f"(sha256={sha}), horizon={args.margin_horizon}, "
+          f"gen_tokens={args.gen_tokens}, dtype={args.kv_cache_dtype}", flush=True)
+    kept = 0
+    for i, entry in enumerate(candidates):
+        nonce = f"cal{i:03d}-{uuid.uuid4().hex[:8]}"
+        prompt = f"kvstash-equiv {nonce} :: {entry}"
+        try:
+            a = complete_greedy(args.vllm, args.model, prompt, args.gen_tokens,
+                                args.seed, args.request_timeout,
+                                want_margins=True,
+                                margin_horizon=args.margin_horizon)
+            b = complete_greedy(args.vllm, args.model, prompt, args.gen_tokens,
+                                args.seed, args.request_timeout)
+        except Exception as e:                     # noqa: BLE001 - report, continue
+            print(f"[calibrate] i={i} ERROR {e}", flush=True)
+            continue
+        if a["tokens"] is not None and b["tokens"] is not None:
+            div = first_divergence(a["tokens"], b["tokens"])
+        else:
+            div = first_divergence(list(a["text"]), list(b["text"]))
+        rec = {"schema_version": 1, "kind": "margin-calibration", "i": i,
+               "candidate_sha256": sha, "prompt_text": entry,
+               "min_margin": a.get("min_margin"),
+               "self_consistent": div is None,
+               "self_divergence_index": div,
+               "kv_cache_dtype": args.kv_cache_dtype,
+               "margin_horizon": args.margin_horizon,
+               "gen_tokens": args.gen_tokens,
+               "model": args.model}
+        eligible = (rec["self_consistent"] and rec["min_margin"] is not None
+                    and rec["min_margin"] >= args.margin_floor)
+        rec["eligible"] = eligible
+        kept += int(eligible)
+        print("CALIBJSONL " + json.dumps(rec, sort_keys=True), flush=True)
+        print(f"[calibrate] i={i} margin={rec['min_margin']} "
+              f"self_consistent={rec['self_consistent']} eligible={eligible}",
+              flush=True)
+    print(f"[calibrate] {kept}/{len(candidates)} candidates are eligible "
+          f"(self-consistent AND margin >= {args.margin_floor})", flush=True)
+    if kept == 0:
+        print("FATAL(calibrate): no candidate is both self-consistent and above "
+              "the margin floor on this engine — certification cannot be made to "
+              "work by prompt selection here; that is the finding.",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
 # --------------------------------------------------------------- phase: record
 
 def run_record(args) -> int:
@@ -1400,7 +1467,7 @@ def selftest() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--phase", choices=("record", "compare"))
+    ap.add_argument("--phase", choices=("record", "compare", "calibrate"))
     ap.add_argument("--vllm", default="http://127.0.0.1:8000")
     ap.add_argument("--metrics", default="",
                     help="kvblockd metrics endpoint; empty skips the store "
@@ -1469,8 +1536,13 @@ def main() -> int:
     if args.selftest:
         return selftest()
     if not args.phase:
-        ap.error("--phase record|compare is required (or --selftest); the two "
-                 "phases run around an engine restart — see the docstring")
+        ap.error("--phase record|compare|calibrate is required (or --selftest); "
+                 "record/compare run around an engine restart — see the docstring")
+
+    if args.phase == "calibrate":
+        if not args.prompt_set:
+            ap.error("--phase calibrate needs --prompt-set (the CANDIDATE pool)")
+        return run_calibrate(args)
 
     if args.phase == "record":
         try:
