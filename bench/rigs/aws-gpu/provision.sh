@@ -60,7 +60,10 @@ run aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG"
   --protocol tcp --port 22 --cidr "$MYIP" 2>/dev/null || true
 
 # AZ ladder: g6e exists only in these four; 1a shows the loosest capacity.
-for AZ in us-east-1a us-east-1c us-east-1b us-east-1d; do
+# AZ_ONLY pins the ladder to one AZ — a two-node session wants the GPU in
+# the STORE's AZ (cross-AZ adds per-GB transfer cost and a latency delta
+# that pollutes comparability with the banked same-AZ cells).
+for AZ in ${AZ_ONLY:-us-east-1a us-east-1c us-east-1b us-east-1d}; do
   SUBNET=$(aws ec2 describe-subnets --region "$REGION" \
     --filters "Name=availability-zone,Values=$AZ" "Name=default-for-az,Values=true" \
     --query 'Subnets[0].SubnetId' --output text)
