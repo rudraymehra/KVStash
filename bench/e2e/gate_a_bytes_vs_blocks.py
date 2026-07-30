@@ -102,12 +102,23 @@ def start_daemon(arena_bytes: int):
 
 
 def measure(dport: int, blocks: int, block_bytes: int) -> tuple[float, float]:
-    """Populate `blocks` of `block_bytes`, then time a full verified reload."""
+    """Populate `blocks` of `block_bytes`, then time a full verified reload.
+
+    The reload streams in bounded key batches (default 512 = the server's
+    DefaultMaxBatchKeys) and DISCARDS each chunk's payloads after counting
+    hits: holding every value, as the first version did, put ~17 GB of
+    client RSS beside the daemon's prefaulted arena at BLOCKS=16384 and the
+    kernel OOM killer took the daemon mid-read (dmesg banked next to the
+    artifacts). Chunking is identical in both arms — equal block count,
+    equal batch shape — so the ratio semantics are unchanged, and bounded
+    batches are what the real connector sends anyway.
+    """
     payload = os.urandom(block_bytes)          # incompressible, per methodology
     # Keys are 32-byte prefix hashes by contract; derive distinct ones per
     # (size, index) so the two arms never share a key.
     keys = [hashlib.sha256(f"gateA-{block_bytes}-{i}".encode()).digest()
             for i in range(blocks)]
+    chunk = int(os.environ.get("CHUNK_KEYS", "512"))
     c = Client(("127.0.0.1", dport), namespace="t", token="sekret")
     try:
         for k in keys:
@@ -115,9 +126,11 @@ def measure(dport: int, blocks: int, block_bytes: int) -> tuple[float, float]:
         best = None
         for _ in range(REPS):
             t0 = time.perf_counter()
-            vals, _statuses = c.batch_get_bytes(keys)  # real wire path + xxh3 verify
+            hits = 0
+            for off in range(0, blocks, chunk):
+                vals, _statuses = c.batch_get_bytes(keys[off:off + chunk])
+                hits += sum(1 for v in vals if v is not None)
             dt = time.perf_counter() - t0
-            hits = sum(1 for v in vals if v is not None)
             if hits != blocks:
                 # Explicit raise, not assert: survives python -O, and a miss
                 # here means eviction/arena pressure, which would otherwise be
