@@ -392,10 +392,26 @@ warm rep, which is why the refused runs are published rather than hidden.
    registered. Without this the
    screen would have silently narrowed certification to the first block or two
    — a real regression, caught by review before any measurement.
-4. **The margin is judged over a frozen horizon.** `--margin-horizon` (default
-   **8** steps): a min() over a long free-running continuation shrinks as the
-   text drifts and would exclude nearly every prompt, defeating the fix while
-   looking strict.
+4. **The margin is judged over a frozen horizon, and the identity window
+   MATCHES it.** `--margin-horizon` (default **8** steps): a min() over a long
+   free-running continuation shrinks as the text drifts and would exclude
+   nearly every prompt, defeating the fix while looking strict. The
+   certification window is therefore also **8 generated tokens** in corpus mode
+   (`EQUIV_GEN_TOKENS=8`, the pairing pre-registered with this corpus).
+   Comparing 32 generated tokens while screening margins over 8 is internally
+   inconsistent: it charges the store for engine drift occurring outside the
+   screened region. **Measured on 2026-07-30 (HF job
+   `6a6b7a5623ed89c748ec7f73`, A10G, fp8_e4m3, this corpus, window 32):** of 8
+   prompts, 5 were kernel-nondeterministic with divergences at generated tokens
+   1, 4, 6, **9 and 29** — the last two outside the screened horizon — and 3
+   were low-margin (gaps 0.19-1.0 nats) yet all three replay-MATCHED. Zero
+   prompts were gated, so nothing certified. That run's summary is the evidence
+   for this pairing; the window is fixed here BEFORE the re-run.
+   **The margin floor stays 2.0 nats.** Lowering it after seeing that the
+   excluded prompts happened to match would be exactly the cherry-picking this
+   pre-registration exists to prevent, so it is not done. Any published fp8
+   claim states its window explicitly: "token-identical over the first 8
+   generated tokens on all gated prompts".
 5. **The two exclusions are disjoint and separately reported.**
    `n_kernel_nondet` counts only self-inconsistent prompts;
    `n_low_margin_excluded` counts only near-ties; `n_gated + n_kernel_nondet +

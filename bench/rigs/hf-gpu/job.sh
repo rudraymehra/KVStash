@@ -119,6 +119,12 @@ EQUIV_PROMPT_SET="${EQUIV_PROMPT_SET:-}"   # frozen high-margin corpus (CLAIMS.m
                                               # legacy near-tie prompts are exactly
                                               # what fp8 engines cannot replay.
 EQUIV_MARGIN_FLOOR="${EQUIV_MARGIN_FLOOR:-}"  # pre-registered nats floor; empty -> tool default
+EQUIV_GEN_TOKENS="${EQUIV_GEN_TOKENS:-}"      # certification window in generated tokens. Empty ->
+                                              # 8 in corpus mode (the pre-registered pairing: the
+                                              # identity window must MATCH the horizon the margin
+                                              # screen judges — comparing 32 tokens while screening
+                                              # 8 charges the store for engine drift that occurs
+                                              # outside the screened region), else the tool default.
 EQUIV_N="${EQUIV_N:-}"                        # token-identity prompts (bench/e2e/equivalence.py) run
                                               # around the SAME vLLM restart: record on engine #1
                                               # after populate, compare on engine #2 BEFORE the warm
@@ -283,6 +289,10 @@ fi
 if [[ "$KV_CACHE_DTYPE" == fp8* && -z "$EQUIV_PROMPT_SET" ]]; then
   EQUIV_PROMPT_SET="$ROOT/bench/e2e/equiv-prompts-high-margin.txt"
   log "fp8 run: defaulting EQUIV_PROMPT_SET to the frozen high-margin corpus ($EQUIV_PROMPT_SET)"
+fi
+if [[ -n "$EQUIV_PROMPT_SET" && -z "$EQUIV_GEN_TOKENS" ]]; then
+  EQUIV_GEN_TOKENS=8
+  log "corpus mode: certification window EQUIV_GEN_TOKENS=8 (matches the margin horizon)"
 fi
 
 # fp8 alias: vLLM spells the same e4m3 KV cache 'fp8' and 'fp8_e4m3', and the
@@ -824,6 +834,7 @@ if (( EQUIV_N > 0 )); then
   log "token-identity record: $EQUIV_N greedy prompts via engine #1 (equivalence suite, hard fail)"
   python3 "$ROOT/bench/e2e/equivalence.py" --phase record \
     ${EQUIV_PROMPT_SET:+--prompt-set "$EQUIV_PROMPT_SET"} \
+    ${EQUIV_GEN_TOKENS:+--gen-tokens "$EQUIV_GEN_TOKENS"} \
     ${EQUIV_MARGIN_FLOOR:+--margin-floor "$EQUIV_MARGIN_FLOOR"} \
     --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
     --model "$MODEL" --n "$EQUIV_N" --block-size 16 \
@@ -878,6 +889,7 @@ if (( EQUIV_N > 0 )); then
   log "token-identity compare on the restarted engine (greedy identity, labeled ${KV_CACHE_DTYPE:-auto-bf16}-vs-${KV_CACHE_DTYPE:-auto-bf16}, hard fail)"
   python3 "$ROOT/bench/e2e/equivalence.py" --phase compare \
     ${EQUIV_PROMPT_SET:+--prompt-set "$EQUIV_PROMPT_SET"} \
+    ${EQUIV_GEN_TOKENS:+--gen-tokens "$EQUIV_GEN_TOKENS"} \
     ${EQUIV_MARGIN_FLOOR:+--margin-floor "$EQUIV_MARGIN_FLOOR"} \
     --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
     --model "$MODEL" --block-size 16 \
