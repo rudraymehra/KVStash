@@ -201,6 +201,10 @@ store path is attributed in each run's job log), same protocol as above:
 | 32k | 10,923 ms | 10,941 ms | **535 ms** (522–536) | **20.4×** | 20.4× |
 
 **The fp8 cells (kv_cache_dtype=fp8_e4m3, n=3, token-identity certified):**
+*fp8 certification scope — see [CLAIMS.md](CLAIMS.md) fp8 Amendment 3: fp8
+greedy decoding is reproducible on wide-margin tokens and fragile on near-ties;
+these cells were certified before the margin screen existed, under the legacy
+prompt set.*
 halving the KV bytes halves the reload — every arm of these runs (baseline,
 cold, warm) ran the SAME dtype, and each run's certification is machine-
 checked before any warm number exists: 8 equivalence prompts recorded on
@@ -284,6 +288,9 @@ gate, token-identity certification around every restart.
 | 131k | 82,883 ms  | **1,787 ms** (n=2, 1.9%) | **46.4×** | 47.0× |
 | 160k | 120,831 ms | **2,228 ms** (n=1, reps within 1.4% of median; 2.7% peak-to-peak) | **54.2×** | 55.0× |
 
+*These A10G long-context cells are fp8; their certification predates the margin
+screen. fp8 scope: [CLAIMS.md](CLAIMS.md) fp8 Amendment 3.*
+
 ² baselines are one run × (2+1) reps (rep spreads ≤0.1%); calibration on the
 same box first reproduced the published HF-Jobs 16k/32k fp8 cells within
 8–13% (233.7 ms / 451.3 ms warm; ~2.4 points of the 32k gap is prompt length
@@ -327,6 +334,9 @@ context to the model card's full certified window.
 | 131k | 26,621 ms | **1,224 ms** (n=1) | **21.7×** | 21.9× |
 | 160k | 37,678 ms | **1,510 ms** (n=1) | **25.0×** | 25.1× |
 | **262,144** | **85,693 ms** | **2,474 ms** (n=2, 0.3%) | **34.6×** | 34.7× |
+
+*L40S cells are fp8; fp8 certification scope: [CLAIMS.md](CLAIMS.md) fp8
+Amendment 3.*
 
 ² baseline: one run × (3+1) reps per point, five-point curve banked
 (`chart2-ttft-l40s-base-fp8-run1.jsonl`). The 262,144 cell runs at
@@ -401,15 +411,18 @@ prompts (2 of 6; 4 excluded as near-ties, disclosed)*. Raw JSONL:
 covers 2 gated prompts, which is thin, and it is stated as thin rather than
 widened by moving a threshold after the fact. More importantly, the calibration
 that produced corpus v2 (48 candidates, committed at
-`bench/results/rig-e/margin-calibration-a10g-fp8.jsonl`) measured something that
-belongs next to every fp8 number in this field: **at fp8 precision, attention
-over byte-identical KV can select a different argmax depending on whether that
-KV was computed in place or reloaded** — attention kernels are not
-tiling-invariant and fp8 leaves no precision headroom, where bf16 has enough and
-stays bit-exact. See [CLAIMS.md](CLAIMS.md) fp8 Amendment 3. So this 50.9× is a
-real, reproducible *speed* result whose *equivalence* holds on wide-margin
-tokens and is explicitly not claimed on near-ties. The bf16 cells above carry no
-such caveat.
+`bench/results/rig-e/margin-calibration-a10g-fp8.jsonl`) measured the variable
+that actually governs fp8 certification: **the top1-top2 logit margin.** Only 2
+of 48 candidates cleared 2.0 nats and the median was 0.25 — fp8 greedy decoding
+on this stack is reproducible on wide-margin tokens and fragile on near-ties.
+What perturbs the near-ties is NOT established by this experiment: an earlier
+draft attributed it to reload-vs-recompute, and review against the artifacts
+refuted that (this very run's control shows 0 of 6 prompts self-divergent with
+the store in the loop, including 4 near-ties). See [CLAIMS.md](CLAIMS.md) fp8
+Amendment 3 for the full correction and the experiment that would isolate it. So
+this 50.9× is a real, reproducible *speed* result whose *equivalence* is
+certified on wide-margin tokens and explicitly not claimed on near-ties. The
+bf16 cells carry no such caveat — bf16 has certified without exclusions.
 
 ## When NOT to use kvblockd
 

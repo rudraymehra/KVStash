@@ -7,11 +7,14 @@
 # never runs a store comparison, so it cannot select for a passing gate.
 #
 # Why a pool at all: the first hand-written corpus was designed from intuition
-# and measurement disproved it — 10 of 16 of its prompts were near-ties on the
-# target model, and 6 more were prompts the engine could not even replay against
-# itself (HF jobs 6a6b7a5623ed89c748ec7f73 and 6a6b7c1023ed89c748ec7fa1, both
-# committed as refusals). Guessing which prompts are greedy-stable does not
-# work; measuring does.
+# and measurement disproved it: a 16-prompt certification run against v1 ITSELF
+# found 10 of 16 of its prompts were near-ties and 6 of 16 were prompts the
+# engine could not replay against itself (HF jobs 6a6b7a5623ed89c748ec7f73 and
+# 6a6b7c1023ed89c748ec7fa1, both committed as refusals under
+# bench/results/rig-g/refusals/). Note the provenance precisely: THIS pool is
+# disjoint from v1 and never measured a v1 prompt.
+#
+# Guessing which prompts are greedy-stable does not work; measuring does.
 #
 # Bias of the pool, stated: these lean on verbatim continuation, counting and
 # mechanical patterns, because those are where an LLM's argmax is furthest from

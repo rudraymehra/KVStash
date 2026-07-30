@@ -389,7 +389,7 @@ def run_calibrate(args) -> int:
     Why this phase exists, and why it is not cherry-picking: the frozen corpus
     must contain prompts whose argmax is robust to fp8 numerical noise, and the
     honest way to know that is to MEASURE it rather than assume it (the first
-    corpus was written from intuition; 10 of 16 of its prompts turned out to be
+    corpus was written from intuition; a 16-prompt run against it found 10 of 16
     near-ties on the target model). This phase looks at exactly two engine
     properties — the top1-top2 logprob gap over the frozen horizon, and whether
     the engine reproduces itself back-to-back — and never at whether a reload

@@ -458,24 +458,52 @@ restart in the loop, so it cannot select on any store outcome.
    greedy output every time. But only **2 of 48** cleared the 2.0-nat margin
    floor, and the **median candidate margin was 0.25 nats** — this model's
    greedy choices are usually near-ties.
-2. **The finding that follows, and it is the interesting one.** In the earlier
-   certification runs 5 of 8 and 6 of 16 prompts "diverged" from themselves —
-   but there the control generation may LOAD its prefix from the store while
-   the first computes it. With no store in the loop the divergence disappears.
-   So the effect is not random engine noise: **at fp8 precision, attention over
-   byte-identical KV can produce a different argmax depending on whether that
-   KV was computed in place or reloaded.** Attention kernels are not
-   tiling-invariant, and fp8 leaves no precision headroom to absorb the
-   difference; bf16 has that headroom and is bit-exact (certified 20/20).
-   The reloaded bytes were xxh3-verified identical in every one of those runs,
-   so this is a precision-headroom property of fp8 KV reuse — it applies to any
-   system that reuses fp8 KV, including an engine's own prefix cache — and not
-   a defect of this store. We publish it rather than route around it.
+2. **What the data isolates: MARGIN — and what it does not isolate.** The
+   variable this measurement cleanly identifies is the top1-top2 logit gap.
+   Near-tie prompts fail certification and wide-margin prompts pass it: the two
+   measured-eligible prompts certified on the first attempt at 16k and again at
+   131k, while the v1 corpus — whose prompts measured 0.06-1.0 nats — produced
+   10 of 16 low-margin exclusions and 6 of 16 self-divergences
+   (`bench/results/rig-g/refusals/equiv-fp8-corpus-v1-16prompts.jsonl`, digest
+   `b76ad0c4c4c194aa`).
+
+   **The tempting explanation is NOT established, and this correction is
+   published rather than quietly dropped.** An earlier draft of this amendment
+   asserted a mechanism: that at fp8 precision, attention over byte-identical KV
+   selects a different argmax depending on whether the KV was computed in place
+   or reloaded, and that this generalizes to any fp8 KV reuse including an
+   engine's own prefix cache. Review against the artifacts refuted that as an
+   isolated finding, on three grounds:
+   (a) the certified 131k run's own control shows **0 of 6 prompts
+   self-divergent WITH the store in the loop — including 4 prompts measured
+   below the 2.0-nat floor**, which under that mechanism were the likeliest to
+   flip and did not
+   (`bench/results/rig-e/equiv-fp8-131k-certified-run1.jsonl`);
+   (b) the calibration that showed 48/48 self-consistency changed **three**
+   variables at once versus the certification runs — no store in the loop, a
+   different checkpoint (`Qwen2.5-7B-Instruct` vs the DCA-stripped
+   `Qwen2.5-7B-Instruct-1M`), and a disjoint prompt set — so "remove the store
+   and divergence disappears" is an uncontrolled comparison;
+   (c) the committed refusals show 1-4 of 8 self-divergent, and in each the
+   refusal was actually caused by a GATED, self-consistent prompt mismatching
+   after the restart.
+   So the honest statement is: **fp8 greedy decoding on this stack is
+   reproducible on wide-margin tokens and fragile on near-ties, and this
+   experiment does not establish what perturbs the near-ties.** Reload is one
+   candidate; kernel scheduling under a different batch shape is another. The
+   experiment that would isolate it — same checkpoint, same prompts, store in
+   versus out as the only varied factor — is not run, and until it is, no claim
+   here attributes the effect to reload or generalizes it to other systems.
+
 3. **Corpus v2.** `bench/e2e/equiv-prompts-high-margin-v2.txt`, sha256
    `8d8388a3800e95464b41f5c4357b36629652ed620743d13e8a15f8e14ce0bf06`, containing exactly the 2 measured-eligible prompts
    (margins 4.50 and 3.75 nats). Corpus v1 (digest `b76ad0c4c4c194aa`) is
-   SUPERSEDED, not deleted; its two refusal records stay committed as the
-   evidence that produced this amendment.
+   SUPERSEDED, not deleted. Note the provenance precisely: v1 was disproven by
+   the **16-prompt certification run against v1 itself**
+   (`bench/results/rig-g/refusals/equiv-fp8-corpus-v1-16prompts.jsonl`: 10 of 16
+   low-margin, 6 of 16 self-divergent), not by the 48-candidate calibration,
+   whose pool is disjoint from v1 and never measured a v1 prompt. Both v1
+   refusal records stay committed.
 4. **What an fp8 number certified under v2 may and may not say.** It may say
    "token-identical over the first 8 generated tokens on all gated prompts (N of
    M; the rest excluded as near-ties, disclosed)". It may NOT say or imply that
@@ -528,13 +556,15 @@ engine, prefix caching off in both phases). Both arms ran one
   prompts is THIN coverage. It is stated as thin rather than widened by moving a
   threshold after seeing results — the 2.0-nat floor and 8-token window are
   exactly as pre-registered in Amendment 2.
-- **fp8 reuse is NOT bit-exact in general.** Amendment 3's calibration (48
-  candidates, committed) measured that at fp8 precision, attention over
-  byte-identical KV can select a different argmax depending on whether that KV
-  was computed in place or reloaded — attention kernels are not tiling-invariant
-  and fp8 has no precision headroom, where bf16 does and stays bit-exact. This
-  claim therefore asserts a measured SPEED result plus equivalence on
-  wide-margin tokens, and explicitly does not assert bit-exact fp8 reuse.
+- **fp8 equivalence is certified on wide-margin tokens only.** Amendment 3's
+  calibration (48 candidates, committed) measured that only 2 of 48 prompts
+  clear the 2.0-nat margin floor (median 0.25): fp8 greedy decoding on this
+  stack is reproducible on wide-margin tokens and fragile on near-ties. What
+  perturbs the near-ties is NOT established here — an earlier draft blamed
+  reload-vs-recompute and Amendment 3 records why the artifacts refuted that.
+  So this claim asserts a measured SPEED result plus equivalence on the gated
+  wide-margin prompts, and asserts nothing about near-tie tokens or about other
+  systems. bf16 certifies without exclusions.
 - Loopback (network time ≈ 0), single run × (2+1) reps per arm; baseline rep
   spread 0.01%. An independent cross-session baseline on the same GPU, dtype,
   model and length gives 82,883 ms → 50.8×, agreeing to 0.1×.
