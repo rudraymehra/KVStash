@@ -378,6 +378,39 @@ ceiling at 32k) localizes the bottleneck to the connector, not the store:
 both the reload timing and the iperf3 ceiling it is measured against are
 committed artifacts, so the ratio is checkable, not asserted.
 
+### The certified fp8 cell at 131k (measured 2026-07-30, A10G — Rig E)
+
+The headline the fp8 arc was chasing, and it took four runs and a measurement
+that overturned our own assumption to earn it honestly. Qwen2.5-7B-Instruct-1M
+(standard-attention mode), `kv_cache_dtype=fp8_e4m3` in every arm, loopback,
+per-rep exact-count hit gate, token-identity certified against the
+**measurement-selected** frozen corpus v2 (`8d8388a3800e9546`).
+
+| prefix | fp8 recompute² | **kvblockd fp8 reload** | vs pure |
+|---|---|---|---|
+| 131,072 | 82,945 ms | **1,631 ms** | **50.9×** |
+
+² same-session pure-recompute baseline (no connector), one run × (2+1) reps,
+rep spread 0.01%. An independent cross-session baseline on the same GPU, dtype,
+model and length gives 82,883 ms → **50.8×** — the two agree to 0.1×.
+Certification: *token-identical over the first 8 generated tokens on all gated
+prompts (2 of 6; 4 excluded as near-ties, disclosed)*. Raw JSONL:
+`bench/results/rig-e/chart2-ttft-fp8-131k-certified-{run1,baseline}.jsonl`.
+
+**Read this cell with its caveat, which is the honest part.** Certification here
+covers 2 gated prompts, which is thin, and it is stated as thin rather than
+widened by moving a threshold after the fact. More importantly, the calibration
+that produced corpus v2 (48 candidates, committed at
+`bench/results/rig-e/margin-calibration-a10g-fp8.jsonl`) measured something that
+belongs next to every fp8 number in this field: **at fp8 precision, attention
+over byte-identical KV can select a different argmax depending on whether that
+KV was computed in place or reloaded** — attention kernels are not
+tiling-invariant and fp8 leaves no precision headroom, where bf16 has enough and
+stays bit-exact. See [CLAIMS.md](CLAIMS.md) fp8 Amendment 3. So this 50.9× is a
+real, reproducible *speed* result whose *equivalence* holds on wide-margin
+tokens and is explicitly not claimed on near-ties. The bf16 cells above carry no
+such caveat.
+
 ## When NOT to use kvblockd
 
 Below the crossover hit rate, recompute is cheaper than a remote fetch —

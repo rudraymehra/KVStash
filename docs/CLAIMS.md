@@ -498,6 +498,56 @@ the committed EQUIVJSONL.
 
 ---
 
+## 6b. fp8 @131k, CERTIFIED: 50.9× vs same-dtype recompute (measured 2026-07-30)
+
+**Claim.** Reloading a 131,072-token prefix's fp8 KV from kvblockd into a FRESH
+vLLM engine takes **1,631 ms** vs **82,945 ms** to recompute it with no
+connector installed under the same `kv_cache_dtype=fp8_e4m3` — **50.9×** — with
+token identity CERTIFIED on the gated prompts of the measurement-selected frozen
+corpus v2.
+
+**Rig + commands.** NVIDIA A10G (HF Jobs a10g-large), vLLM 0.25.1 pinned,
+Qwen2.5-7B-Instruct-1M served in the card-sanctioned standard-attention mode
+(`STRIP_DCA=1`), loopback, `max_num_batched_tokens=8192` frozen across arms:
+```
+MODEL=Qwen/Qwen2.5-7B-Instruct-1M STRIP_DCA=1 KV_CACHE_DTYPE=fp8_e4m3 \
+  KV_BYTES_PER_TOKEN=28672 LENGTHS=131072 REPS=2 EQUIV_N=6 \
+  GPU_MEM_UTIL=0.92 MAX_NUM_BATCHED_TOKENS=8192 bench/rigs/hf-gpu/submit.sh
+BASELINE_ONLY=1 (same env, EQUIV_N dropped) bench/rigs/hf-gpu/submit.sh
+```
+Raw JSONL: `bench/results/rig-e/chart2-ttft-fp8-131k-certified-{run1,baseline}.jsonl`;
+corpus selection data: `bench/results/rig-e/margin-calibration-a10g-fp8.jsonl`.
+
+**Definitions.** As claim 2 (warm = the exact populated prompt on a RESTARTED
+engine, prefix caching off in both phases). Both arms ran one
+`kv_cache_dtype`, so the multiple measures the store and never the quantizer.
+
+**Disclosed, and this is the load-bearing part.**
+- **Certification scope:** *token-identical over the first 8 generated tokens on
+  all gated prompts (2 of 6; 4 excluded as near-ties, disclosed)*. Two gated
+  prompts is THIN coverage. It is stated as thin rather than widened by moving a
+  threshold after seeing results — the 2.0-nat floor and 8-token window are
+  exactly as pre-registered in Amendment 2.
+- **fp8 reuse is NOT bit-exact in general.** Amendment 3's calibration (48
+  candidates, committed) measured that at fp8 precision, attention over
+  byte-identical KV can select a different argmax depending on whether that KV
+  was computed in place or reloaded — attention kernels are not tiling-invariant
+  and fp8 has no precision headroom, where bf16 does and stays bit-exact. This
+  claim therefore asserts a measured SPEED result plus equivalence on
+  wide-margin tokens, and explicitly does not assert bit-exact fp8 reuse.
+- Loopback (network time ≈ 0), single run × (2+1) reps per arm; baseline rep
+  spread 0.01%. An independent cross-session baseline on the same GPU, dtype,
+  model and length gives 82,883 ms → 50.8×, agreeing to 0.1×.
+- Per-rep exact-count hit attribution (`warm_hits_verified: true`) is unaffected
+  by any of the above and remains the proof the KV came from the store.
+
+**This claim is false if** rendering the committed JSONL yields different
+medians; if a warm rep's `kvb_hits_total` delta did not equal its expected block
+count; if the certification's corpus digest is not `8d8388a3800e9546`; or if the
+claim is ever quoted without its certification scope and the Amendment 3 caveat.
+
+---
+
 ## 7. Codec quality gate — pre-registered (no codec has landed)
 
 **Status: PRE-REGISTERED, registered before any codec measurement exists.**
