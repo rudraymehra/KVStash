@@ -76,6 +76,7 @@ before trusting a green run.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -146,26 +147,54 @@ def wait_counter_growth(metrics_url: str, before: dict, keys: tuple,
 # -------------------------------------------------------------- greedy decode
 
 def complete_greedy(vllm: str, model: str, prompt: str, gen_tokens: int,
-                    seed: int, timeout_s: float) -> dict:
+                    seed: int, timeout_s: float, want_margins: bool = False,
+                    margin_horizon: int | None = None) -> dict:
     """One NON-streaming greedy completion; returns the generated token
     sequence. logprobs=0 makes vLLM return the chosen token strings
-    (choices[0].logprobs.tokens) — token-level equality, not just text."""
+    (choices[0].logprobs.tokens) — token-level equality, not just text.
+
+    want_margins asks for the top-2 alternatives instead, so the caller can
+    compute each step's top1-vs-top2 logprob gap. A step with a tiny gap is a
+    near-tie the ENGINE may resolve differently across restarts under fp8;
+    the margin lets the harness say so up front instead of discovering it as
+    an unexplained mismatch."""
     payload = {
         "model": model,
         "prompt": prompt,
         "max_tokens": gen_tokens,
         "temperature": 0.0,
         "seed": seed,
-        "logprobs": 0,
+        "logprobs": 2 if want_margins else 0,
     }
     resp = _post_json(vllm + "/v1/completions", payload, timeout=timeout_s)
     ch = (resp.get("choices") or [{}])[0]
     lp = ch.get("logprobs") or {}
-    return {
+    out = {
         "text": ch.get("text", ""),
         "tokens": lp.get("tokens"),  # None if the server elided logprobs
         "usage": resp.get("usage") or {},
     }
+    if want_margins:
+        out["min_margin"] = _min_margin(lp, margin_horizon)
+    return out
+
+
+def _min_margin(lp: dict, horizon: int | None = None):
+    """Smallest top1-top2 logprob gap over the generated steps, or None when
+    the server did not return alternatives. Large gap = the argmax is robust
+    to numerical noise; near zero = a coin-flip the engine may re-decide."""
+    chosen = lp.get("token_logprobs") or []
+    tops = lp.get("top_logprobs") or []
+    if horizon:
+        chosen, tops = chosen[:horizon], tops[:horizon]
+    gaps = []
+    for i, ch_lp in enumerate(chosen):
+        if ch_lp is None or i >= len(tops) or not tops[i]:
+            continue
+        alts = sorted((v for v in tops[i].values() if v is not None), reverse=True)
+        if len(alts) >= 2:
+            gaps.append(abs(alts[0] - alts[1]))
+    return min(gaps) if gaps else None
 
 
 # ------------------------------------------------------------- prompt build
@@ -208,6 +237,73 @@ def build_prompt(vllm: str, model: str, target_tokens: int, nonce: str) -> tuple
         f"could not land exactly on {target_tokens} tokens (got {n}; "
         f"unit={unit_toks:.2f} tok, k={k}, fill={fill}) — the boundary cells "
         "are only meaningful at their exact lengths")
+
+
+# High-margin tail sentences for corpus-mode length calibration. Each is a
+# DISTINCT factual statement with an unambiguous continuation, so padding to a
+# boundary length does not reintroduce the near-tie problem a repeated pangram
+# creates (that repetition was the measured cause of the fp8 replay failures).
+CORPUS_TAIL = [
+    "Water freezes at zero degrees Celsius. ",
+    "A triangle has exactly three sides. ",
+    "The number seven is a prime number. ",
+    "There are sixty seconds in one minute. ",
+    "The letter B follows the letter A. ",
+    "A square has four equal sides. ",
+    "Ten plus ten equals twenty. ",
+    "The sun rises in the east. ",
+]
+CORPUS_FILLER = " and"   # single-token pad (same token as the legacy builder)
+
+
+def build_prompt_corpus(vllm: str, model: str, target_tokens: int, nonce: str,
+                        entry: str) -> tuple[str, int]:
+    """Calibrate to EXACTLY target_tokens with the high-margin corpus entry as
+    the LAST thing in the prompt.
+
+    Two properties matter and they pull against each other:
+      * exact landing — the boundary trio m*B-1 / m*B / m*B+1 differs by single
+        tokens, so a tolerance as wide as one unit collapses all three onto one
+        physical length (the sweep would measure one cell thrice);
+      * a high-margin continuation — whatever the model reads LAST determines
+        how tied its next-token choice is, which is the whole point of the
+        corpus.
+    So the padding goes in the MIDDLE: nonce header, then distinct factual
+    filler sentences to reach the length, then the corpus entry. A dangling
+    " and"-style pad at the end would invite exactly the near-tie the corpus
+    exists to avoid."""
+    head = f"kvstash-equiv {nonce} :: "
+    tail = " " + entry
+    fixed = tokenize_count(vllm, model, head + tail)
+    if fixed > target_tokens:
+        raise PromptLandingError(
+            f"header+entry is already {fixed} tokens > target {target_tokens}: "
+            "shorten the corpus entry or raise the boundary multiples")
+    unit = "".join(CORPUS_TAIL)
+    probe = tokenize_count(vllm, model, head + unit * 8 + tail)
+    unit_toks = max((probe - fixed) / 8.0, 0.5)
+    k = max(0, round((target_tokens - fixed) / unit_toks))
+    fill, n = 0, fixed
+    for _ in range(28):
+        prompt = head + unit * k + CORPUS_FILLER * fill + tail
+        n = tokenize_count(vllm, model, prompt)
+        err = target_tokens - n
+        if err == 0:
+            return prompt, n
+        if err > 0:
+            if err >= unit_toks:
+                k += int(err // unit_toks)
+            else:
+                fill += err
+        elif fill >= -err:
+            fill += err
+        elif fill:
+            fill = 0
+        else:
+            k = max(0, k - max(1, math.ceil(-err / unit_toks)))
+    raise PromptLandingError(
+        f"corpus mode could not land exactly on {target_tokens} tokens "
+        f"(got {n}) — the boundary cells are only meaningful at exact lengths")
 
 
 def expected_hit_blocks(prompt_tokens: int, block_size: int) -> int:
@@ -265,6 +361,25 @@ def first_divergence(a: list, b: list):
     return None
 
 
+def _write_text(path: str, text: str) -> None:
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def load_prompt_corpus(path: str) -> tuple[list[str], str]:
+    """Frozen prompt corpus + its sha256. The digest is the pre-registration:
+    it lands in every record, so a corpus edited after a measurement is
+    detectable by anyone re-deriving the claim."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    digest = hashlib.sha256(raw).hexdigest()[:16]
+    prompts = [ln.strip() for ln in raw.decode().splitlines()
+               if ln.strip() and not ln.lstrip().startswith("#")]
+    if not prompts:
+        raise ValueError(f"prompt corpus {path} has no prompts")
+    return prompts, digest
+
+
 # --------------------------------------------------------------- phase: record
 
 def run_record(args) -> int:
@@ -274,6 +389,27 @@ def run_record(args) -> int:
         print("FATAL(record): no usable lengths after the zero-block filter",
               file=sys.stderr)
         return 2
+    max_blocks_covered = 0
+    corpus, corpus_sha = ([], "")
+    if args.prompt_set:
+        corpus, corpus_sha = load_prompt_corpus(args.prompt_set)
+        print(f"[record] FROZEN prompt corpus {args.prompt_set} "
+              f"({len(corpus)} prompts, sha256={corpus_sha}), "
+              f"margin floor {args.margin_floor:.2f} nats", flush=True)
+    # Check the floor against the CONFIGURED lengths before issuing a single
+    # completion: a doomed set must refuse at t=0, not after paid GPU work.
+    if corpus:
+        planned = max(expected_hit_blocks(L, args.block_size) for L in lengths)
+        if planned < args.min_blocks_covered:
+            print(f"FATAL(record): configured lengths {lengths} can reach at most "
+                  f"{planned} blocks < --min-blocks-covered "
+                  f"{args.min_blocks_covered}; certification would not exercise the "
+                  f"block-index path. Raise --boundary-multiples/--lengths (or lower "
+                  f"the floor DELIBERATELY and disclose it). Refusing before any "
+                  f"completion is issued.", file=sys.stderr)
+            return 2
+        print(f"[record] planned block coverage: {planned} blocks vs floor "
+              f"{args.min_blocks_covered} — OK before spending", flush=True)
     print(f"[record] n={args.n} prompts over lengths {lengths} "
           f"(block_size={args.block_size}, seed={args.seed}, "
           f"gen_tokens={args.gen_tokens}, kv_cache_dtype={args.kv_cache_dtype})",
@@ -288,15 +424,30 @@ def run_record(args) -> int:
         # The engine KV dtype this state was recorded under: the compare
         # phase REFUSES a mismatch (fp8-vs-bf16 is not an equivalence claim).
         "kv_cache_dtype": args.kv_cache_dtype,
+        "prompt_corpus": args.prompt_set or "(repeated-filler builder)",
+        "prompt_corpus_sha256": corpus_sha,
+        "margin_floor": args.margin_floor if corpus else None,
+        "margin_horizon": args.margin_horizon if corpus else None,
         "entries": [],
     }
     for i in range(args.n):
         target = lengths[i % len(lengths)]
         nonce = f"{uuid.uuid4().hex[:12]}-L{target}-e{i}"
-        prompt, ntok = build_prompt(args.vllm, args.model, target, nonce)
+        if corpus:
+            # Frozen corpus entry, nonce-prefixed so every prompt mints its own
+            # cache keys — then LENGTH-CALIBRATED onto the same m*B-1/m*B/m*B+1
+            # boundary trio the legacy builder used. Coverage is not optional:
+            # certification must exercise the block-index path to depth, or a
+            # fault in block 5 of a reload is simply never tested.
+            prompt, ntok = build_prompt_corpus(args.vllm, args.model, target,
+                                               nonce, corpus[i % len(corpus)])
+        else:
+            prompt, ntok = build_prompt(args.vllm, args.model, target, nonce)
         c0 = read_counters(args.metrics) if args.metrics else None
         r = complete_greedy(args.vllm, args.model, prompt, args.gen_tokens,
-                            args.seed, args.request_timeout)
+                            args.seed, args.request_timeout,
+                            want_margins=bool(corpus),
+                            margin_horizon=args.margin_horizon)
         if args.metrics:
             after = wait_counter_growth(args.metrics, c0, ("put_bytes", "blocks"),
                                         args.put_wait_s)
@@ -334,15 +485,42 @@ def run_record(args) -> int:
                   f"token {kdiv}) — excluded from the store gate, disclosed",
                   flush=True)
         ptoks = int(r["usage"].get("prompt_tokens", ntok))
+        blocks_covered = expected_hit_blocks(ptoks, args.block_size)
+        max_blocks_covered = max(max_blocks_covered, blocks_covered)
+        margin = r.get("min_margin")
+        low_margin = (corpus and margin is not None
+                      and margin < args.margin_floor)
+        if low_margin:
+            print(f"[record] LOW-MARGIN i={i}: smallest top1-top2 gap "
+                  f"{margin:.3f} < {args.margin_floor:.2f} nats — a near-tie the "
+                  f"engine may re-decide across a restart; excluded from the "
+                  f"store gate, disclosed", flush=True)
         state["entries"].append({
             "i": i, "target_tokens": target, "nonce": nonce, "prompt": prompt,
             "prompt_tokens": ptoks, "tokens": r["tokens"], "text": r["text"],
             "kernel_deterministic": kernel_det,
             "record_divergence_index": kdiv,
+            "min_margin": margin,
+            "low_margin": bool(low_margin),
         })
         print(f"[record] i={i} target={target} tokens={ptoks} "
               f"gen={len(r['tokens']) if r['tokens'] is not None else '?'} "
               f"kernel_deterministic={kernel_det}", flush=True)
+    # COVERAGE FLOOR (pre-registered): the deepest prompt must reach at least
+    # this many blocks, or certification never touches the block-index path
+    # beyond the first block or two — a store fault at block 5 would pass
+    # unnoticed. Refuse rather than certify a set that cannot discriminate.
+    if corpus and max_blocks_covered < args.min_blocks_covered:
+        print(f"FATAL(record): deepest prompt covers {max_blocks_covered} blocks "
+              f"< --min-blocks-covered {args.min_blocks_covered}: certification "
+              f"would not exercise the block-index path to depth. Raise "
+              f"--boundary-multiples/--lengths (or lower the floor DELIBERATELY "
+              f"and disclose it).", file=sys.stderr)
+        return 2
+    state["max_blocks_covered"] = max_blocks_covered
+    state["min_blocks_covered"] = args.min_blocks_covered
+    print(f"[record] block coverage: deepest prompt spans {max_blocks_covered} "
+          f"blocks (floor {args.min_blocks_covered})", flush=True)
     tmp = args.state + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f)
@@ -396,6 +574,7 @@ def run_compare(args, stamp: dict) -> int:
     matched = 0
     n_gated = 0
     mismatches, unwarmed, text_fallback, kernel_nondet = [], [], [], []
+    n_low_margin, low_margin_detail = 0, []
     for e in entries:
         # KERNEL-DETERMINISM CONTROL stamp from the record phase: a prompt
         # the record engine could not replay against ITSELF is excluded from
@@ -403,9 +582,41 @@ def run_compare(args, stamp: dict) -> int:
         # States predating the control carry no stamp — those prompts stay
         # gated (the pre-control behavior; the gate never loosens by default).
         kernel_det = bool(e.get("kernel_deterministic", True))
+        # Pre-registered NARROWING (never a loosening): a prompt whose
+        # smallest top1-top2 gap sits under the frozen margin floor is a
+        # near-tie the ENGINE may re-decide across the restart, so it cannot
+        # discriminate a store fault from numerical noise. It is excluded from
+        # the gate and disclosed — it can never turn a mismatch into a pass.
+        # Re-DERIVED here, never trusted from the state file: a hand-edited
+        # flag could otherwise exclude an inconvenient prompt. A stored flag
+        # that contradicts the arithmetic aborts the compare (rc 2).
+        floor = state.get("margin_floor")
+        mm = e.get("min_margin")
+        recorded_low = bool(floor is not None and mm is not None and mm < floor)
+        if bool(e.get("low_margin", False)) != recorded_low:
+            print(f"FATAL(compare): state entry {e['i']} claims "
+                  f"low_margin={e.get('low_margin')} but min_margin={mm} vs floor "
+                  f"{floor} says {recorded_low} — the state file has been edited",
+                  file=sys.stderr)
+            return 2
         c0 = read_counters(args.metrics) if args.metrics else None
         r = complete_greedy(args.vllm, args.model, e["prompt"], gen_tokens,
-                            seed, args.request_timeout)
+                            seed, args.request_timeout,
+                            want_margins=floor is not None,
+                            margin_horizon=state.get("margin_horizon"))
+        # The state file is data on disk and therefore forgeable; the engine is
+        # not. An exclusion stands only if the REPLAY's own margin is also under
+        # the frozen floor — so editing min_margin in the state cannot launder a
+        # real divergence into a disclosed "near-tie".
+        replay_mm = r.get("min_margin")
+        low_margin = bool(recorded_low and floor is not None
+                          and replay_mm is not None and replay_mm < floor)
+        if recorded_low and not low_margin:
+            print(f"  MARGIN RE-MEASURED i={e['i']}: state said near-tie "
+                  f"(min_margin={mm}) but the replay measures {replay_mm} >= floor "
+                  f"{floor} — the exclusion is REFUSED and the prompt is GATED",
+                  flush=True)
+        gated = kernel_det and not low_margin
         rec = {"schema_version": 1, "kind": "equivalence", "i": e["i"],
                "target_tokens": e["target_tokens"],
                "prompt_tokens": e["prompt_tokens"]}
@@ -415,7 +626,9 @@ def run_compare(args, stamp: dict) -> int:
         rec["kv_cache_dtype"] = args.kv_cache_dtype
         rec["equivalence_scope"] = scope
         rec["kernel_deterministic"] = kernel_det
-        rec["gated"] = kernel_det
+        rec["min_margin"] = e.get("min_margin")
+        rec["low_margin"] = low_margin
+        rec["gated"] = gated
         if not kernel_det:
             rec["record_divergence_index"] = e.get("record_divergence_index")
         # equality: token-level when both sides have token lists, else text
@@ -428,13 +641,35 @@ def run_compare(args, stamp: dict) -> int:
             text_fallback.append(e["i"])
         rec["match"] = div is None
         rec["first_divergence_index"] = div
-        if kernel_det:
+        # STRICT PARTITION (CLAIMS fp8 amendment 2 item 5): a prompt can be
+        # excluded for exactly ONE reported reason. Kernel-nondeterminism wins
+        # — it is the stronger statement about the engine — so low-margin is
+        # counted only for prompts that were otherwise gate-eligible. Without
+        # this precedence a prompt that is both (the COMMON fp8 case) is
+        # counted twice and the run dies at the rig's receipt arithmetic after
+        # the paid work is done.
+        if low_margin and kernel_det:
+            n_low_margin += 1
+            low_margin_detail.append({"i": e["i"], "min_margin": e.get("min_margin"),
+                                      "replay_match": div is None,
+                                      "replay_first_divergence_index": div})
+            mm = e.get("min_margin")
+            print(f"  LOW-MARGIN i={e['i']}: smallest top1-top2 gap "
+                  f"{mm if mm is None else round(mm, 3)} < floor "
+                  f"{state.get('margin_floor')} nats — near-tie, excluded from the "
+                  f"store gate; replay "
+                  f"{'matched' if div is None else f'diverged at token {div}'}"
+                  " — disclosed either way", flush=True)
+        if gated:
             n_gated += 1
             if div is None:
                 matched += 1
             else:
                 mismatches.append((e["i"], e["target_tokens"], div))
-        else:
+        elif not kernel_det:
+            # kernel-nondeterministic ONLY: a low-margin prompt is a DIFFERENT
+            # exclusion and must not be reported under this label (the two sets
+            # are disjoint, and job.sh checks the partition arithmetic).
             kernel_nondet.append({
                 "i": e["i"], "target_tokens": e["target_tokens"],
                 "record_divergence_index": e.get("record_divergence_index"),
@@ -472,11 +707,29 @@ def run_compare(args, stamp: dict) -> int:
     # wording may only ever persist in a record whose run exits 0. Precedence
     # mirrors the exit ladder: nothing-gated, then gated mismatch (rc 1),
     # then unattributed / text-fallback (rc 3), and only then certified.
+    # The invariant the rig re-checks: every prompt lands in exactly one bucket.
+    if n_gated + len(kernel_nondet) + n_low_margin != len(entries):
+        print(f"FATAL(compare): exclusion partition broken — n_gated={n_gated} + "
+              f"n_kernel_nondet={len(kernel_nondet)} + "
+              f"n_low_margin={n_low_margin} != n={len(entries)}; refusing to emit "
+              "a summary whose own arithmetic does not close", file=sys.stderr)
+        return 2
+    tripwire = bool(n_low_margin and low_margin_detail
+                    and all(not d["replay_match"] for d in low_margin_detail))
+    if tripwire:
+        print("  TRIPWIRE: every low-margin prompt ALSO diverged on replay — "
+              "coin-flips would not all land the same way, so this pattern is "
+              "store-shaped. Treat the run as suspect and investigate before "
+              "quoting any cell from it.", file=sys.stderr, flush=True)
+    excl = ""
+    if n_low_margin:
+        excl = (f"; {n_low_margin} excluded as low-margin (< "
+                f"{state.get('margin_floor')} nats top1-top2, disclosed)")
     if not n_gated:
         certification = (
-            "NOTHING CERTIFIED: every prompt was kernel-nondeterministic "
-            "(the record engine disagreed with itself back-to-back on all of "
-            "them — the store gate judged zero prompts)")
+            "NOTHING CERTIFIED: every prompt was excluded — kernel-"
+            "nondeterministic (the record engine disagreed with itself "
+            "back-to-back) or low-margin; the store gate judged zero prompts")
     elif matched < n_gated or rate < args.min_match:
         certification = (
             f"NOT CERTIFIED: {n_gated - matched} of {n_gated} "
@@ -493,15 +746,27 @@ def run_compare(args, stamp: dict) -> int:
             "logprobs.tokens)")
     else:
         certification = (
-            f"token-identical on all kernel-deterministic prompts "
+            f"token-identical on all gated prompts "
             f"({n_gated} of {len(entries)}; {len(kernel_nondet)} excluded as "
-            "kernel-nondeterministic, disclosed)")
+            f"kernel-nondeterministic{excl}, all disclosed)")
     summary = {"schema_version": 1, "kind": "equivalence-summary",
                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "model": args.model, "seed": seed, "gen_tokens": gen_tokens,
                "block_size": block_size, "n": len(entries),
                "n_gated": n_gated, "n_kernel_nondet": len(kernel_nondet),
                "kernel_nondet": kernel_nondet,
+               # Frozen-corpus provenance + the pre-registered margin screen:
+               # a reader can tell exactly which prompt set produced the claim
+               # and how many prompts were excluded as engine-tie-prone.
+               "prompt_corpus": state.get("prompt_corpus"),
+               "prompt_corpus_sha256": state.get("prompt_corpus_sha256"),
+               "margin_floor": state.get("margin_floor"),
+               "margin_horizon": state.get("margin_horizon"),
+               "max_blocks_covered": state.get("max_blocks_covered"),
+               "min_blocks_covered": state.get("min_blocks_covered"),
+               "n_low_margin_excluded": n_low_margin,
+               "tripwire_all_low_margin_diverged": tripwire,
+               "low_margin": low_margin_detail,
                "matched": matched, "match_rate_pct": rate,
                "min_match_pct": args.min_match,
                "certification": certification,
@@ -643,7 +908,17 @@ def _stub_server(ctl):
                         toks[min(3, len(toks) - 1)] = "NONDET"
                 choice = {"index": 0, "text": " ".join(toks)}
                 if not ctl.get("elide_logprobs"):
-                    choice["logprobs"] = {"tokens": toks}
+                    lp = {"tokens": toks}
+                    if int(body.get("logprobs") or 0) >= 2:
+                        # top1-top2 gap: wide by default, near-tied when the
+                        # prompt is marked — lets the selftest drive the
+                        # pre-registered margin screen with no GPU.
+                        tie = any(m in prompt for m in ctl.get("lowmargin_markers", ()))
+                        gap = 0.05 if tie else 6.0
+                        lp["token_logprobs"] = [-0.01] * len(toks)
+                        lp["top_logprobs"] = [{"a": -0.01, "b": -0.01 - gap}
+                                              for _ in toks]
+                    choice["logprobs"] = lp
                 resp = {"choices": [choice],
                         "usage": {"prompt_tokens": ptoks,
                                   "completion_tokens": len(toks)}}
@@ -686,7 +961,8 @@ def selftest() -> int:
 
     ctl = {"hits": 0.0, "put_bytes": 0.0, "get_bytes": 0.0, "blocks": 0.0,
            "on_completion": "none", "flip_at": None, "block_size": 12,
-           "elide_logprobs": False, "nondet_markers": [], "call_counts": {}}
+           "elide_logprobs": False, "nondet_markers": [], "call_counts": {},
+           "lowmargin_markers": []}
     srv, url = _stub_server(ctl)
     ok = True
 
@@ -696,7 +972,9 @@ def selftest() -> int:
              "boundary_multiples": "8", "lengths": "120", "state": "",
              "out": "", "min_match": 100.0, "put_wait_s": 0.6,
              "request_timeout": 15.0, "print_prefix": PRINT_PREFIX,
-             "kv_cache_dtype": "auto-bf16"}
+             "kv_cache_dtype": "auto-bf16",
+             "prompt_set": "", "margin_floor": 2.0, "min_blocks_covered": 1,
+             "margin_horizon": 8}
         d.update(kw)
         return argparse.Namespace(**d)
 
@@ -989,6 +1267,128 @@ def selftest() -> int:
             print("[selftest] all-nondeterministic run: rc=1 — loud fail, "
                   "nothing was certified")
         ctl["nondet_markers"] = []
+
+        # 9) FROZEN CORPUS + PRE-REGISTERED MARGIN SCREEN. A near-tie prompt
+        # (top1-top2 gap under the floor) must be EXCLUDED and DISCLOSED, the
+        # gate must still certify the wide-margin prompts, and the corpus
+        # sha256 must land in the records — the pre-registration that stops a
+        # corpus from being edited after seeing a result.
+        corpus = os.path.join(tempfile.mkdtemp(prefix="equiv-corpus-"), "prompts.txt")
+        _write_text(corpus, "# frozen for the selftest\n"
+                          "wide margin prompt number one about arithmetic\n"
+                          "TIEPROMPT near tied continuation\n"
+                          "wide margin prompt number two about geography\n")
+        ctl["lowmargin_markers"] = ["TIEPROMPT"]
+        st = os.path.join(tempfile.mkdtemp(prefix="equiv-margin-"), "state.json")
+        ctl["on_completion"] = "store"      # record must see put counters grow
+        rc_rec = run_record(mkargs(n=3, state=st, prompt_set=corpus,
+                                   margin_floor=2.0))
+        ctl["on_completion"] = "hit"        # compare must see warm attribution
+        out_m = os.path.join(tempfile.mkdtemp(prefix="equiv-mout-"), "m.jsonl")
+        rc_cmp = run_compare(mkargs(n=3, state=st, prompt_set=corpus,
+                                    margin_floor=2.0, out=out_m),
+                             {"rig": "selftest"})
+        with open(out_m) as f:
+            mrecs = [json.loads(line) for line in f]
+        msum = [r for r in mrecs if r["kind"] == "equivalence-summary"]
+        s0 = msum[0] if msum else {}
+        if rc_rec != 0 or rc_cmp != 0:
+            print(f"FAIL: frozen-corpus run rc=({rc_rec},{rc_cmp}) — expected 0/0",
+                  file=sys.stderr)
+            ok = False
+        elif s0.get("n_low_margin_excluded") != 1 or s0.get("n_gated") != 2:
+            print(f"FAIL: margin screen gated={s0.get('n_gated')} "
+                  f"excluded={s0.get('n_low_margin_excluded')} — expected 2 gated, "
+                  f"1 excluded", file=sys.stderr)
+            ok = False
+        elif not s0.get("prompt_corpus_sha256"):
+            print("FAIL: corpus sha256 missing from the summary — the "
+                  "pre-registration is unverifiable", file=sys.stderr)
+            ok = False
+        elif "low-margin" not in (s0.get("certification") or ""):
+            print(f"FAIL: certification hides the exclusion: "
+                  f"{s0.get('certification')!r}", file=sys.stderr)
+            ok = False
+        else:
+            print(f"[selftest] margin screen OK: 2 gated + 1 low-margin excluded "
+                  f"and disclosed, corpus sha256={s0['prompt_corpus_sha256']}, "
+                  f"certification names it")
+        # 9b) COVERAGE FLOOR bites: the same corpus run with a floor above
+        # what the lengths can cover must REFUSE (rc 2), not certify a shallow
+        # set that cannot exercise the block-index path.
+        st2 = os.path.join(tempfile.mkdtemp(prefix="equiv-cov-"), "state.json")
+        ctl["on_completion"] = "store"
+        rc_cov = run_record(mkargs(n=2, state=st2, prompt_set=corpus,
+                                   margin_floor=2.0, min_blocks_covered=999))
+        if rc_cov != 2:
+            print(f"FAIL: coverage floor did not refuse a shallow set (rc={rc_cov}, "
+                  "expected 2)", file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] coverage floor OK: a set too shallow to exercise the "
+                  "block-index path is REFUSED (rc 2), never certified")
+
+        # 9c) A DEEP STORE FAULT still fails under the frozen corpus: corrupt a
+        # token late in the replayed output and the gate must NOT certify.
+        st3 = os.path.join(tempfile.mkdtemp(prefix="equiv-fault-"), "state.json")
+        ctl["on_completion"] = "store"
+        rc_r3 = run_record(mkargs(n=2, state=st3, prompt_set=corpus,
+                                  margin_floor=2.0, min_blocks_covered=1))
+        ctl["on_completion"] = "hit"
+        ctl["flip_at"] = 4                      # a store-fault-shaped divergence
+        out_f = os.path.join(tempfile.mkdtemp(prefix="equiv-fout-"), "f.jsonl")
+        rc_f = run_compare(mkargs(n=2, state=st3, prompt_set=corpus,
+                                  margin_floor=2.0, out=out_f), {"rig": "selftest"})
+        ctl["flip_at"] = None
+        with open(out_f) as f:
+            frecs = [json.loads(line) for line in f]
+        fsum = [r for r in frecs if r["kind"] == "equivalence-summary"]
+        if rc_r3 != 0 or rc_f == 0 or not fsum \
+                or "NOT CERTIFIED" not in (fsum[0].get("certification") or ""):
+            print(f"FAIL: a store-fault-shaped divergence was NOT caught under the "
+                  f"frozen corpus (record rc={rc_r3}, compare rc={rc_f}, "
+                  f"certification={fsum[0].get('certification') if fsum else None!r})",
+                  file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] store fault under corpus OK: divergence still FAILS "
+                  f"the gate (rc={rc_f}, '{fsum[0]['certification'][:38]}...')")
+        # 9d) FORGERY: a hand-edited state (min_margin + low_margin flipped on a
+        # prompt whose replay diverges) must NOT be able to launder a store-fault
+        # divergence into a disclosed "near-tie". The replay-side margin is
+        # re-measured against the frozen floor, so the exclusion is refused.
+        st4 = os.path.join(tempfile.mkdtemp(prefix="equiv-forge-"), "state.json")
+        ctl["on_completion"] = "store"
+        run_record(mkargs(n=2, state=st4, prompt_set=corpus, margin_floor=2.0,
+                          min_blocks_covered=1))
+        with open(st4) as f:
+            forged = json.load(f)
+        # entry 0 is a wide-margin prompt; forge it into a "near-tie"...
+        forged["entries"][0]["min_margin"] = 0.1
+        forged["entries"][0]["low_margin"] = True
+        # ...and corrupt its recorded tokens so the replay MUST diverge.
+        if forged["entries"][0].get("tokens"):
+            forged["entries"][0]["tokens"] = ["FORGED"] + forged["entries"][0]["tokens"][1:]
+        _write_text(st4, json.dumps(forged))
+        ctl["on_completion"] = "hit"
+        out_g = os.path.join(tempfile.mkdtemp(prefix="equiv-gout-"), "g.jsonl")
+        rc_g = run_compare(mkargs(n=2, state=st4, prompt_set=corpus,
+                                  margin_floor=2.0, out=out_g), {"rig": "selftest"})
+        with open(out_g) as f:
+            grecs = [json.loads(line) for line in f]
+        gsum = [r for r in grecs if r["kind"] == "equivalence-summary"]
+        if rc_g == 0 or not gsum \
+                or "NOT CERTIFIED" not in (gsum[0].get("certification") or ""):
+            print(f"FAIL: a forged state laundered a divergence into a pass "
+                  f"(rc={rc_g}, certification="
+                  f"{gsum[0].get('certification') if gsum else None!r})",
+                  file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] forgery refused OK: the replay-side margin "
+                  "re-measurement rejects a hand-edited near-tie, the divergence "
+                  f"still FAILS the gate (rc={rc_g})")
+        ctl["lowmargin_markers"] = []
     finally:
         srv.shutdown()
     print("SELFTEST " + ("PASS" if ok else "FAIL"))
@@ -1037,6 +1437,32 @@ def main() -> int:
                          f"{PRINT_PREFIX} marker)")
     ap.add_argument("--print-prefix", default=PRINT_PREFIX)
     ap.add_argument("--stamp", action="append", default=[], metavar="K=V")
+    ap.add_argument("--margin-horizon", type=int, default=8,
+                    help="pre-registered: judge the top1-top2 gap over the FIRST N "
+                         "generated steps. A min() over a long free-running "
+                         "continuation shrinks as the text drifts and would "
+                         "exclude nearly every prompt — the horizon keeps the "
+                         "screen about the decision the store influences.")
+    ap.add_argument("--min-blocks-covered", type=int, default=16,
+                    help="pre-registered floor: the deepest certification prompt "
+                         "must span at least this many blocks, so the gate "
+                         "exercises the block-index path instead of only the "
+                         "first block or two. Record REFUSES below it.")
+    ap.add_argument("--prompt-set", default="",
+                    help="path to a FROZEN high-margin prompt corpus (one prompt "
+                         "per line). Replaces the repeated-pangram filler prompts, "
+                         "whose near-tied continuations made fp8 engines fail to "
+                         "replay themselves (a large share of runs refused for a reason "
+                         "that was never about the store). The corpus sha256 is "
+                         "stamped into every record: editing it after seeing a "
+                         "result voids the certification.")
+    ap.add_argument("--margin-floor", type=float, default=2.0,
+                    help="pre-registered minimum top1-top2 logprob gap (nats) for "
+                         "a prompt to be GATED. Below it the step is a near-tie the "
+                         "engine may re-decide across a restart, so the prompt is "
+                         "excluded and DISCLOSED — the same narrowing the "
+                         "kernel-determinism control performs, never a loosening "
+                         "of --min-match.")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 

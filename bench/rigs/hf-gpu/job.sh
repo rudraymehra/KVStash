@@ -112,6 +112,13 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"          # optional --kv-cache-dtype for vL
                                               # plot.py/aggregate.py refuse mixed-dtype inputs. On an
                                               # explicit KV_BYTES_PER_TOKEN that still looks like the
                                               # bf16 default under fp8, WARN below.
+EQUIV_PROMPT_SET="${EQUIV_PROMPT_SET:-}"   # frozen high-margin corpus (CLAIMS.md fp8
+                                              # amendment 2). Empty -> the legacy
+                                              # length-calibrated filler prompts;
+                                              # DEFAULTED for fp8 below, because the
+                                              # legacy near-tie prompts are exactly
+                                              # what fp8 engines cannot replay.
+EQUIV_MARGIN_FLOOR="${EQUIV_MARGIN_FLOOR:-}"  # pre-registered nats floor; empty -> tool default
 EQUIV_N="${EQUIV_N:-}"                        # token-identity prompts (bench/e2e/equivalence.py) run
                                               # around the SAME vLLM restart: record on engine #1
                                               # after populate, compare on engine #2 BEFORE the warm
@@ -267,6 +274,15 @@ PY
   MODEL_SURGERY="dca-stripped from $MODEL (dual_chunk_attention_config key + sparse_attention_config.json removed; model-card standard-attention mode, certified <= ${MAXLEN_CERTIFIED}; identical snapshot serves both arms)"
   MODEL="$SNAP"
   log "MODEL now $MODEL — surgery disclosed in every JSONL record"
+fi
+
+# fp8 + certification: default the FROZEN high-margin corpus for fp8 runs. The
+# legacy prompts are a repeated pangram whose near-tied continuations an fp8
+# engine cannot reproduce across a restart (5 committed refusals), so an fp8
+# campaign that silently used them would re-buy that failure at GPU prices.
+if [[ "$KV_CACHE_DTYPE" == fp8* && -z "$EQUIV_PROMPT_SET" ]]; then
+  EQUIV_PROMPT_SET="$ROOT/bench/e2e/equiv-prompts-high-margin.txt"
+  log "fp8 run: defaulting EQUIV_PROMPT_SET to the frozen high-margin corpus ($EQUIV_PROMPT_SET)"
 fi
 
 # fp8 alias: vLLM spells the same e4m3 KV cache 'fp8' and 'fp8_e4m3', and the
@@ -807,6 +823,8 @@ EQUIV_OUT="$WORK/results/equivalence.jsonl"
 if (( EQUIV_N > 0 )); then
   log "token-identity record: $EQUIV_N greedy prompts via engine #1 (equivalence suite, hard fail)"
   python3 "$ROOT/bench/e2e/equivalence.py" --phase record \
+    ${EQUIV_PROMPT_SET:+--prompt-set "$EQUIV_PROMPT_SET"} \
+    ${EQUIV_MARGIN_FLOOR:+--margin-floor "$EQUIV_MARGIN_FLOOR"} \
     --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
     --model "$MODEL" --n "$EQUIV_N" --block-size 16 \
     --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" \
@@ -859,6 +877,8 @@ TOKEN_IDENTITY=""
 if (( EQUIV_N > 0 )); then
   log "token-identity compare on the restarted engine (greedy identity, labeled ${KV_CACHE_DTYPE:-auto-bf16}-vs-${KV_CACHE_DTYPE:-auto-bf16}, hard fail)"
   python3 "$ROOT/bench/e2e/equivalence.py" --phase compare \
+    ${EQUIV_PROMPT_SET:+--prompt-set "$EQUIV_PROMPT_SET"} \
+    ${EQUIV_MARGIN_FLOOR:+--margin-floor "$EQUIV_MARGIN_FLOOR"} \
     --vllm "http://127.0.0.1:$VLLM_PORT" --metrics "http://$KVBD_METRICS" \
     --model "$MODEL" --block-size 16 \
     --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" \
@@ -893,19 +913,24 @@ if summ is None:
 try:
     n, gated = int(summ["n"]), int(summ["n_gated"])
     nondet, matched = int(summ["n_kernel_nondet"]), int(summ["matched"])
+    # Low-margin exclusions (CLAIMS.md fp8 amendment 2) are a SECOND, disjoint
+    # exclusion reason; absent on pre-amendment records, hence the default 0.
+    lowm = int(summ.get("n_low_margin_excluded") or 0)
     cert = str(summ["certification"])
 except (KeyError, TypeError, ValueError) as e:
     sys.exit(f"summary missing/garbled gate fields ({e}) in {sys.argv[1]}")
-if gated + nondet != n:
+if gated + nondet + lowm != n:
     sys.exit(f"summary arithmetic broken: n_gated={gated} + "
-             f"n_kernel_nondet={nondet} != n={n}")
+             f"n_kernel_nondet={nondet} + n_low_margin_excluded={lowm} != n={n}")
 if matched != gated:
     sys.exit(f"summary says matched={matched} != n_gated={gated} but the "
              "compare phase exited 0 — its own record disagrees with the gate")
-if not cert.startswith("token-identical on all kernel-deterministic prompts"):
+if not (cert.startswith("token-identical on all kernel-deterministic prompts")
+        or cert.startswith("token-identical on all gated prompts")):
     sys.exit("summary certification is not the certified wording despite a "
              f"rc-0 compare: {cert!r}")
-print(f"n={n} n_gated={gated} n_kernel_nondet={nondet} matched={matched}")
+print(f"n={n} n_gated={gated} n_kernel_nondet={nondet} "
+      f"n_low_margin={lowm} matched={matched}")
 print(cert)
 PY
 )" || die "token-identity summary in $EQUIV_OUT failed its own gate arithmetic/certification check — the compare exited 0 but its record does not back the claim (see the python error above)"

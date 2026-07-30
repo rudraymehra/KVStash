@@ -1,0 +1,44 @@
+# kvblockd token-identity certification — HIGH-MARGIN prompt corpus
+#
+# WHY THIS FILE EXISTS. The original certification prompts were a pangram
+# ("The quick brown fox...") repeated to a target length. After hundreds of
+# repetitions the next-token distribution is nearly tied between several
+# continuations, so an fp8 kernel's last-bit numerical wobble flips the argmax
+# and the ENGINE cannot replay its own greedy output. Measured consequence:
+# ~40% of long-context fp8 certification runs were refused by the gate for a
+# reason that had nothing to do with the store (every reloaded block was
+# xxh3-verified byte-identical in the refused runs).
+#
+# These prompts instead have a LARGE top1-vs-top2 logit gap at every generated
+# token: factual completions, counting, structured formats, code with one
+# obvious continuation. A store fault (wrong bytes, wrong slot, stale block)
+# still changes the output, so the gate keeps its full discriminating power —
+# but a 1e-7 numerical perturbation no longer does.
+#
+# THIS IS A NARROWING, NOT A LOOSENING. The gate still requires 100% token
+# identity on every prompt it judges (--min-match stays 100). What changes is
+# that the judged prompts are ones where a mismatch MEANS something. The
+# corpus is frozen and checksummed BEFORE any measurement (pre-registration,
+# CLAIMS.md); editing it after seeing a result voids the certification.
+#
+# Format: one prompt per line, blank lines and #-comments ignored. Every entry
+# must be >= 17 tokens so the prefix straddles at least one 16-token block
+# boundary (a single-block prompt would not exercise the block-index path).
+# The harness prepends a per-prompt nonce, so cache keys differ per prompt.
+
+List the first eight positive integers in ascending order, separated by commas, starting from one:
+Complete the sequence by continuing the pattern exactly: 2, 4, 6, 8, 10, 12, 14,
+The chemical symbol for water is H2O. The chemical symbol for carbon dioxide is
+Count backwards from twenty to thirteen, one number per step, separated by commas:
+In the standard seven-day week, the day that comes immediately after Monday is
+Write the numbers ten, twenty, thirty, forty, fifty and sixty separated by single spaces:
+The Python expression len("hello") evaluates to the integer value
+Repeat exactly the following comma-separated list and then stop: alpha, bravo, charlie, delta,
+A right angle measures ninety degrees. A straight angle measures exactly
+Convert the decimal number sixteen into binary using standard notation:
+def add(a, b):\n    """Return the sum of a and b."""\n    return
+The seven colours of the visible spectrum in order are red, orange, yellow, green,
+Multiply six by seven and give only the resulting integer value:
+JSON object with a single key named "status" whose value is the string "ok":
+The first four letters of the English alphabet, uppercase, separated by commas:
+State the boiling point of water at sea level in degrees Celsius as an integer:

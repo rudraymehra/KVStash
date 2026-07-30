@@ -56,6 +56,8 @@ STRIP_DCA=1
 HF_HOME=/nvme/hf
 KV_CACHE_DTYPE=fp8_e4m3
 KV_BYTES_PER_TOKEN=28672
+EQUIV_PROMPT_SET=/work/kvstash/bench/e2e/equiv-prompts-high-margin.txt
+EQUIV_MARGIN_FLOOR=2.0
 LENGTHS=$1
 GEN_TOKENS=16
 GPU_MEM_UTIL=0.92
@@ -88,6 +90,8 @@ STRIP_DCA=1
 HF_HOME=/nvme/hf
 KV_CACHE_DTYPE=fp8_e4m3
 KV_BYTES_PER_TOKEN=28672
+EQUIV_PROMPT_SET=/work/kvstash/bench/e2e/equiv-prompts-high-margin.txt
+EQUIV_MARGIN_FLOOR=2.0
 LENGTHS=$1
 GEN_TOKENS=16
 GPU_MEM_UTIL=0.92
@@ -106,6 +110,39 @@ KVBD_GET_FANOUT=$KVB_FANOUT
 KVBD_STORE_QUEUE_BYTES=4294967296
 REQUEST_TIMEOUT=900
 NEOF
+}
+
+# bf16 variant of the two-node arms: fp8 kernels are nondeterministic on
+# these GPUs and the token-identity gate refuses them (~half the runs);
+# bf16 has certified cleanly in every calibration run, so the real-NIC
+# numbers are measured in bf16 — bigger payload (the wire matters MORE),
+# no dtype caveat, and it actually certifies.
+nic_bf16_common() { # $1 = LENGTHS
+  : "${STORE_PRIVATE_IP:?nic arms need STORE_PRIVATE_IP (from kvbench-dday/store-private-ip)}"
+  : "${STORE_TC_GBIT:?nic arms need STORE_TC_GBIT set to a gbit number or the word unshaped}"
+  cat <<NBF
+MODEL=Qwen/Qwen2.5-7B-Instruct-1M
+STRIP_DCA=1
+HF_HOME=/nvme/hf
+KV_BYTES_PER_TOKEN=57344
+LENGTHS=$1
+GEN_TOKENS=16
+GPU_MEM_UTIL=0.92
+MAX_NUM_BATCHED_TOKENS=8192
+RIG=ec2-twonode-nic
+GPU_ANNOT=ec2 g6e.2xlarge + r6in.2xlarge store (bf16)
+EXTERNAL_DAEMON=$STORE_PRIVATE_IP:9440
+EXTERNAL_METRICS=$STORE_PRIVATE_IP:9442
+TC_LINK=two-node real NIC bf16, store egress ${STORE_TC_GBIT} (htb+fq; iperf3 ceiling in artifacts)
+KVBD_STREAMS=8
+KVBD_STORE_DRAIN_WORKERS=4
+KVBD_STORE_FLUSH_TIMEOUT_S=180
+KVBD_LOAD_DEADLINE_S=300
+KVBD_EXISTS_TIMEOUT_S=3.0
+KVBD_GET_FANOUT=$KVB_FANOUT
+KVBD_STORE_QUEUE_BYTES=6442450944
+REQUEST_TIMEOUT=900
+NBF
 }
 
 arm_env() {
@@ -164,7 +201,45 @@ arm_env() {
     a10g-base-192k) a10g_common 196608 | sed 's/^GPU_MEM_UTIL=.*/GPU_MEM_UTIL=0.93/'; echo "BASELINE_ONLY=1"; echo "REPS=2"; echo "WARMUP=1" ;;
     a10g-base) a10g_common 65536,98304,131072; echo "BASELINE_ONLY=1"; echo "REPS=2"; echo "WARMUP=1" ;;
     a10g-base-cal) a10g_common 16384,32768; echo "BASELINE_ONLY=1"; echo "REPS=3"; echo "WARMUP=1" ;;
-    # ---- two-node real-NIC (Session 2) ----
+    # fp8 baselines on THIS box for the nic multiples' denominator (same GPU,
+    # same dtype, no connector) — recompute at the nic arm lengths.
+    nic-base) cat <<NBEOF
+MODEL=Qwen/Qwen2.5-7B-Instruct-1M
+STRIP_DCA=1
+HF_HOME=/nvme/hf
+KV_CACHE_DTYPE=fp8_e4m3
+KV_BYTES_PER_TOKEN=28672
+LENGTHS=32768,65536,131072
+GEN_TOKENS=16
+GPU_MEM_UTIL=0.92
+MAX_NUM_BATCHED_TOKENS=8192
+RIG=ec2-twonode-nic
+GPU_ANNOT=ec2 g6e.2xlarge (baseline, no connector)
+BASELINE_ONLY=1
+REPS=2
+WARMUP=1
+NBEOF
+          ;;
+    nicb-32k)  nic_bf16_common 32768;  echo "REPS=3"; echo "WARMUP=1" ;;
+    nicb-64k)  nic_bf16_common 65536;  echo "REPS=2"; echo "WARMUP=1" ;;
+    nicb-128k) nic_bf16_common 131072; echo "REPS=2"; echo "WARMUP=1" ;;
+    nicb-base) cat <<NBBEOF
+MODEL=Qwen/Qwen2.5-7B-Instruct-1M
+STRIP_DCA=1
+HF_HOME=/nvme/hf
+KV_BYTES_PER_TOKEN=57344
+LENGTHS=32768,65536,131072
+GEN_TOKENS=16
+GPU_MEM_UTIL=0.92
+MAX_NUM_BATCHED_TOKENS=8192
+RIG=ec2-twonode-nic
+GPU_ANNOT=ec2 g6e.2xlarge (bf16 baseline, no connector)
+BASELINE_ONLY=1
+REPS=2
+WARMUP=1
+NBBEOF
+          ;;
+    # ---- two-node real-NIC (Session 2, fp8 — engine-nondeterministic on these GPUs) ----
     nic-32k)  nic_common 32768;  echo "REPS=3"; echo "WARMUP=1" ;;
     nic-64k)  nic_common 65536;  echo "REPS=2"; echo "WARMUP=1" ;;
     nic-128k) nic_common 131072; echo "REPS=2"; echo "WARMUP=1" ;;

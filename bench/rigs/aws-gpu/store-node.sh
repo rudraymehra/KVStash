@@ -35,12 +35,18 @@ cmd_up() {
     --query 'Reservations[0].Instances[0].[Placement.AvailabilityZone,SubnetId]' --output text)
   log "GPU node is in $az/$subnet — placing the store node beside it"
   local ami sg
-  ami=$(aws ec2 describe-images --region $REGION --owners 099720109477 \
-    --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-jammy-22.04-amd64-server-*' \
-              'Name=state,Values=available' \
-    --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text)
+  # SSM's canonical Ubuntu-22.04 parameter — resolves reliably; the
+  # describe-images name filter drifted (Canonical dropped the -gp3 suffix).
+  ami=$(aws ssm get-parameter --region $REGION \
+    --name /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id \
+    --query Parameter.Value --output text)
+  [[ "$ami" == ami-* ]] || die "Ubuntu AMI resolution failed: $ami"
   sg=$(aws ec2 describe-security-groups --region $REGION \
     --filters Name=group-name,Values=kvbench-ssh --query 'SecurityGroups[0].GroupId' --output text)
+  # SSH from the operator's CURRENT egress IP (it drifts on home networks —
+  # a stale rule is why an earlier setup timed out on port 22):
+  aws ec2 authorize-security-group-ingress --region $REGION --group-id "$sg" \
+    --protocol tcp --port 22 --cidr "$(curl -fsS https://checkip.amazonaws.com)/32" 2>/dev/null || true
   # The store's data + ops ports are reachable only from inside the SG (i.e.
   # from the GPU node), never from the internet: plaintext KVB1 + bearer token
   # belong on a private segment, which is exactly what we publish.
@@ -110,9 +116,15 @@ pkill -f "kvblockd -config" 2>/dev/null || true
 for i in $(seq 1 20); do pgrep -f "kvblockd -config" >/dev/null || break; sleep 1; [ "$i" = 20 ] && { echo "old daemon refused to die"; exit 1; }; done
 nohup ~/kvblockd -config ~/kvb/kvblockd.yaml > ~/kvb/kvbd.log 2>&1 &
 NEW=$!
-sleep 4
-kill -0 "$NEW" 2>/dev/null || { echo "new daemon died at boot:"; tail -5 ~/kvb/kvbd.log; exit 1; }
-curl -fsS http://127.0.0.1:9442/healthz >/dev/null
+# The DRAM arena is prefaulted at boot (32 GiB ~ 7.5s), so /healthz is not
+# up immediately — poll for up to 30s rather than guess a sleep.
+ok=0
+for i in $(seq 1 30); do
+  kill -0 "$NEW" 2>/dev/null || { echo "new daemon died at boot:"; tail -5 ~/kvb/kvbd.log; exit 1; }
+  curl -fsS http://127.0.0.1:9442/healthz >/dev/null 2>&1 && { ok=1; break; }
+  sleep 1
+done
+[ "$ok" = 1 ] || { echo "daemon never became healthy:"; tail -5 ~/kvb/kvbd.log; exit 1; }
 echo "fresh daemon pid $NEW healthy"
 # Re-arm the store dead-man for the ongoing session window:
 sudo shutdown -c 2>/dev/null || true

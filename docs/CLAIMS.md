@@ -349,6 +349,88 @@ the resulting claim is STRICTER to state:
    n=... n_gated=... n_kernel_nondet=...` line in the job log, and the
    `token_identity` stamp in the TTFT JSONL carries the N-of-M wording.
 
+**Amendment 2 (2026-07-30): the frozen high-margin prompt corpus.** Written
+BEFORE any measurement with it, for the same reason as the determinism
+control: after it, the change would be indistinguishable from choosing the
+prompts that pass. The problem it fixes is measured, not hypothetical — the
+original certification prompts were one pangram repeated to a target length,
+whose continuations are near-tied, so an fp8 kernel's last-bit wobble flipped
+the argmax and the ENGINE could not replay its own greedy output. The exact,
+checkable fraction: **5 equivalence refusal records
+(`bench/results/rig-g/refusals/equiv-*.jsonl`) against 22 committed result
+files** — count them yourself (the sixth file in that directory is an
+unrelated VRAM boot refusal). The gate's own kernel-determinism control
+excluded 1-4 of 8 prompts per run as engine-nondeterministic, and the
+diverging prompt indices across the five records are 2, 2, 0, 6 and 1 — not a
+single fixed prompt, which is what an engine-side effect looks like. The refusals were never about the store: each
+reloaded block carried its xxh3 digest and the hit counters attributed every
+warm rep, which is why the refused runs are published rather than hidden.
+
+1. **The corpus is frozen and checksummed.**
+   `bench/e2e/equiv-prompts-high-margin.txt`, committed with this amendment,
+   sha256 `b76ad0c4c4c194aa851d202b3cd9ba991a21428aa50b9cf8838b65af0c68d0dc` (the first 16 hex chars are stamped into every
+   record as `prompt_corpus_sha256`; recompute the file's digest to check). Editing it after seeing a result voids the
+   certification — the digest in the artifacts is how a reader detects that.
+2. **The screen NARROWS, it never loosens.** `--min-match` stays 100. A prompt
+   whose smallest top1-vs-top2 logprob gap falls under the pre-registered
+   floor (**2.0 nats**, frozen here) is a near-tie the engine may re-decide
+   across a restart, so it cannot discriminate a store fault from numerical
+   noise: it is EXCLUDED from the gate and DISCLOSED
+   (`low_margin: true`, `min_margin`, `n_low_margin_excluded`, and the
+   exclusion named inside the `certification` string), exactly as the
+   kernel-determinism control already treats a self-inconsistent prompt. An
+   excluded prompt can never convert a mismatch into a pass.
+3. **Coverage is preserved, not traded away.** Corpus prompts are
+   LENGTH-CALIBRATED onto the same boundary trio the legacy builder used
+   (m*B-1 / m*B / m*B+1, exact to the token), with the padding in the middle so
+   the high-margin entry is always what the model reads last. A pre-registered
+   **coverage floor** (`--min-blocks-covered`, default 16) makes the record
+   phase REFUSE (rc 2) a prompt set too shallow to exercise the block-index
+   path — checked against the CONFIGURED lengths BEFORE any completion is
+   issued, so a doomed set costs nothing — with `max_blocks_covered` stamped in
+   every summary. The floor applies to corpus mode, which is where it was
+   registered. Without this the
+   screen would have silently narrowed certification to the first block or two
+   — a real regression, caught by review before any measurement.
+4. **The margin is judged over a frozen horizon.** `--margin-horizon` (default
+   **8** steps): a min() over a long free-running continuation shrinks as the
+   text drifts and would exclude nearly every prompt, defeating the fix while
+   looking strict.
+5. **The two exclusions are disjoint and separately reported.**
+   `n_kernel_nondet` counts only self-inconsistent prompts;
+   `n_low_margin_excluded` counts only near-ties; `n_gated + n_kernel_nondet +
+   n_low_margin_excluded == n` is arithmetic the rig re-checks from the record.
+   `low_margin` is RE-MEASURED at compare time: the replay requests its own
+   top-2 margins over the frozen horizon, and an exclusion stands only if the
+   REPLAY's margin is also under the floor (a stored flag that contradicts the
+   recorded arithmetic aborts the compare, rc 2). The state file is data on
+   disk and therefore forgeable; the live engine is not — so editing
+   `min_margin` cannot launder a real divergence into a disclosed "near-tie".
+   The partition is enforced with kernel-nondeterminism taking precedence, and
+   the compare REFUSES to emit a summary whose own bucket arithmetic does not
+   close.
+6. **Tripwire.** If EVERY excluded low-margin prompt also diverges on replay,
+   that is a store-shaped pattern rather than independent coin-flips: the run
+   prints a loud TRIPWIRE line and stamps
+   `tripwire_all_low_margin_diverged: true` into the summary, so the signal
+   survives into the artifact instead of scrolling past in a log.
+7. **A store fault still fails the gate.** Wrong bytes, a wrong slot, or a
+   stale block changes the output regardless of logit margin — the screen
+   removes only the engine's coin-flips, not the store's discriminating power.
+   *Witnesses (all no-GPU, in `--selftest`):* a near-tied prompt is excluded and
+   disclosed while the gate still certifies the wide-margin prompts at 100% and
+   the corpus digest reaches the summary; a set too shallow for the coverage
+   floor is REFUSED rather than certified; and a store-fault-shaped divergence
+   under the frozen corpus still FAILS the gate.
+8. **Disclosure wording.** An fp8 claim certified under this corpus reads
+   "token-identical on all gated prompts (N of M; K excluded as
+   kernel-nondeterministic; L excluded as low-margin, all disclosed)" — never
+   a bare "100%".
+
+**This amendment is violated if** an fp8 number ships whose corpus digest does
+not match the committed file, whose margin floor differs from 2.0 nats without
+its own dated amendment, or whose exclusions are not published beside it.
+
 **This amendment is violated if** an fp8 number ships whose token-identity
 claim omits the exclusion count, or if a prompt is excluded from the gate
 without its `kernel_deterministic: false` stamp and disclosed divergences in
