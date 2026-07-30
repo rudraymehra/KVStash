@@ -68,6 +68,13 @@ mkdir -p "$WORK/bin" "$WORK/results"
 BASELINE_ONLY="${BASELINE_ONLY:-0}"           # 1 = pure-recompute control: NO connector, NO daemon,
                                               # one engine boot, cold-only sweep. The third chart
                                               # series; see run_ttft.py --phase baseline.
+if [[ -n "${MARGIN_CALIBRATE:-}" ]]; then
+  # Margin calibration measures the ENGINE (logit gaps + self-consistency), so
+  # it needs no daemon, no connector and no arena. Reuse the store-free path
+  # instead of a second one: a tiny calibration sweep otherwise derives a
+  # ~118 MB arena that the 256 MB pinned cap refuses to boot against.
+  BASELINE_ONLY=1
+fi
 MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 LENGTHS="${LENGTHS:-1024,4096,8192,16384}"
 REPS="${REPS:-5}"
@@ -780,6 +787,25 @@ PY
   exit $PROBE_FAIL
 fi
 
+# ---- 6b. MARGIN CALIBRATION (optional, terminal): measure candidate prompts
+# against a real engine and stop. This is how the frozen certification corpus
+# gets chosen by measurement instead of by intuition.
+if [[ -n "$MARGIN_CALIBRATE" ]]; then
+  [[ -f "$MARGIN_CALIBRATE" ]] || die "MARGIN_CALIBRATE=$MARGIN_CALIBRATE not found"
+  start_vllm "$WORK/vllm-calibrate.log" 900
+  log "margin calibration against $MARGIN_CALIBRATE (no store involved)"
+  rc_cal=0
+  python3 "$ROOT/bench/e2e/equivalence.py" --phase calibrate \
+    --vllm "http://127.0.0.1:$VLLM_PORT" --model "$MODEL" \
+    --prompt-set "$MARGIN_CALIBRATE" \
+    --gen-tokens "${EQUIV_GEN_TOKENS:-8}" \
+    --margin-floor "${EQUIV_MARGIN_FLOOR:-2.0}" \
+    --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" || rc_cal=$?
+  log "margin calibration finished rc=$rc_cal (CALIBJSONL lines above)"
+  kill "$VLLM_PID" 2>/dev/null || true
+  exit "$rc_cal"
+fi
+
 # ---- 8b. BASELINE mode: one boot, cold-only control, then straight to results
 if [[ "$BASELINE_ONLY" == "1" ]]; then
   start_vllm "$WORK/vllm-baseline.log" 2400
@@ -801,25 +827,6 @@ if [[ "$BASELINE_ONLY" == "1" ]]; then
   [[ $rc -eq 0 ]] || { tail_logs; die "baseline driver exited rc=$rc"; }
   log "DONE (baseline)"
   exit 0
-fi
-
-# ---- 6b. MARGIN CALIBRATION (optional, terminal): measure candidate prompts
-# against a real engine and stop. This is how the frozen certification corpus
-# gets chosen by measurement instead of by intuition.
-if [[ -n "$MARGIN_CALIBRATE" ]]; then
-  [[ -f "$MARGIN_CALIBRATE" ]] || die "MARGIN_CALIBRATE=$MARGIN_CALIBRATE not found"
-  start_vllm "$WORK/vllm-calibrate.log" 900
-  log "margin calibration against $MARGIN_CALIBRATE (no store involved)"
-  rc_cal=0
-  python3 "$ROOT/bench/e2e/equivalence.py" --phase calibrate \
-    --vllm "http://127.0.0.1:$VLLM_PORT" --model "$MODEL" \
-    --prompt-set "$MARGIN_CALIBRATE" \
-    --gen-tokens "${EQUIV_GEN_TOKENS:-8}" \
-    --margin-floor "${EQUIV_MARGIN_FLOOR:-2.0}" \
-    --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" || rc_cal=$?
-  log "margin calibration finished rc=$rc_cal (CALIBJSONL lines above)"
-  kill "$VLLM_PID" 2>/dev/null || true
-  exit "$rc_cal"
 fi
 
 # ---- 9. PHASE 1: populate (vLLM #1 stores every sweep prompt into kvblockd) --
