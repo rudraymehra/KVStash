@@ -124,9 +124,10 @@ if [[ -n "$EXT_METRICS" ]]; then
   [[ -s "$ARENA_FILE" ]] || die "no $ARENA_FILE — store-node.sh up/restart records the arena size this gate checks"
   ARENA_B="$(cat "$ARENA_FILE")"
   KVB_TOK="$(env_val KV_BYTES_PER_TOKEN)"; REPS_A="$(env_val REPS)"; WARM_A="$(env_val WARMUP)"
+  EQN="$(env_val EQUIV_N)"; EQN="${EQN:-8}"
   SUM_TOK=0; IFS=',' read -ra _LS <<< "$(env_val LENGTHS)"
   for _l in "${_LS[@]}"; do SUM_TOK=$((SUM_TOK + _l)); done
-  NEED_B=$(( SUM_TOK * (REPS_A + WARM_A) * KVB_TOK * 115 / 100 + 8 * 320 * KVB_TOK ))
+  NEED_B=$(( SUM_TOK * (REPS_A + WARM_A) * KVB_TOK * 115 / 100 + EQN * 320 * KVB_TOK ))
   (( NEED_B <= ARENA_B * 95 / 100 )) \
     || die "workload needs ~$((NEED_B / 1073741824)) GiB vs store arena $((ARENA_B / 1073741824)) GiB (95% cap) — the populate would evict itself; shrink the arm or grow STORE_ARENA_BYTES"
 fi
