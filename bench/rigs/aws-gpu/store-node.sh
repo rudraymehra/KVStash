@@ -103,6 +103,13 @@ max_conns: 1024
 CFG
 REMOTE
   cmd_restart
+  # Machine-state records the run-arm preflight gates check (a stamp an
+  # operator types can lie; these are written by the code that did the thing).
+  echo "$ARENA_BYTES" > "$STATE_DIR/store-arena-bytes"
+  echo "unshaped" > "$STATE_DIR/store-tc-state"
+  aws ec2 describe-instances --region $REGION --instance-ids "$(cat "$STATE_DIR/store-instance-id")" \
+    --query 'Reservations[0].Instances[0].InstanceType' --output text \
+    > "$STATE_DIR/store-instance-type" 2>/dev/null || true
   log "store ready — GPU-side env: EXTERNAL_DAEMON=$(cat "$STATE_DIR/store-private-ip"):9440 EXTERNAL_METRICS=$(cat "$STATE_DIR/store-private-ip"):9442"
 }
 
@@ -144,16 +151,24 @@ sudo tc class replace dev "\$IF" parent 1: classid 1:10 htb rate ${rate}gbit cei
 sudo tc qdisc replace dev "\$IF" parent 1:10 handle 10: fq
 tc qdisc show dev "\$IF" | head -3
 REMOTE
-  log "egress shaped to ${rate} Gbit (the reload direction)"
+  echo "${rate}gbit" > "$STATE_DIR/store-tc-state"
+  log "egress shaped to ${rate} Gbit (the reload direction) — recorded in store-tc-state"
 }
 
 cmd_unshape() {
   ssh_store 'IF=$(ip -o -4 route show to default | awk "{print \$5}"); sudo tc qdisc del dev "$IF" root 2>/dev/null || true; tc qdisc show dev "$IF" | head -2'
-  log "shaping removed"
+  echo "unshaped" > "$STATE_DIR/store-tc-state"
+  log "shaping removed — recorded in store-tc-state"
 }
 
 cmd_iperf() {  # ceiling FIRST, store->GPU direction (the reload direction)
   local gpu_priv
+  # Interlock: saturating the link for 30 s while an arm is measuring would
+  # poison that arm's timings — refuse if the engine container is running.
+  if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "ubuntu@$(cat "$STATE_DIR/gpu-ip")" \
+      'sudo docker ps --format "{{.Image}}"' 2>/dev/null | grep -q vllm; then
+    die "an engine container is running on the GPU node — refusing to iperf over a live arm"
+  fi
   gpu_priv=$(aws ec2 describe-instances --region $REGION --instance-ids "$(cat "$STATE_DIR/gpu-instance-id")" \
     --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
   log "iperf3: store -> GPU ($gpu_priv), 4 streams, 30 s — this is the published denominator"

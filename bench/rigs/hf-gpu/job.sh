@@ -68,11 +68,12 @@ mkdir -p "$WORK/bin" "$WORK/results"
 BASELINE_ONLY="${BASELINE_ONLY:-0}"           # 1 = pure-recompute control: NO connector, NO daemon,
                                               # one engine boot, cold-only sweep. The third chart
                                               # series; see run_ttft.py --phase baseline.
-if [[ -n "${MARGIN_CALIBRATE:-}" ]]; then
-  # Margin calibration measures the ENGINE (logit gaps + self-consistency), so
-  # it needs no daemon, no connector and no arena. Reuse the store-free path
-  # instead of a second one: a tiny calibration sweep otherwise derives a
-  # ~118 MB arena that the 256 MB pinned cap refuses to boot against.
+if [[ -n "${MARGIN_CALIBRATE:-}" || -n "${PRESCREEN_SETS:-}" ]]; then
+  # Margin calibration and the store-free prescreen measure the ENGINE
+  # (logit gaps + self-consistency), so they need no daemon, no connector
+  # and no arena. Reuse the store-free path instead of a second one: a tiny
+  # calibration sweep otherwise derives a ~118 MB arena that the 256 MB
+  # pinned cap refuses to boot against.
   BASELINE_ONLY=1
 fi
 MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
@@ -124,6 +125,15 @@ MARGIN_CALIBRATE="${MARGIN_CALIBRATE:-}"      # path to a CANDIDATE pool: boot o
                                               # (margin + self-consistency), print CALIBJSONL,
                                               # exit. No daemon, no connector, no store — so it
                                               # cannot select on a store outcome it never sees.
+PRESCREEN_SETS="${PRESCREEN_SETS:-}"          # terminal, store-free (PR-10): colon-separated
+                                              # corpus paths whose PADDED margins get screened
+                                              # on one baseline engine, then exit. Prefix a
+                                              # path with '?' to record zero-eligible as a
+                                              # FINDING instead of a failure (the near-tie
+                                              # candidate pool is EXPECTED to screen out).
+PRESCREEN_N="${PRESCREEN_N:-8}"               # prompts per prescreen set (mirrors EQUIV_N's
+                                              # fp8 default so both sides of the mechanism
+                                              # pair sample the same corpus cells).
 EQUIV_PROMPT_SET="${EQUIV_PROMPT_SET:-}"   # frozen high-margin corpus (CLAIMS.md fp8
                                               # amendment 2). Empty -> the legacy
                                               # length-calibrated filler prompts;
@@ -228,12 +238,33 @@ VLLM_VER="$(python3 -c 'import vllm; print(vllm.__version__)')" || die "vllm not
 log "image vllm=$VLLM_VER"
 
 GIT_SHA="unknown"
+# The clone is host-owned (ubuntu) while this container runs as root — git's
+# dubious-ownership check would otherwise silently fail rev-parse and drop us
+# to the fallback ref with no dirty detection.
+git config --global --add safe.directory "$ROOT" 2>/dev/null || true
 if git -C "$ROOT" rev-parse --short=12 HEAD >/dev/null 2>&1; then
   GIT_SHA="$(git -C "$ROOT" rev-parse --short=12 HEAD)"
+  # Working-tree honesty: a box-side edit to the mounted clone must be
+  # visible in every stamp — session-1 published rows whose annotation
+  # strings existed in no committed tree, and nothing recorded that the
+  # tree was dirty. The suffix makes that unforgeable-by-omission.
+  [[ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]] && GIT_SHA="$GIT_SHA-dirty"
 elif [[ -n "${GIT_REF:-}" ]]; then
   GIT_SHA="$GIT_REF"   # tarball checkout: stamp the requested ref instead
 fi
 log "git_sha stamp: $GIT_SHA"
+
+# EC2 truth for the provenance stamp: the box's own IMDS answer, never the
+# operator-typed annotation (session 1 provisioned a g5 when g6e had no
+# capacity — an annot alone would have lied undetectably). IMDSv2 first,
+# anonymous fallback; off-EC2 (HF jobs) this stamps "unavailable".
+IMDS_TOK="$(curl -sX PUT --max-time 2 "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)"
+INSTANCE_TYPE_ACTUAL="$(curl -sf --max-time 2 \
+  ${IMDS_TOK:+-H "X-aws-ec2-metadata-token: $IMDS_TOK"} \
+  http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || true)"
+INSTANCE_TYPE_ACTUAL="${INSTANCE_TYPE_ACTUAL:-unavailable}"
+log "instance-type (IMDS): $INSTANCE_TYPE_ACTUAL"
 
 # ---- 1. knob coherence: LENGTHS drives max-model-len AND the arena ----------
 # FP8_PREFLIGHT probes the daemon's counters; BASELINE_ONLY runs with no
@@ -305,6 +336,11 @@ fi
 if [[ -n "$EQUIV_PROMPT_SET" && -z "$EQUIV_GEN_TOKENS" ]]; then
   EQUIV_GEN_TOKENS=8
   log "corpus mode: certification window EQUIV_GEN_TOKENS=8 (matches the margin horizon)"
+fi
+# Refuse a missing corpus at t=0, not at the post-populate record phase —
+# MARGIN_CALIBRATE gets this check, the certification corpus must too.
+if [[ -n "$EQUIV_PROMPT_SET" && ! -f "$EQUIV_PROMPT_SET" ]]; then
+  die "EQUIV_PROMPT_SET=$EQUIV_PROMPT_SET not found on this node — refusing before any paid work (stale clone?)"
 fi
 
 # fp8 alias: vLLM spells the same e4m3 KV cache 'fp8' and 'fp8_e4m3', and the
@@ -539,7 +575,7 @@ python3 "$HERE/run_ttft.py" --selftest | sed 's/^CHART2JSONL /SELFTESTJSONL /'
 # loud-fail) must be proven against the stub before any engine boots, and its
 # stub EQUIVJSONL lines are renamed so log retrieval can never scoop them.
 if (( EQUIV_N > 0 )); then
-  python3 "$ROOT/bench/e2e/equivalence.py" --selftest | sed 's/^EQUIVJSONL /SELFTESTEQUIV /'
+  python3 "$ROOT/bench/e2e/equivalence.py" --selftest | sed 's/^EQUIVJSONL /SELFTESTEQUIV /; s/^PRESCREENJSONL /SELFTESTPRESCREEN /'
 fi
 
 # ---- 8. vLLM lifecycle (started twice: populate engine, then a fresh measure engine)
@@ -806,6 +842,39 @@ if [[ -n "$MARGIN_CALIBRATE" ]]; then
   exit "$rc_cal"
 fi
 
+# ---- 6c. PRESCREEN (optional, terminal): padded-margin screen of one or more
+# corpora on THIS engine, store-free. This is the store-FREE side of PR-10's
+# construction-matched mechanism pair — the connector arms' in-run prescreen
+# (same builder, same lengths, connector attached) is the store-ATTACHED side.
+if [[ -n "$PRESCREEN_SETS" ]]; then
+  start_vllm "$WORK/vllm-prescreen.log" 900
+  rc_pre=0
+  IFS=':' read -ra _PSETS <<< "$PRESCREEN_SETS"
+  for pset in "${_PSETS[@]}"; do
+    tolerate=0
+    [[ "$pset" == \?* ]] && { tolerate=1; pset="${pset#\?}"; }
+    [[ -f "$pset" ]] || die "PRESCREEN_SETS entry $pset not found"
+    log "prescreen (store-free) against $pset (n=$PRESCREEN_N, tolerate-zero=$tolerate)"
+    rc_one=0
+    python3 "$ROOT/bench/e2e/equivalence.py" --phase prescreen \
+      --vllm "http://127.0.0.1:$VLLM_PORT" --model "$MODEL" \
+      --prompt-set "$pset" --n "$PRESCREEN_N" --block-size 16 \
+      --gen-tokens "${EQUIV_GEN_TOKENS:-8}" \
+      --margin-floor "${EQUIV_MARGIN_FLOOR:-2.0}" \
+      --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" || rc_one=$?
+    if [[ $rc_one -ne 0 ]]; then
+      if [[ $tolerate -eq 1 && $rc_one -eq 1 ]]; then
+        log "prescreen: ZERO eligible on $pset — recorded as a FINDING (tolerated for this set; the near-tie pool is expected to screen out when padded)"
+      else
+        rc_pre=$rc_one
+      fi
+    fi
+  done
+  log "prescreen finished rc=$rc_pre (PRESCREENJSONL lines above)"
+  kill "$VLLM_PID" 2>/dev/null || true
+  exit "$rc_pre"
+fi
+
 # ---- 8b. BASELINE mode: one boot, cold-only control, then straight to results
 if [[ "$BASELINE_ONLY" == "1" ]]; then
   start_vllm "$WORK/vllm-baseline.log" 2400
@@ -819,7 +888,7 @@ if [[ "$BASELINE_ONLY" == "1" ]]; then
     --gen-tokens "$GEN_TOKENS" --out "$OUT_JSONL" \
     --stamp gpu="$GPU_NAME ($GPU_ANNOT)" \
     --stamp vllm="$VLLM_VER" --stamp connector="none (baseline control)" \
-    --stamp tc_link="$TC_LINK" --stamp rig="$RIG" \
+    --stamp tc_link="$TC_LINK" --stamp rig="$RIG" --stamp instance_type="$INSTANCE_TYPE_ACTUAL" \
     --stamp kv_cache_dtype="${KV_CACHE_DTYPE:-auto-bf16}" \
     ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \
     --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" ${MODEL_SURGERY:+--stamp model_surgery="$MODEL_SURGERY"} || rc=$?
@@ -831,6 +900,28 @@ fi
 
 # ---- 9. PHASE 1: populate (vLLM #1 stores every sweep prompt into kvblockd) --
 start_vllm "$WORK/vllm-populate.log" 2400   # generous: first boot downloads ~15 GB of weights
+
+# Pre-populate prescreen (PR-10): raw-candidate margins provably do not
+# transfer to padded prompts (measured: 4.50 nats raw -> 0.125 once padded),
+# so screen the ACTUAL certification construction on THIS engine before the
+# paid populate — a doomed arm refuses in ~a minute here instead of at the
+# post-populate receipt, the failure this rig has paid for twice. Selection-
+# independent by construction: record/compare re-measure their own margins
+# and gate on those; this step can only stop the run, never steer it. Its
+# PRESCREENJSONL is also the store-ATTACHED side of the PR-10 mechanism pair
+# (engine #1 serves with the connector on).
+if (( EQUIV_N > 0 )) && [[ -n "$EQUIV_PROMPT_SET" ]]; then
+  log "pre-populate prescreen: padded margins of $EQUIV_PROMPT_SET on engine #1 (connector attached)"
+  python3 "$ROOT/bench/e2e/equivalence.py" --phase prescreen \
+    --prompt-set "$EQUIV_PROMPT_SET" \
+    ${EQUIV_GEN_TOKENS:+--gen-tokens "$EQUIV_GEN_TOKENS"} \
+    ${EQUIV_MARGIN_FLOOR:+--margin-floor "$EQUIV_MARGIN_FLOOR"} \
+    --vllm "http://127.0.0.1:$VLLM_PORT" \
+    --model "$MODEL" --n "$EQUIV_N" --block-size 16 \
+    --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" \
+    || die "prescreen: zero gate-eligible padded prompts on this engine — the arm would populate, restart, and then certify NOTHING; refusing before the paid work"
+fi
+
 log "phase 1/2 populate: lengths=$LENGTHS x $PAIRS pairs; driver polls kvblockd's put counters per prompt and FAILS if they never grow"
 # --vllm-log: after the put counters quiesce the driver greps the engine log
 # for the connector's write-behind disclosure and ABORTS on a nonzero
@@ -926,7 +1017,7 @@ if (( EQUIV_N > 0 )); then
     --model "$MODEL" --block-size 16 \
     --kv-cache-dtype "${KV_CACHE_DTYPE:-auto-bf16}" \
     --state "$EQUIV_STATE" --out "$EQUIV_OUT" \
-    --stamp isolation=vllm-restart --stamp rig="$RIG" \
+    --stamp isolation=vllm-restart --stamp rig="$RIG" --stamp instance_type="$INSTANCE_TYPE_ACTUAL" \
     --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" ${MODEL_SURGERY:+--stamp model_surgery="$MODEL_SURGERY"} \
     || die "token-identity compare FAILED — the warm arm must not be published without machine-checked same-dtype token identity (records above behind the EQUIV''JSONL marker)"
   # The kernel-determinism control's receipt (greppable: EQUIVCONTROL): the
@@ -1006,7 +1097,7 @@ python3 "$HERE/run_ttft.py" --phase measure \
   --stamp gpu="$GPU_NAME ($GPU_ANNOT)" \
   --stamp vllm="$VLLM_VER" \
   --stamp connector="$CONNECTOR_STAMP" \
-  --stamp tc_link="$TC_LINK" --stamp rig="$RIG" \
+  --stamp tc_link="$TC_LINK" --stamp rig="$RIG" --stamp instance_type="$INSTANCE_TYPE_ACTUAL" \
   --stamp kv_cache_dtype="${KV_CACHE_DTYPE:-auto-bf16}" \
   ${TOKEN_IDENTITY:+--stamp token_identity="$TOKEN_IDENTITY"} \
   ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \

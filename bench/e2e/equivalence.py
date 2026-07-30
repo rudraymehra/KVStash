@@ -449,6 +449,90 @@ def run_calibrate(args) -> int:
 
 # --------------------------------------------------------------- phase: record
 
+def run_prescreen(args) -> int:
+    """Store-blind margin screen of the PADDED certification prompts.
+
+    Builds exactly the prompts run_record would build (same boundary trio,
+    same corpus cycling, same length-calibrated padding — but fresh nonces,
+    so no cache-key overlap with a later record phase) and measures, per
+    prompt, the horizon margin and back-to-back self-consistency on THIS
+    engine. Raw-candidate margins provably do not transfer to padded prompts
+    (measured on the certified 131k run: entries at 4.50/3.75 nats raw
+    collapsed to 0.125-0.75 once padded to depth), so only a padded screen
+    predicts whether record/compare will have anything to judge.
+
+    Two pre-registered uses (CLAIMS.md PR-10):
+      1. Refuse a doomed arm BEFORE the paid populate: exit 1 iff ZERO padded
+         prompts are eligible (self-consistent AND >= floor). Any other count
+         exits 0 — this phase never publishes, it only stops obvious waste.
+      2. The mechanism pair: this same phase run on a connector-attached
+         engine (store in loop) vs on a baseline engine (store-free), same
+         box, same checkpoint, same construction — banked PRESCREENJSONL on
+         both sides isolates store-in-loop for the padded construction.
+
+    SELECTION INDEPENDENCE: this phase never chooses what the gate judges.
+    Record/compare re-measure margins on their own engines and gate on those;
+    a prescreen can only stop a run entirely, never steer its verdict.
+    """
+    lengths = boundary_lengths(args.block_size, _ints(args.boundary_multiples),
+                               _ints(args.lengths))
+    if not lengths:
+        print("FATAL(prescreen): no usable lengths after the zero-block filter",
+              file=sys.stderr)
+        return 2
+    corpus, corpus_sha = load_prompt_corpus(args.prompt_set)
+    print(f"[prescreen] {len(corpus)} corpus entries from {args.prompt_set} "
+          f"(sha256={corpus_sha}) x lengths {lengths}, n={args.n}, "
+          f"floor={args.margin_floor:.2f} nats, horizon={args.margin_horizon}, "
+          f"dtype={args.kv_cache_dtype}", flush=True)
+    eligible = 0
+    for i in range(args.n):
+        target = lengths[i % len(lengths)]
+        nonce = f"pre{uuid.uuid4().hex[:12]}-L{target}-e{i}"
+        prompt, ntok = build_prompt_corpus(args.vllm, args.model, target,
+                                           nonce, corpus[i % len(corpus)])
+        a = complete_greedy(args.vllm, args.model, prompt, args.gen_tokens,
+                            args.seed, args.request_timeout,
+                            want_margins=True,
+                            margin_horizon=args.margin_horizon)
+        b = complete_greedy(args.vllm, args.model, prompt, args.gen_tokens,
+                            args.seed, args.request_timeout)
+        if a["tokens"] is not None and b["tokens"] is not None:
+            div = first_divergence(a["tokens"], b["tokens"])
+        else:
+            div = first_divergence(list(a["text"]), list(b["text"]))
+        margin = a.get("min_margin")
+        ok = bool(div is None and margin is not None
+                  and margin >= args.margin_floor)
+        eligible += ok
+        rec = {"schema_version": 1, "kind": "prescreen", "i": i,
+               "target_tokens": target,
+               "prompt_tokens": int(a["usage"].get("prompt_tokens", ntok)),
+               "entry_text": corpus[i % len(corpus)][:80],
+               "prompt_corpus": args.prompt_set,
+               "prompt_corpus_sha256": corpus_sha,
+               "min_margin": margin,
+               "self_consistent": div is None,
+               "first_divergence_index": div,
+               "margin_floor": args.margin_floor,
+               "margin_horizon": args.margin_horizon,
+               "gen_tokens": args.gen_tokens,
+               "kv_cache_dtype": args.kv_cache_dtype,
+               "eligible": ok}
+        print("PRESCREENJSONL " + json.dumps(rec, sort_keys=True), flush=True)
+        print(f"[prescreen] i={i} target={target} "
+              f"margin={margin if margin is None else round(margin, 3)} "
+              f"self_consistent={div is None} eligible={ok}", flush=True)
+    print(f"[prescreen] {eligible}/{args.n} padded prompts eligible on this "
+          "engine", flush=True)
+    if eligible == 0:
+        print("FATAL(prescreen): ZERO padded prompts are gate-eligible on this "
+              "engine — a record/compare pass would certify nothing; refusing "
+              "before the paid populate.", file=sys.stderr)
+        return 1
+    return 0
+
+
 def run_record(args) -> int:
     lengths = boundary_lengths(args.block_size, _ints(args.boundary_multiples),
                                _ints(args.lengths))
@@ -640,6 +724,14 @@ def run_compare(args, stamp: dict) -> int:
 
     matched = 0
     n_gated = 0
+    # Depth the GATE actually judged, distinct from depth the corpus was built
+    # to: padding provably collapses margins (measured: the certified 131k run
+    # excluded every 15-16-block prompt as a near-tie at 0.25-0.75 nats and
+    # gated only 3-4-block ones), so the built depth can satisfy the coverage
+    # floor while the gated set stays shallow. The certification string discloses both numbers; the
+    # per-cell BYTE proof to full depth remains the exact-count hit gate plus
+    # per-block xxh3 verify, not this token gate.
+    gated_max_blocks = 0
     mismatches, unwarmed, text_fallback, kernel_nondet = [], [], [], []
     n_low_margin, low_margin_detail = 0, []
     for e in entries:
@@ -729,6 +821,9 @@ def run_compare(args, stamp: dict) -> int:
                   " — disclosed either way", flush=True)
         if gated:
             n_gated += 1
+            gated_max_blocks = max(
+                gated_max_blocks,
+                expected_hit_blocks(e["prompt_tokens"], block_size))
             if div is None:
                 matched += 1
             else:
@@ -815,7 +910,13 @@ def run_compare(args, stamp: dict) -> int:
         certification = (
             f"token-identical on all gated prompts "
             f"({n_gated} of {len(entries)}; {len(kernel_nondet)} excluded as "
-            f"kernel-nondeterministic{excl}, all disclosed)")
+            f"kernel-nondeterministic{excl}, all disclosed)"
+            # Depth honesty: the coverage floor is a property of the BUILT set;
+            # exclusions can leave the gate judging only shallow prompts. Say
+            # so in the quotable string itself — byte-correctness to full depth
+            # is the hit gate + xxh3's claim, not this one's.
+            f"; gated depth <= {gated_max_blocks} blocks "
+            f"(deepest built: {state.get('max_blocks_covered')})")
     summary = {"schema_version": 1, "kind": "equivalence-summary",
                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "model": args.model, "seed": seed, "gen_tokens": gen_tokens,
@@ -831,6 +932,7 @@ def run_compare(args, stamp: dict) -> int:
                "margin_horizon": state.get("margin_horizon"),
                "max_blocks_covered": state.get("max_blocks_covered"),
                "min_blocks_covered": state.get("min_blocks_covered"),
+               "gated_max_blocks": gated_max_blocks,
                "n_low_margin_excluded": n_low_margin,
                "tripwire_all_low_margin_diverged": tripwire,
                "low_margin": low_margin_detail,
@@ -869,9 +971,10 @@ def run_compare(args, stamp: dict) -> int:
                  else f"diverged at token {nd['replay_first_divergence_index']}")
               + " — disclosed, outside the store gate either way", file=sys.stderr)
     if entries and not n_gated:
-        print("FAIL: every prompt was kernel-nondeterministic — the record "
-              "engine disagreed with itself back-to-back on all of them, so "
-              "the store gate judged ZERO prompts and NOTHING was certified.",
+        print(f"FAIL: every prompt was excluded — {len(kernel_nondet)} kernel-"
+              f"nondeterministic (the record engine disagreed with itself "
+              f"back-to-back), {n_low_margin} low-margin near-ties — so the "
+              "store gate judged ZERO prompts and NOTHING was certified.",
               file=sys.stderr)
         return 1
     if mismatches:
@@ -1022,8 +1125,12 @@ def selftest() -> int:
     a prompt the stub
     engine answers differently back-to-back is stamped nondeterministic at
     record, EXCLUDED from the gate (which still passes on the deterministic
-    prompts) and disclosed — even when its replay diverges — and (11) an
-    all-nondeterministic run FAILS loudly (nothing was certified)."""
+    prompts) and disclosed — even when its replay diverges — (11) an
+    all-nondeterministic run FAILS loudly (nothing was certified), (12) the
+    certified wording discloses the depth the gate actually judged
+    (gated_max_blocks) beside the built depth, and (13) the prescreen phase
+    screens PADDED margins on this engine, exits 0 when anything is eligible
+    and refuses (rc 1) only an all-ineligible corpus — before any populate."""
     import tempfile
 
     ctl = {"hits": 0.0, "put_bytes": 0.0, "get_bytes": 0.0, "blocks": 0.0,
@@ -1455,6 +1562,44 @@ def selftest() -> int:
             print("[selftest] forgery refused OK: the replay-side margin "
                   "re-measurement rejects a hand-edited near-tie, the divergence "
                   f"still FAILS the gate (rc={rc_g})")
+
+        # 9e) GATED-DEPTH DISCLOSURE: the certified wording from case 9 must
+        # state the depth the gate actually judged, separately from the depth
+        # the corpus was built to — the two provably diverge under padding
+        # (the certified 131k run gated nothing deeper than 4 blocks while
+        # the receipt implied 16).
+        if not msum or not isinstance(s0.get("gated_max_blocks"), int) \
+                or s0.get("gated_max_blocks", 0) < 1 \
+                or "gated depth <=" not in (s0.get("certification") or ""):
+            print(f"FAIL: certified wording lacks the gated-depth disclosure "
+                  f"(gated_max_blocks={s0.get('gated_max_blocks')!r}, "
+                  f"certification={s0.get('certification')!r})", file=sys.stderr)
+            ok = False
+        else:
+            print(f"[selftest] gated-depth disclosure OK: summary carries "
+                  f"gated_max_blocks={s0['gated_max_blocks']} and the certified "
+                  "wording names it")
+
+        # 9f) PRESCREEN: the padded-margin screen must count eligibility on
+        # THIS engine (2 of 3 with one marked near-tie -> rc 0) and refuse
+        # outright only when NOTHING is eligible (rc 1) — the pre-populate
+        # guard that stops a doomed paid arm before it spends.
+        rc_p = run_prescreen(mkargs(n=3, prompt_set=corpus, margin_floor=2.0))
+        if rc_p != 0:
+            print(f"FAIL: prescreen rc={rc_p} with 2 of 3 prompts eligible "
+                  "(expected 0)", file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] prescreen OK: eligible prompts found, rc 0")
+        ctl["lowmargin_markers"] = ["prompt number", "TIEPROMPT"]  # all near-tie
+        rc_p0 = run_prescreen(mkargs(n=3, prompt_set=corpus, margin_floor=2.0))
+        if rc_p0 != 1:
+            print(f"FAIL: all-ineligible prescreen rc={rc_p0} (expected 1 — it "
+                  "must refuse before the paid populate)", file=sys.stderr)
+            ok = False
+        else:
+            print("[selftest] prescreen refusal OK: zero eligible prompts "
+                  "-> rc 1 before any populate")
         ctl["lowmargin_markers"] = []
     finally:
         srv.shutdown()
@@ -1467,7 +1612,8 @@ def selftest() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--phase", choices=("record", "compare", "calibrate"))
+    ap.add_argument("--phase", choices=("record", "compare", "calibrate",
+                                        "prescreen"))
     ap.add_argument("--vllm", default="http://127.0.0.1:8000")
     ap.add_argument("--metrics", default="",
                     help="kvblockd metrics endpoint; empty skips the store "
@@ -1543,6 +1689,16 @@ def main() -> int:
         if not args.prompt_set:
             ap.error("--phase calibrate needs --prompt-set (the CANDIDATE pool)")
         return run_calibrate(args)
+
+    if args.phase == "prescreen":
+        if not args.prompt_set:
+            ap.error("--phase prescreen needs --prompt-set (the corpus whose "
+                     "PADDED margins are being screened)")
+        try:
+            return run_prescreen(args)
+        except PromptLandingError as e:
+            print(f"FATAL(prescreen): {e}", file=sys.stderr)
+            return 2
 
     if args.phase == "record":
         try:
