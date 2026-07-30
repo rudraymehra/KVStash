@@ -299,7 +299,7 @@ fi
 # engine cannot reproduce across a restart (5 committed refusals), so an fp8
 # campaign that silently used them would re-buy that failure at GPU prices.
 if [[ "$KV_CACHE_DTYPE" == fp8* && -z "$EQUIV_PROMPT_SET" ]]; then
-  EQUIV_PROMPT_SET="$ROOT/bench/e2e/equiv-prompts-high-margin.txt"
+  EQUIV_PROMPT_SET="$ROOT/bench/e2e/equiv-prompts-high-margin-v2.txt"
   log "fp8 run: defaulting EQUIV_PROMPT_SET to the frozen high-margin corpus ($EQUIV_PROMPT_SET)"
 fi
 if [[ -n "$EQUIV_PROMPT_SET" && -z "$EQUIV_GEN_TOKENS" ]]; then

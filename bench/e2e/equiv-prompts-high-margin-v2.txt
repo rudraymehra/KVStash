@@ -1,0 +1,19 @@
+# FROZEN certification corpus v2 — selected BY MEASUREMENT, not intuition.
+#
+# Provenance: every prompt below survived a margin-calibration pass against a
+# real fp8_e4m3 engine (A10G, vLLM 0.25.1, Qwen2.5-7B-Instruct, 8-token
+# horizon) — HF job 6a6b7eb523ed89c748ec7fef, full per-candidate data committed
+# at bench/results/rig-e/margin-calibration-a10g-fp8.jsonl. Selection used only
+# two ENGINE properties: the top1-top2 logprob gap and whether the engine
+# reproduces itself back-to-back. The calibration phase runs with no daemon, no
+# connector and no restart, so it cannot select for a store outcome it never
+# observes.
+#
+# What the calibration measured, stated plainly because it is the interesting
+# part: 48 of 48 candidates were self-consistent, but only these 2 cleared a
+# 2.0-nat margin — the median candidate margin was 0.25 nats. This model's
+# greedy choices are usually near-ties, so almost any perturbation flips them.
+# Corpus v1 (hand-written, digest b76ad0c4c4c194aa) was disproven by exactly
+# this measurement and is superseded; its two refusal records stay committed.
+Echo this sequence verbatim: A B C D E F G H
+Count down and stop at one: 10, 9, 8, 7, 6, 5,

@@ -443,6 +443,50 @@ warm rep, which is why the refused runs are published rather than hidden.
    kernel-nondeterministic; L excluded as low-margin, all disclosed)" — never
    a bare "100%".
 
+**Amendment 3 (2026-07-30): what measurement said about fp8 reuse, and corpus
+v2.** Amendment 2's corpus was written from intuition and a measured
+calibration pass disproved it. The calibration (HF job
+`6a6b7eb523ed89c748ec7fef`; A10G, vLLM 0.25.1, Qwen2.5-7B-Instruct, fp8_e4m3,
+8-token horizon; full per-candidate data committed at
+`bench/results/rig-e/margin-calibration-a10g-fp8.jsonl`) measured 48 candidate
+prompts on two engine properties only — the top1-top2 logprob gap and whether
+the engine reproduces itself back-to-back — with no daemon, no connector and no
+restart in the loop, so it cannot select on any store outcome.
+
+1. **The measured result.** **48 of 48 candidates were self-consistent**: with
+   both generations computing their KV fresh, this engine reproduces its own
+   greedy output every time. But only **2 of 48** cleared the 2.0-nat margin
+   floor, and the **median candidate margin was 0.25 nats** — this model's
+   greedy choices are usually near-ties.
+2. **The finding that follows, and it is the interesting one.** In the earlier
+   certification runs 5 of 8 and 6 of 16 prompts "diverged" from themselves —
+   but there the control generation may LOAD its prefix from the store while
+   the first computes it. With no store in the loop the divergence disappears.
+   So the effect is not random engine noise: **at fp8 precision, attention over
+   byte-identical KV can produce a different argmax depending on whether that
+   KV was computed in place or reloaded.** Attention kernels are not
+   tiling-invariant, and fp8 leaves no precision headroom to absorb the
+   difference; bf16 has that headroom and is bit-exact (certified 20/20).
+   The reloaded bytes were xxh3-verified identical in every one of those runs,
+   so this is a precision-headroom property of fp8 KV reuse — it applies to any
+   system that reuses fp8 KV, including an engine's own prefix cache — and not
+   a defect of this store. We publish it rather than route around it.
+3. **Corpus v2.** `bench/e2e/equiv-prompts-high-margin-v2.txt`, sha256
+   `8d8388a3800e95464b41f5c4357b36629652ed620743d13e8a15f8e14ce0bf06`, containing exactly the 2 measured-eligible prompts
+   (margins 4.50 and 3.75 nats). Corpus v1 (digest `b76ad0c4c4c194aa`) is
+   SUPERSEDED, not deleted; its two refusal records stay committed as the
+   evidence that produced this amendment.
+4. **What an fp8 number certified under v2 may and may not say.** It may say
+   "token-identical over the first 8 generated tokens on all gated prompts (N of
+   M; the rest excluded as near-ties, disclosed)". It may NOT say or imply that
+   fp8 reload is bit-exact against recompute in general — item 2 measured that
+   it is not on near-tie tokens. Any published fp8 cell carries a pointer to
+   this amendment, and the per-rep exact-count hit gate (which is unaffected by
+   any of this) remains the primary proof that the KV came from the store.
+5. **Floors unchanged.** The 2.0-nat floor and the 8-token window stay exactly
+   as pre-registered. Two prompts is thin coverage and is stated as such rather
+   than fixed by lowering a threshold after seeing the data.
+
 **This amendment is violated if** an fp8 number ships whose corpus digest does
 not match the committed file, whose margin floor differs from 2.0 nats without
 its own dated amendment, or whose exclusions are not published beside it.
