@@ -28,12 +28,28 @@ ssh_store() { ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
   -o ServerAliveInterval=30 -o ServerAliveCountMax=10 "ubuntu@$(cat "$STATE_DIR/store-ip")" "$@"; }
 
 cmd_up() {
-  # Same AZ + subnet as the GPU node: private-IP traffic, one hop, no NAT.
-  local gpu_id az subnet
-  gpu_id=$(cat "$STATE_DIR/gpu-instance-id") || die "launch the GPU node first"
-  read -r az subnet < <(aws ec2 describe-instances --region $REGION --instance-ids "$gpu_id" \
-    --query 'Reservations[0].Instances[0].[Placement.AvailabilityZone,SubnetId]' --output text)
-  log "GPU node is in $az/$subnet — placing the store node beside it"
+  # Same AZ + subnet as the GPU node when one is RUNNING; otherwise the
+  # store launches FIRST into STORE_AZ's default subnet (PR-11's Gate A
+  # kill rule runs on the store node before the GPU node exists) and the
+  # GPU provisioner pins itself beside it with AZ_ONLY. A stale
+  # gpu-instance-id from a torn-down session must not place us.
+  local gpu_id="" az="" subnet=""
+  gpu_id=$(cat "$STATE_DIR/gpu-instance-id" 2>/dev/null || true)
+  if [[ -n "$gpu_id" ]]; then
+    read -r az subnet < <(aws ec2 describe-instances --region $REGION --instance-ids "$gpu_id" \
+      --filters Name=instance-state-name,Values=running \
+      --query 'Reservations[0].Instances[0].[Placement.AvailabilityZone,SubnetId]' --output text 2>/dev/null) || true
+  fi
+  if [[ "$subnet" == subnet-* ]]; then
+    log "GPU node is in $az/$subnet — placing the store node beside it"
+  else
+    az="${STORE_AZ:-us-east-1c}"
+    subnet=$(aws ec2 describe-subnets --region $REGION \
+      --filters "Name=availability-zone,Values=$az" "Name=default-for-az,Values=true" \
+      --query 'Subnets[0].SubnetId' --output text)
+    [[ "$subnet" == subnet-* ]] || die "no default subnet in $az"
+    log "no running GPU node — store launches first into $az/$subnet (pin the GPU there with AZ_ONLY=$az)"
+  fi
   local ami sg
   # SSM's canonical Ubuntu-22.04 parameter — resolves reliably; the
   # describe-images name filter drifted (Canonical dropped the -gp3 suffix).
