@@ -360,11 +360,14 @@ harness refuses to enter this mode unless the store is on another host
 (a 127.x / same-host address dies at boot), and each run's log proves it
 entered external-daemon mode or the run is voided. iperf3 ceiling measured
 FIRST on the same pair, store→GPU (the reload direction), banked as its own
-artifact and quoted beside every cell. **bf16** (fp8 kernels are nondeterministic on these GPUs and the
-token-identity gate rightly refused them — the refusal record is banked
-under `refusals/`; bf16 certified cleanly, and the larger payload makes the
-wire matter *more*, not less). Qwen2.5-7B-1M, standard-attention mode,
-per-rep exact-count hit gate, token-identity certified.
+artifact and quoted beside every cell. **bf16** (the fp8 attempt of that
+session was refused by the token-identity gate running the legacy
+no-corpus prompt builder — record banked under `refusals/`, mechanism not
+attributed: CLAIMS.md PR-10 and fp8 Amendment 3; the corpus-v2 session
+below certified 6/6 on the first draw — bf16 certified cleanly, and the
+larger payload makes the wire matter *more*, not less).
+Qwen2.5-7B-1M, standard-attention mode, per-rep exact-count hit gate,
+token-identity certified.
 
 | context | link (iperf3 ceiling) | recompute² | **kvblockd reload** | vs pure |
 |---|---|---|---|---|
@@ -387,6 +390,66 @@ NIC. The effective reload rate (~1.9 GB/s against the banked 2.40 GB/s
 ceiling at 32k) localizes the bottleneck to the connector, not the store:
 both the reload timing and the iperf3 ceiling it is measured against are
 committed artifacts, so the ratio is checkable, not asserted.
+
+### The real-network cells, fp8 (measured 2026-07-31 — the pre-registered PR-10 session)
+
+The same instance pair class (g6e.2xlarge GPU + r6in.2xlarge store; this
+pair was cross-AZ — different default subnets, proven by the banked IPs —
+with its own ceilings banked and quoted, 18.84 Gbit/s unshaped vs the
+earlier pair's 19.15), fp8_e4m3 in BOTH phases of every pair, certified
+under the frozen measurement-selected corpus v2 (digest `8d8388a3800e9546`,
+2.0-nat floor, 8-token window, EQUIV_N=24 per the dated PR-10 addendum) —
+**every cell below certified on its first draw; the pre-registered retry
+rule was never needed**. Denominators are same-box, same-pin fp8 baselines,
+one length per baseline run. Every number below was independently
+re-derived from the committed JSONL before this section was written.
+
+| context | link (iperf3 ceiling) | recompute² | **kvblockd reload** | vs pure | frozen prediction³ |
+|---|---|---|---|---|---|
+| 32k  | 18.84 Gbit (2.36 GB/s) | 3,335 ms  | **559 ms**   | **5.96×** | 4.4× (3.4–6.5) hit |
+| 64k  | 18.84 Gbit (2.36 GB/s) | 8,772 ms  | **1,049 ms** | **8.36×** | 7.5× (6–10.5) hit |
+| 128k | 18.84 Gbit (2.36 GB/s) | 26,090 ms | **2,162 ms** | **12.07×** | 12.5× (10–14) hit |
+| 128k | shaped 4.84 Gbit (0.61 GB/s) | 26,090 ms | **6,485 ms** | **4.02×** | 4.2× (3.8–4.7) hit |
+| **262k** | 18.84 Gbit (2.36 GB/s) | 84,916 ms | **4,420 ms** | **19.21×** | 21× (17–24) hit |
+
+² fp8 pure-recompute baselines on the GPU node, one run × (2+1) reps each.
+Warm cells are likewise single-run: one run × (2+1) reps, except 32k at
+one run × (3+1) — Tier B in CLAIMS.md PR-5's sense, labeled as such. The 262k pair ran at MNBT 16384 per the pre-registered chunk-size
+sweep (its baseline-minimizing winner, 84,916 vs 85,270 ms; proven from the
+`engine_args_sha` preimages); the other cells keep MNBT 8192 for same-pin
+comparability with the bf16 table above — the banked check cell
+(`...base-128k-m16-run1.jsonl`, 25,803 ms) shows that choice flatters the
+128k multiple by ~1.1% (11.93× under the best-tuned denominator).
+³ frozen in CLAIMS.md PR-10 before provisioning; **5/5 cells in-band**, and
+all four pre-registered falsifiers pass — including the denominator-free
+ones (warm @128k 2.16 s ≤ 3.0 s; warm @262k 4.42 s ≤ 5.2 s).
+
+**fp8 vs bf16 on the same link class, cell by cell** (each dtype against
+its own banked ceiling — 18.84 vs 19.15 Gbit/s): 3.7× → 5.96× @32k,
+7.6× → 12.07× @128k unshaped, 2.4× → 4.02× @128k shaped — halving the
+payload buys ~1.6× everywhere. The measured cells and the same-bytes probe
+are the end-to-end evidence that the reload path is byte-bound; Gate A
+(`bench/results/gate-a/`, banked at the 262k cell's exact block count)
+carries the client-path leg only, per its own scope line. The
+pre-registered same-bytes probe: fp8 @262k moves *exactly* the 7.516 GB
+bf16 moved @128k, through 2× the block count, taking 9.7% longer (4,420 vs
+4,030 ms) — within the disclosed ~10% run-to-run spread, so an **upper
+bound on per-block cost**; byte-dominant at scale.
+
+Disclosures riding this table: certification gated 2–4 of 24 prompts per
+cell (near-tie exclusions disclosed in each banked summary; gated depth ≤
+15–16 blocks — the full-depth byte proof is the per-rep exact-count hit
+gate + xxh3, 19/19 pairs verified); a post-shaped unshaped rerun (the
+pre-registered drift bracket, banked) reproduced the 128k warm at −9.9%,
+just inside the 10% adjudication window, so the shaped falsifier verdict
+stands and the ~10% run-to-run spread is the 128k cell's honest
+uncertainty; 262k prompts landed +2–4 tokens over the model card's 262,144
+standard-attention bound (same tokenizer overshoot as the loopback 256k
+cell, visible in every banked record); cold-with-connector ran 1.00–1.04×
+of the no-connector baseline (the store-on-miss cost, PR-5's secondary
+series). Raw JSONL: `bench/results/rig-g/chart2-ttft-twonode-fp8-*.jsonl`,
+equivalence receipts `equiv-twonode-fp8-*.jsonl`, ceilings
+`iperf3-twonode2-*.json`.
 
 ### The certified fp8 cell at 131k (measured 2026-07-30, A10G — Rig E)
 
