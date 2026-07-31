@@ -510,3 +510,38 @@ def test_idx_staging_allocated_once_and_mixed_chunks_stay_byte_exact():
     assert conn._load_errors == {req.block_ids[5]}
     for name in names:
         assert same_bytes(conn._layer_kv[name], ref_kv[name]), f"{name} diverged"
+
+
+# ------------------------------------- B16: the pipeline-half knob's shapes
+
+def test_pipeline_half_knob_reshapes_passes():
+    """kvblockd_pipeline_half_bytes caps a half below staging/2: a 1-body
+    half turns the 4-pass default world into 8 single-block passes — same
+    bytes, same order, every key fetched exactly once."""
+    conn, req, w = make_world()
+    conn._staging_bytes = 16 * w["body"]  # staging no longer the binding cap
+    conn._cfg.pipeline_half_bytes = w["body"]  # 1 block per half
+    conn._load_one(req)
+    assert conn._load_errors == set()
+    assert conn._reported_path == "pipelined-slab"
+    assert_loaded(conn, w, range(NBLOCKS))
+    assert [len(c) for c in w["fake"].calls] == [1] * NBLOCKS
+    fetched = [k for call in w["fake"].calls for k in call]
+    assert fetched == w["keys"]
+
+
+def test_pipeline_half_knob_below_body_serializes_with_disclosure(caplog):
+    """A knob smaller than one blob body cannot be refused at boot (blob
+    size is engine-dependent), so it must DISCLOSE that it serialized the
+    load path — a silent serialization is the exact failure the boot-time
+    >0 refusal exists to prevent. The load itself still lands byte-exact
+    through the serial slab lane, and the pipeline latch is untouched."""
+    conn, req, w = make_world()
+    conn._cfg.pipeline_half_bytes = w["body"] - 1
+    with caplog.at_level(logging.WARNING, logger="vllm_kvblockd"):
+        conn._load_one(req)
+    assert conn._load_errors == set()
+    assert conn._reported_path == "chunked-slab"  # serial lane served it
+    assert_loaded(conn, w, range(NBLOCKS))
+    assert not conn._pipeline_disabled and conn._pipeline_fails == 0
+    assert any("pipelined path disabled" in r.getMessage() for r in caplog.records)

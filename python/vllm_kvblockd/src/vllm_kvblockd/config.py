@@ -204,6 +204,7 @@ KNOWN_EXTRA_KEYS = frozenset({
     "kvblockd_min_hit_tokens",
     "kvblockd_namespace",
     "kvblockd_op_timeout_s",
+    "kvblockd_pipeline_half_bytes",
     "kvblockd_prewarm_bytes",
     "kvblockd_recompute_ms_per_token",
     "kvblockd_so_rcvbuf",
@@ -243,6 +244,7 @@ class AdapterConfig:
         "model_name",
         "namespace",
         "op_timeout",
+        "pipeline_half_bytes",
         "port",
         "prewarm_bytes",
         "recompute_ms_per_token",
@@ -322,6 +324,22 @@ class AdapterConfig:
         # cap drain through it in cap-sized passes. <=0 disables the slab
         # (per-block loads only).
         c.staging_bytes = int(get_extra_config(ktc, "kvblockd_staging_bytes", 2 * 2**30))
+        # Cap on ONE pipelined slab half (bytes; the load path reserves TWO).
+        # Halves must be small enough that pass p+1's wire drain genuinely
+        # overlaps pass p's H2D+scatter, yet big enough to amortize the
+        # per-pass costs (drain submit, shard-straggler tail, scatter issue):
+        # a 262k-token fp8 load at the 256MiB default is 29 passes. Real-NIC
+        # rigs with pinned-RAM headroom can halve the pass count at 512MiB;
+        # the effective half is always min(this, staging_bytes/2).
+        c.pipeline_half_bytes = int(
+            get_extra_config(ktc, "kvblockd_pipeline_half_bytes", 256 * 2**20))
+        if c.pipeline_half_bytes <= 0:
+            raise ValueError(
+                f"kvblockd_pipeline_half_bytes must be > 0, got "
+                f"{c.pipeline_half_bytes}. NOTE: a value smaller than one "
+                "blob body also disables the pipelined path (blob size is "
+                "engine-dependent, so that case is disclosed at load time, "
+                "not refused here)")
         # Eager pinned-slab pre-warm CEILING, applied at the FIRST CUDA layout
         # capture (default: the staging cap). cudaHostAlloc of gigabytes takes
         # hundreds of ms — paying it at capture time instead of inside the

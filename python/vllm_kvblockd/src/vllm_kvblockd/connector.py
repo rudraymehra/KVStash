@@ -289,7 +289,7 @@ def decode_blob_prefix(prefix: bytes) -> tuple[str, int, int, int, int, int]:
 # file, because both modules import blob-codec / dial-plumbing names defined
 # above (cycle-safe by ordering). _AckedKeyLRU is re-exported unchanged for
 # its existing importers (tests).
-from .slab_loader import _PIPELINE_HALF_MAX, SlabLoader
+from .slab_loader import SlabLoader
 from .store_queue import StoreQueue, _AckedKeyLRU, _StagePlan  # noqa: F401
 
 
@@ -1209,16 +1209,17 @@ class KvblockdConnector(_Base):
                 want = min(self._staging_bytes, self._cfg.prewarm_bytes)
                 # Pin what the load path will actually RESERVE, not the whole
                 # staging cap: the pipelined path reserves two half-cap
-                # passes (2×min(cap/2, _PIPELINE_HALF_MAX), ~512MiB at the
-                # 2GiB default), and pinning the 2GiB cap on top of the ~1GiB
-                # store pool left 1.5GiB dead. kvblockd_prewarm_bytes still
-                # bounds it (explicit override); layoutless/oversized-body
-                # engines keep the old cap-sized behavior (the serial path
-                # may reserve up to the cap there).
+                # passes (2×min(cap/2, kvblockd_pipeline_half_bytes),
+                # ~512MiB at the defaults), and pinning the 2GiB cap on top
+                # of the ~1GiB store pool left 1.5GiB dead.
+                # kvblockd_prewarm_bytes still bounds it (explicit override);
+                # layoutless/oversized-body engines keep the old cap-sized
+                # behavior (the serial path may reserve up to the cap there).
                 names_, _d, bpl_ = self._layout()
                 body_ = bpl_ * len(names_)
                 if names_ and body_ > 0:
-                    hb = min(self._staging_bytes // 2, _PIPELINE_HALF_MAX) // body_
+                    hb = min(self._staging_bytes // 2,
+                             self._cfg.pipeline_half_bytes) // body_
                     if hb > 0:
                         want = min(want, 2 * hb * body_)
                 if want > 0:

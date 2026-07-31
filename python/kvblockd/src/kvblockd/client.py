@@ -35,6 +35,12 @@ _MAX_GET_FANOUT = 4
 # Vectored send: header + body in one syscall with no payload copy. Absent
 # only on platforms without sendmsg (Windows); the join fallback stays.
 _HAS_SENDMSG = hasattr(socket.socket, "sendmsg")
+# Scatter-gather recv: the final read of a block's body can opportunistically
+# run on into the NEXT block's 32B prefix in the same syscall, deleting the
+# separate small recv (plus its timeout-mode readiness poll) that every block
+# after a frame's first otherwise pays. Absent on Windows; the plain
+# recv_into path stays.
+_HAS_RECVMSG_INTO = hasattr(socket.socket, "recvmsg_into")
 # Rate limit for the degrade-to-miss disclosure lines (one per key per window).
 _WARN_INTERVAL_S = 10.0
 
@@ -98,6 +104,11 @@ class _Conn:
         self._hdr = bytearray(p.HEADER_SIZE)
         self._scratch = bytearray(_MAX_SCRATCH)
         self._pfxbuf = bytearray(64)  # reused per-block prefix staging (grown on demand)
+        self._aheadbuf = bytearray(64)  # next-prefix landing zone for merged reads (grown on demand)
+        # One xxh3 hasher reused across blocks (reset per block): a _Conn is
+        # single-owner (Pool contract), so per-block hasher allocation was
+        # pure churn on the drain thread.
+        self._xxh = xxhash.xxh3_64() if verify else None
         self.granted_rcvbuf = 0  # stamped by _dial_one (the kernel-GRANTED SO_RCVBUF)
         # The steady-state per-recv timeout (what the dialer configured on the
         # socket); restored after any deadline-clamped call. None = blocking.
@@ -167,16 +178,26 @@ class _Conn:
         except OSError as e:
             raise ConnectionLost(f"send: {e}") from e
 
-    def _recv_into(self, view: memoryview):
+    def _recv_into(self, view: memoryview, ahead: memoryview | None = None) -> int:
         """Fill view completely or raise ConnectionLost. When a per-call
         deadline is armed (see __init__/_arm_deadline), each recv is clamped
         to min(op_timeout, remaining budget) and an exhausted budget raises —
         abandoning mid-read leaves the stream state unknown, so the caller
-        must evict the connection (Pool.run does, on any non-StatusError)."""
+        must evict the connection (Pool.run does, on any non-StatusError).
+
+        ahead (optional): a spill buffer the kernel may run into once view is
+        satisfied — each recv becomes a scatter read [view-remainder, ahead],
+        so the bytes that FOLLOW view in the stream can land in the same
+        syscall instead of a separate small recv. The caller must know those
+        bytes are its own to consume (batch_get_scatter passes the next
+        block's prefix region, and only within one frame). Returns how many
+        ahead bytes landed (0 when ahead is None or without recvmsg_into)."""
         got = 0
         n = len(view)
+        extra = 0
         deadline = self._deadline
         op_timeout = self._op_timeout
+        use_ahead = ahead is not None and _HAS_RECVMSG_INTO
         while got < n:
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -196,12 +217,21 @@ class _Conn:
                     except OSError as e:
                         raise ConnectionLost(f"settimeout: {e}") from e
             try:
-                r = self._sock.recv_into(view[got:], n - got)
+                if use_ahead:
+                    r, _anc, _flags, _addr = self._sock.recvmsg_into(
+                        [view[got:], ahead])
+                else:
+                    r = self._sock.recv_into(view[got:], n - got)
             except OSError as e:
                 raise ConnectionLost(f"recv: {e}") from e
             if r == 0:
                 raise ConnectionLost("peer closed mid-frame")
-            got += r
+            if r > n - got:  # scatter read ran into the ahead buffer
+                extra = r - (n - got)
+                got = n
+            else:
+                got += r
+        return extra
 
     def _next_header(self) -> p.Header:
         """Read one response header, skipping unsolicited NOPs (credit-only
@@ -316,6 +346,21 @@ class _Conn:
                     raise ConnectionLost(f"GET total_keys {total} != requested {n}")
                 if first != seen or first + len(descs) > n:
                     raise ConnectionLost(f"GET frame window [{first},{first+len(descs)}) invalid at seen={seen}, n={n}")
+                # Merged prefix reads: within a frame, the wire bytes after an
+                # OK block's body are the NEXT OK block's payload (non-OK
+                # descriptors are payload-free), so the body's final recv may
+                # scatter-read min(prefix_len, that whole payload) extra bytes
+                # and hand them to the next block as `lead` — deleting the
+                # separate 32B recv every block after a frame's first used to
+                # pay. The frame's LAST OK block must stop exactly at its
+                # body's end: the next wire bytes are a frame header (or
+                # nothing), never ours to consume.
+                nxt = [0] * len(descs)
+                follow = 0
+                for j in range(len(descs) - 1, -1, -1):
+                    nxt[j] = follow
+                    if p.status_ok(descs[j][0]):
+                        follow = min(prefix_len, descs[j][1])
                 for j, (dstatus, dlen, dxxh) in enumerate(descs):
                     local = first + j
                     if not p.status_ok(dstatus):  # NOT_FOUND / EVICTED / any non-OK: no payload
@@ -324,7 +369,8 @@ class _Conn:
                     if deadline is not None and time.monotonic() > deadline:
                         raise ConnectionLost("GET deadline exceeded mid-frame (conn evicted)")
                     lead = self._scatter_one(idx_base + local, local, dlen, dxxh,
-                                             prefix_len, alloc, statuses, lead)
+                                             prefix_len, alloc, statuses, lead,
+                                             nxt[j])
                 if lead:  # every pre-read byte belongs to some OK payload above
                     raise ConnectionLost(f"GET frame left {len(lead)} unclaimed payload bytes")
                 seen = first + len(descs)
@@ -372,15 +418,35 @@ class _Conn:
         rest = bytearray(rest_len + extra)
         self._recv_into(memoryview(rest))
         region = p.parse_get_region(bytes(pre) + bytes(rest[:rest_len]))
+        # The frame's declared payload_len is the authoritative byte budget:
+        # the descriptors' OK lengths must account for it EXACTLY, or the
+        # stream is desynced and every later read (the merged next-prefix
+        # over-reads included) would consume bytes that are not this frame's
+        # payload. Checked here, before any payload byte beyond the bounded
+        # lead is consumed.
+        descs = region[3]
+        if sum(d[1] for d in descs if p.status_ok(d[0])) != payload_in_frame:
+            raise ConnectionLost(
+                f"GET frame payload {payload_in_frame}B does not match its "
+                "descriptors' OK lengths (desynced server)")
         return (*region, bytes(rest[rest_len:]))
 
-    def _scatter_one(self, gidx, local, dlen, dxxh, prefix_len, alloc, statuses, lead=b""):
+    def _scatter_one(self, gidx, local, dlen, dxxh, prefix_len, alloc, statuses, lead=b"",
+                     ahead_pfx=0):
         """Consume one OK block's payload. `lead` is payload bytes already
-        pulled off the socket by _read_region's merged read; the unconsumed
+        pulled off the socket by a prior merged read (_read_region's frame
+        lead, or the previous block's body over-read); the unconsumed
         remainder is returned for the next block. Because `lead` is at most
         prefix_len bytes, it can only ever hold prefix-region bytes (a block
         with dlen < prefix_len has an empty body), never body bytes — so body
-        reads always come straight off the socket into the alloc view."""
+        reads always come straight off the socket into the alloc view.
+
+        ahead_pfx (caller-computed, min(prefix_len, next OK payload) within
+        THIS frame, else 0): how many bytes after this body are safe to
+        over-read; they come back as the next block's `lead`. Only one of
+        {leftover lead, ahead over-read} can occur for a given block: a
+        non-empty leftover means dlen < prefix_len, i.e. body_len == 0 and
+        no body read happens."""
         pfx = min(prefix_len, dlen)
         take = min(pfx, len(lead))
         if take == pfx:
@@ -395,7 +461,10 @@ class _Conn:
             prefix = bytes(mv)
         lead = lead[pfx:] if len(lead) > pfx else b""
         body_len = dlen - pfx
-        digest = xxhash.xxh3_64() if self._verify else None
+        digest = None
+        if self._verify:
+            digest = self._xxh
+            digest.reset()
         if digest is not None and pfx:
             digest.update(prefix)
         view = alloc(gidx, prefix, body_len)
@@ -409,7 +478,16 @@ class _Conn:
         mv = memoryview(view)
         if len(mv) < body_len:
             raise ConnectionLost(f"alloc view too small: {len(mv)} < {body_len}")
-        self._recv_into(mv[:body_len])
+        if body_len:
+            if ahead_pfx > 0:
+                if len(self._aheadbuf) < ahead_pfx:
+                    self._aheadbuf = bytearray(ahead_pfx)
+                amv = memoryview(self._aheadbuf)[:ahead_pfx]
+                extra = self._recv_into(mv[:body_len], amv)
+                if extra:
+                    lead = bytes(amv[:extra])
+            else:
+                self._recv_into(mv[:body_len])
         if digest is not None:
             digest.update(mv[:body_len])
         self._check_digest(digest, dxxh, gidx)

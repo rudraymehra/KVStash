@@ -539,3 +539,19 @@ def test_store_dedupe_knobs_parse():
     assert cfg.store_dedupe_keys == 4096 and cfg.store_dedupe_ttl_s == 5.0
     with pytest.raises(ValueError, match="must be >= 0"):
         AdapterConfig.from_vllm_config(_vc_extra(kvblockd_store_dedupe_keys=-1))
+
+
+def test_pipeline_half_bytes_knob_parses_and_validates():
+    """kvblockd_pipeline_half_bytes: default 256MiB (the pre-knob constant —
+    every banked number was measured at it); explicit values re-shape the
+    pipelined pass count on rigs with pinned-RAM headroom; <=0 is refused at
+    boot (disabling the pipeline is the staging knob's job, and a silent 0
+    would just skip the pipelined path with no disclosure)."""
+    assert AdapterConfig.from_vllm_config(_vc_extra()).pipeline_half_bytes == 256 * 2**20
+    cfg = AdapterConfig.from_vllm_config(
+        _vc_extra(kvblockd_pipeline_half_bytes=512 * 2**20))
+    assert cfg.pipeline_half_bytes == 512 * 2**20
+    with pytest.raises(ValueError, match="must be > 0"):
+        AdapterConfig.from_vllm_config(_vc_extra(kvblockd_pipeline_half_bytes=0))
+    with pytest.raises(ValueError, match="must be > 0"):
+        AdapterConfig.from_vllm_config(_vc_extra(kvblockd_pipeline_half_bytes=-1))

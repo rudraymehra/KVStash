@@ -62,12 +62,12 @@ _SCRATCH_RING = 1
 # per-block-from-slab copies keep serving loads either way.
 _SCRATCH_MAX_FAILS = 3
 
-# Pipelined load: cap on ONE slab half. Passes must be small enough that the
-# prefetch drain of pass p+1 genuinely overlaps the H2D+scatter of pass p
-# (one 2GiB pass has nothing to overlap with), yet big enough to amortize
-# per-pass costs; the load path reserves TWO halves, so the pinned footprint
-# of the pipeline is 2×min(staging/2, this) — what _maybe_prewarm now pins.
-_PIPELINE_HALF_MAX = 256 << 20
+# Pipelined-load half sizing lives in config (kvblockd_pipeline_half_bytes,
+# default 256MiB): passes must be small enough that pass p+1's wire drain
+# genuinely overlaps pass p's H2D+scatter (one 2GiB pass has nothing to
+# overlap with), yet big enough to amortize per-pass costs. The load path
+# reserves TWO halves, so the pinned footprint of the pipeline is
+# 2×min(staging/2, the knob) — what _maybe_prewarm pins.
 
 
 class SlabLoader:
@@ -159,8 +159,19 @@ class SlabLoader:
             if not self._pipeline_disabled and body_len > 0:
                 # Pipelined double-buffered halves: passes small enough that
                 # the next pass's wire drain overlaps this pass's H2D+scatter.
-                hb = min(min(self._staging_bytes // 2, _PIPELINE_HALF_MAX) // body_len,
+                hb = min(min(self._staging_bytes // 2,
+                             self._c._cfg.pipeline_half_bytes) // body_len,
                          len(keys))
+                if hb == 0 and body_len > self._c._cfg.pipeline_half_bytes:
+                    # A knob below one blob body silently serializes every
+                    # load — the boot-time >0 check can't see body_len, so
+                    # the disclosure lands here (rate-limited, not a latch).
+                    self._c._log.maybe(
+                        "pipeline-half",
+                        f"kvblockd_pipeline_half_bytes="
+                        f"{self._c._cfg.pipeline_half_bytes} < one blob body "
+                        f"({body_len}B) — pipelined path disabled, serial "
+                        "slab passes serve loads")
                 need = (2 * hb if len(keys) > hb else hb) * body_len
                 if hb > 0 and self._c._slab_reserve(need):
                     path = self._c._load_pipelined(req, names, dtype_name, bytes_per_layer,
@@ -538,7 +549,12 @@ class SlabLoader:
                            and time.monotonic() > deadline)
                 # Fence before EVERY scatter: pass i-1's event guards both
                 # the half pass i+1 will overwrite and the pinned idx slices
-                # this pass's scatter refills.
+                # this pass's scatter refills. It runs HERE, on the engine
+                # thread, on purpose: it is ~free in steady state (the event
+                # was recorded one full wire drain ago), and moving it into
+                # the drain job was measured-refuted as a perf lever — the
+                # submit below already precedes the scatter, so the wire's
+                # restart never waited on the GPU in the first place.
                 ev = free_ev[(i + 1) % 2]
                 if ev is not None:
                     ev.synchronize()
@@ -700,6 +716,7 @@ class SlabLoader:
         paged_u8 = None
         ring = None
         idx_pin = None
+        idx_prefilled = False
         if not self._chunked_disabled:
             try:
                 paged_u8 = {}
@@ -713,6 +730,16 @@ class SlabLoader:
                     paged_u8[name] = t.view(torch.uint8).view(t.shape[0], -1)
                 ring = self._c._scratch_ring(dev, n_layers, bytes_per_layer)
                 idx_pin = self._c._idx_staging(n)
+                if all(b is not None for b in bids):
+                    # All-OK pass: ONE list→tensor conversion + pinned write
+                    # for the whole pass instead of one per 64-block chunk —
+                    # the chunk loop below slices what this prefilled. Safe
+                    # exactly when the per-chunk writes were: the caller's
+                    # pre-scatter fence (serial trailing sync / the pipelined
+                    # per-half event) proves the previous pass's uploads from
+                    # these slices are done before this host write.
+                    idx_pin[:n].copy_(torch.tensor(bids, dtype=torch.long))
+                    idx_prefilled = True
                 self._scratch_fails = 0
             except Exception as e:  # noqa: BLE001 — never-raise boundary: non-viewable layout / scratch OOM degrades to per-block copies
                 ring = None
@@ -742,7 +769,8 @@ class SlabLoader:
                     # never overwritten; cross-PASS reuse is fenced by the
                     # trailing sync (serial) / per-half events (pipelined).
                     seg = idx_pin[c0:c1]
-                    seg.copy_(torch.tensor(chunk_bids, dtype=torch.long))
+                    if not idx_prefilled:
+                        seg.copy_(torch.tensor(chunk_bids, dtype=torch.long))
                     idx = seg.to(dev, non_blocking=True)
                     for li, name in enumerate(names):
                         paged_u8[name].index_copy_(0, idx, scratch[:nblk, li])
