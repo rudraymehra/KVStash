@@ -171,6 +171,16 @@ KVBD_VERIFY="${KVBD_VERIFY:-1}"               # 1 (default) = xxh3-verify every 
                                               # 0 = DIAGNOSTIC arm only: skips the client-side
                                               # digest to isolate hash cost; labelled in the
                                               # connector stamp, never a headline number.
+KVBD_PIPELINE_HALF_BYTES="${KVBD_PIPELINE_HALF_BYTES:-}"  # optional pipelined-slab half cap
+                                              # (connector kvblockd_pipeline_half_bytes;
+                                              # empty = the connector's 256MiB default).
+                                              # Non-default values land in the connector
+                                              # stamp so every JSONL row names its config.
+PYSPY="${PYSPY:-0}"                           # 1 = attach py-spy over the measure phase
+                                              # (best-effort attribution probe; sampling
+                                              # overhead makes the arm a DIAGNOSTIC — the
+                                              # stamp says so; artifact lands in results/).
+PYSPY_DURATION_S="${PYSPY_DURATION_S:-90}"
 CONNECTOR_STAGING_GB="${CONNECTOR_STAGING_GB:-2}"   # native-connector pinned staging CAP: the connector
                                               # keeps ONE persistent pinned host slab, grown to the
                                               # largest load up to this cap (bigger loads drain
@@ -509,6 +519,8 @@ KVBD_EXTRA_JSON=""
    \"kvblockd_exists_timeout_s\": $KVBD_EXISTS_TIMEOUT_S"
 [[ -n "$KVBD_GET_FANOUT" ]] && KVBD_EXTRA_JSON+=",
    \"kvblockd_get_fanout\": $KVBD_GET_FANOUT"
+[[ -n "$KVBD_PIPELINE_HALF_BYTES" ]] && KVBD_EXTRA_JSON+=",
+   \"kvblockd_pipeline_half_bytes\": $KVBD_PIPELINE_HALF_BYTES"
 cat > "$WORK/kv_transfer.json" <<EOF
 {"kv_connector": "KvblockdConnector", "kv_role": "kv_both",
  "kv_connector_module_path": "vllm_kvblockd.connector",
@@ -1081,6 +1093,48 @@ fi
 CONNECTOR_VER="$(python3 -c 'import vllm_kvblockd; print(vllm_kvblockd.__version__)')"
 CONNECTOR_STAMP="vllm_kvblockd $CONNECTOR_VER (native)"
 [[ "$KVBD_VERIFY" == "0" ]] && CONNECTOR_STAMP="$CONNECTOR_STAMP verify=off (DIAGNOSTIC arm)"
+# Config truth in the stamp: every knob that shapes the reload path and is
+# not at its default gets named, so no two JSONL rows with different
+# connector configs can ever read as the same cell. An EQUIV_N=0 connector
+# arm additionally stamps itself uncertified: un-publishable by
+# CONSTRUCTION, not by convention — a delta arm's number can never be
+# mistaken for a certified cell.
+[[ "$KVBD_STREAMS" != "4" ]] && CONNECTOR_STAMP="$CONNECTOR_STAMP streams=$KVBD_STREAMS"
+[[ -n "$KVBD_GET_FANOUT" ]] && CONNECTOR_STAMP="$CONNECTOR_STAMP fanout=$KVBD_GET_FANOUT"
+[[ -n "$KVBD_PIPELINE_HALF_BYTES" ]] && CONNECTOR_STAMP="$CONNECTOR_STAMP half=$((KVBD_PIPELINE_HALF_BYTES / 1048576))MiB"
+if [[ "${BASELINE_ONLY:-0}" != "1" ]] && (( EQUIV_N == 0 )); then
+  CONNECTOR_STAMP="$CONNECTOR_STAMP uncertified (DIAGNOSTIC arm)"
+fi
+# Optional attribution probe: sample the vLLM process tree (engine-core is a
+# subprocess) over the start of the measure phase — warm reps run first, so
+# the samples land on the connector load path. Best-effort and never fatal:
+# a missing recorder is disclosed and the run proceeds unprofiled. Output
+# goes under results/ so the standard artifact pull banks it. py-spy writes
+# its file only at END of recording, so the recorder pid is waited on after
+# the measure phase below — job.sh is the container's PID 1 and exiting
+# early would SIGKILL the recorder with the artifact still in memory.
+PYSPY_PID=""
+if [[ "$PYSPY" == "1" ]]; then
+  pipi -q py-spy==0.4.0 > "$WORK/pyspy-install.log" 2>&1 || true
+  PYSPY_BIN="$(command -v py-spy || true)"
+  if [[ -n "$PYSPY_BIN" && -n "${VLLM_PID:-}" ]]; then
+    mkdir -p "$WORK/results"
+    ("$PYSPY_BIN" record --subprocesses --idle --format speedscope \
+       -p "$VLLM_PID" -o "$WORK/results/pyspy-measure.speedscope.json" \
+       -d "$PYSPY_DURATION_S" > "$WORK/results/pyspy.log" 2>&1 || true) &
+    PYSPY_PID=$!
+    sleep 2  # attach is not instant; stamp only a recorder that is alive
+    if kill -0 "$PYSPY_PID" 2>/dev/null; then
+      CONNECTOR_STAMP="$CONNECTOR_STAMP pyspy=on (DIAGNOSTIC arm)"
+      log "py-spy recording pid $VLLM_PID for ${PYSPY_DURATION_S}s (waited on after measure)"
+    else
+      PYSPY_PID=""
+      log "py-spy exited immediately (see results/pyspy.log) — attribution probe skipped (disclosed)"
+    fi
+  else
+    log "PYSPY=1 but py-spy or VLLM_PID unavailable — attribution probe skipped (disclosed)"
+  fi
+fi
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | sed 's/^ *//;s/ *$//')"
 log "phase 2/2 measure: reps=$REPS(+$WARMUP warmup) gen=$GEN_TOKENS link='$TC_LINK'"
 # --block-size 16: vLLM's CUDA default; the driver verifies each warm rep's
@@ -1102,6 +1156,20 @@ python3 "$HERE/run_ttft.py" --phase measure \
   ${TOKEN_IDENTITY:+--stamp token_identity="$TOKEN_IDENTITY"} \
   ${HF_OVERRIDES:+--stamp hf_overrides="$HF_OVERRIDES"} \
   --stamp git_sha="$GIT_SHA" --stamp engine_args_sha="${ENGINE_ARGS_SHA:-unset}" ${MODEL_SURGERY:+--stamp model_surgery="$MODEL_SURGERY"} || rc=$?
+
+# py-spy receipt: wait out the recorder (it writes the speedscope JSON only
+# at end-of-recording; PID-1 exit would SIGKILL it artifact-less), then say
+# loudly whether the arm's sole deliverable exists. Disclosure, not a gate:
+# the TTFT numbers of a pyspy arm are DIAGNOSTIC either way.
+if [[ -n "$PYSPY_PID" ]]; then
+  log "waiting on py-spy recorder (<= ${PYSPY_DURATION_S}s remain)"
+  wait "$PYSPY_PID" 2>/dev/null || true
+  if [[ -s "$WORK/results/pyspy-measure.speedscope.json" ]]; then
+    log "PYSPY artifact written: results/pyspy-measure.speedscope.json ($(wc -c < "$WORK/results/pyspy-measure.speedscope.json") bytes)"
+  else
+    log "PYSPY artifact MISSING after wait (see results/pyspy.log) — attribution probe produced nothing (disclosed)"
+  fi
+fi
 
 # Path attribution receipt (the driver already stamped it into the JSONL):
 # on a CUDA run the fast path is chunked-slab — per-block means the pinned

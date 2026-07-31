@@ -50,7 +50,12 @@ IS_FP8=0;      printf '%s\n' "${ENV_ARGS[@]}" | grep -q 'KV_CACHE_DTYPE=fp8' && 
 # in-container git path can silently fail on root-vs-ubuntu ownership).
 GIT_REF=$(git -C "$HERE/../../.." rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 compose_run_cmd() {
-  RUN_CMD=(sudo docker run --rm --gpus all --ipc=host --network host --entrypoint bash
+  # --cap-add=SYS_PTRACE: py-spy (job.sh PYSPY=1 attribution arms) samples
+  # its own container's vLLM tree via process_vm_readv, which the default
+  # seccomp profile denies. Harmless on every other arm — the container is
+  # our own benchmark job, not a tenant boundary.
+  RUN_CMD=(sudo docker run --rm --gpus all --ipc=host --network host
+    --cap-add=SYS_PTRACE --entrypoint bash
     -v /opt/dlami/nvme:/nvme -v /opt/dlami/nvme/work/KVStash:/work/kvstash
     -e WORK=/nvme/work/ttft-"$ARM-$TAG" -e GIT_REF="$GIT_REF" "${ENV_ARGS[@]}"
     "$IMG" /work/kvstash/bench/rigs/hf-gpu/job.sh)

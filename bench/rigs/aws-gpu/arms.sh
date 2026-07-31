@@ -345,6 +345,65 @@ RIG=ec2-twonode-nic
 GPU_ANNOT=ec2 g6e.2xlarge (mechanism rider: store-free padded prescreen)
 MPEOF
           ;;
+    # ---- PR-11 reload-path knob A/B (docs/CLAIMS.md PR-11; frozen pre-spend)
+    # Every knob under test is kv_connector_extra_config — never an engine
+    # arg, so all 131k arms below share nic-128k's ENGINE_ARGS_SHA by
+    # construction. The -ab- delta arms are DIAGNOSTICS: EQUIV_N=0 (no
+    # certification — their warm medians steer the config decision and are
+    # NEVER published as cells; the exact-count hit gate still enforces
+    # every warm rep). Publishable cells re-run CERTIFIED at the config the
+    # pre-registered decision rule selects. Overrides that change an
+    # existing nic_common key go through sed (the m16 precedent) — never a
+    # duplicate env line whose winner is a docker implementation detail.
+    # The control's fan-out is PINNED to 4 (not inherited from the KVB_FANOUT
+    # session knob): fan-out IS this A/B's independent variable, and a stray
+    # session export must not be able to turn the control into a treatment
+    # arm and fire F2 falsely. Same pin on pyspy/bracket/certified-ctl arms.
+    nic-ab-ctl)    nic_common 131072 | sed -e 's/^EQUIV_N=.*/EQUIV_N=0/' \
+                                           -e 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=4/'
+                   printf 'REPS=3\nWARMUP=1\n' ;;
+    nic-ab-f8)     nic_common 131072 | sed -e 's/^EQUIV_N=.*/EQUIV_N=0/' \
+                                           -e 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=8/'
+                   printf 'REPS=3\nWARMUP=1\n' ;;
+    nic-ab-f8h512) nic_common 131072 | sed -e 's/^EQUIV_N=.*/EQUIV_N=0/' \
+                                           -e 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=8/'
+                   printf 'REPS=3\nWARMUP=1\nKVBD_PIPELINE_HALF_BYTES=536870912\n' ;;
+    # verify-off isolation probe at the full-knob config: xxh3 cost on the
+    # drain threads, the loopback memo's prime per-byte suspect. job.sh
+    # stamps it 'verify=off (DIAGNOSTIC arm)' — never a headline.
+    nic-ab-voff)   nic_common 131072 | sed -e 's/^EQUIV_N=.*/EQUIV_N=0/' \
+                                           -e 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=8/'
+                   printf 'REPS=3\nWARMUP=1\nKVBD_PIPELINE_HALF_BYTES=536870912\nKVBD_VERIFY=0\n' ;;
+    # Attribution probe at the CONTROL config (the shape whose ~30ms/pass
+    # boundary needs explaining): py-spy over the measure phase, stamped
+    # DIAGNOSTIC (sampling overhead), speedscope JSON banked from results/.
+    nic-ab-pyspy)  nic_common 131072 | sed -e 's/^EQUIV_N=.*/EQUIV_N=0/' \
+                                           -e 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=4/'
+                   printf 'REPS=2\nWARMUP=1\nPYSPY=1\nPYSPY_DURATION_S=120\n' ;;
+    # End-of-session drift bracket: the control config re-measured after
+    # every other arm (PR-10's bracket convention, ±10%% window).
+    nic-ab-ctl-bracket) nic_common 131072 | sed -e 's/^EQUIV_N=.*/EQUIV_N=0/' \
+                                                -e 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=4/'
+                   printf 'REPS=2\nWARMUP=1\n' ;;
+    # Publishable cells at the knob config the frozen decision rule selects
+    # (pre-registered default: fanout8 + 512MiB halves; fallbacks in
+    # CLAIMS.md PR-11). Full corpus-v2 certification, EQUIV_N=24 per the
+    # dated amendment. 262k runs the PR-10 MNBT sweep winner (16384).
+    nic-ab-131k)   nic_common 131072 | sed 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=8/'
+                   printf 'REPS=2\nWARMUP=1\nKVBD_PIPELINE_HALF_BYTES=536870912\n' ;;
+    nic-ab-131k-f8) nic_common 131072 | sed 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=8/'
+                   printf 'REPS=2\nWARMUP=1\n' ;;
+    nic-ab-131k-ctl) nic_common 131072 | sed 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=4/'
+                   printf 'REPS=2\nWARMUP=1\n' ;;
+    nic-ab-262k)   nic_common 262144 | sed -e 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=8/' \
+                                           -e 's/^MAX_NUM_BATCHED_TOKENS=.*/MAX_NUM_BATCHED_TOKENS=16384/'
+                   printf 'REPS=2\nWARMUP=1\nKVBD_PIPELINE_HALF_BYTES=536870912\n' ;;
+    nic-ab-262k-f8) nic_common 262144 | sed -e 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=8/' \
+                                            -e 's/^MAX_NUM_BATCHED_TOKENS=.*/MAX_NUM_BATCHED_TOKENS=16384/'
+                   printf 'REPS=2\nWARMUP=1\n' ;;
+    nic-ab-262k-ctl) nic_common 262144 | sed -e 's/^KVBD_GET_FANOUT=.*/KVBD_GET_FANOUT=4/' \
+                                             -e 's/^MAX_NUM_BATCHED_TOKENS=.*/MAX_NUM_BATCHED_TOKENS=16384/'
+                   printf 'REPS=2\nWARMUP=1\n' ;;
     *) echo "unknown arm: $1" >&2; return 1 ;;
   esac
 }
