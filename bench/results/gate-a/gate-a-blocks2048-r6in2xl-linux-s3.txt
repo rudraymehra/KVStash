@@ -1,0 +1,9 @@
+Gate A: 2048 blocks x {1024 KiB, 512 KiB}, best of 3, loopback, xxh3 verify ON
+  (equal block COUNT by construction — only payload bytes differ)
+
+   1024 KiB/block:   1288.8 ms  (2.15 GB, 1.67 GB/s)
+    512 KiB/block:    656.5 ms  (1.07 GB, 1.64 GB/s)
+
+  time ratio (2x bytes, same block count) = 1.96x
+  VERDICT: BYTE-BOUND on the CLIENT path (loopback: recv + xxh3 + memcpy) -> halving KV bytes ~halves this stage. Scope: says nothing about the GPU scatter stage, which needs a GPU rig; fp8 promoted for the client/wire half
+  (pre-registered thresholds: >= 1.7 byte-bound, <= 1.3 block-bound)

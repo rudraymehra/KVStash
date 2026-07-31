@@ -451,6 +451,71 @@ series). Raw JSONL: `bench/results/rig-g/chart2-ttft-twonode-fp8-*.jsonl`,
 equivalence receipts `equiv-twonode-fp8-*.jsonl`, ceilings
 `iperf3-twonode2-*.json`.
 
+### The reload-path knob A/B, fp8 @131k (measured 2026-07-31 — the pre-registered PR-11 session)
+
+The unshaped cells above reload at ~70–75% of their measured link ceiling
+(the shaped cell sits at ~96% — link-bound, outside this story). This
+session A/B-tested the connector knobs that were supposed to close that gap
+(client-side merged reads + hasher reuse rode into every arm at the node
+clone's HEAD), on a same-AZ g6e.2xlarge + r6in.2xlarge pair (ceilings
+banked: 19.17 Gbit/s pre-session, 18.56 post — −3.2% credit drift,
+disclosed). Every arm below is stamped with its exact connector config;
+delta arms are additionally stamped `uncertified (DIAGNOSTIC arm)` and are
+never quotable as cells.
+
+| arm (all @131k, warm p50) | config | ms | vs control |
+|---|---|---|---|
+| control | fanout 4, 256 MiB halves, verify on | 2,096.5 | — |
+| fan-out 8 | fanout 8 | 2,051.4 | −2.15% |
+| + 512 MiB halves | fanout 8, half 512 MiB | 2,052.1 | −2.12% |
+| verify off (control probe) | fanout 8, half 512 MiB, xxh3 off | 2,042.1 | −0.49%⁴ |
+
+⁴ measured against the row above (its same-config verify-on twin), not
+against the control — vs control it reads −2.60%, all but 0.49 points of
+which is the fan-out knob.
+
+Three findings, two of them negative and worth exactly as much: **fan-out
+8 buys ~2%** (the frozen decision rule selects it — the tie against the
+512 MiB variant resolves to fewer knobs); **halving the pipelined pass
+count buys nothing** (the per-pass-fixed-cost model is refuted at this
+scale); **xxh3 verification is free at 131k on this link class** (−0.49%,
+inside noise — the pre-registered "≈0 ⇒ the hash already overlaps" branch;
+the loopback-era suspicion that per-block hashing throttles the drain is
+acquitted here, and verify stays ON). A py-spy attribution
+artifact (banked, `pyspy-ab-ctl-config-131k.speedscope.json`, DIAGNOSTIC
+arm) localizes the remaining gap to shard-straggler tails and engine-thread
+scatter-issue GIL contention during drains — the target named for future
+work, not claimed fixed.
+
+The publishable cell at the selected config (fanout 8), certified under
+corpus v2 (6 of 24 gated — the widest gated set banked so far — 6/6
+token-identical, gated depth ≤ 16 blocks, matching the deepest PR-10
+gates; the first draw refused on an empty gated set and was retried once
+under the pre-registered rule, refusal banked under `refusals/`):
+
+| context | link (iperf3 ceiling) | recompute | **kvblockd reload** | vs pure | frozen prediction |
+|---|---|---|---|---|---|
+| 128k | 19.17 Gbit (2.40 GB/s) | 25,654 ms | **2,095.9 ms** | **12.24×** | (12.0–15.0) hit |
+
+Same-SHA fresh baseline, same pins as the table above (proven: all nine of
+the session's `engine_args_sha` values reproduce exactly from preimages
+identical in every engine field — the hash differs only through the
+per-arm model path it embeds). Net of PR-10: 12.07× → 12.24× —
+indistinguishable at the disclosed ~10% run-to-run spread (this session's
+own bracket moved 6.29%); the supported delta is the within-session A/B
+(fan-out 8, −2.15% warm) and +1.0 point of link utilization (73.8% →
+74.8%, each cell against its own session ceiling; this cell computed
+against the pre-session 19.17 — the conservative side of the disclosed
+−3.2% drift). Disclosures: the pre-registered
+262k leg was dropped under the session's spend cap (its falsifier branch
+never adjudicates); the session exceeded its own ≤$15 cap at $16.52
+(~2 h of operator-side idle burn — a discipline miss, recorded); the
+end-of-session drift bracket reproduced the control at +6.29% (inside the
+10% adjudication window). Raw JSONL:
+`bench/results/rig-g/chart2-ttft-twonode-fp8-ab-*.jsonl`, ceilings
+`iperf3-twonode3-*.json`, Gate A step-0 + old-vs-new client control:
+`bench/results/gate-a/*-s3.txt`.
+
 ### The certified fp8 cell at 131k (measured 2026-07-30, A10G — Rig E)
 
 The headline the fp8 arc was chasing, and it took four runs and a measurement

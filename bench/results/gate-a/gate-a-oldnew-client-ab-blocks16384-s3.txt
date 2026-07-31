@@ -1,0 +1,10 @@
+Preparing worktree (detached HEAD d0fc77a)
+HEAD is now at d0fc77a docs: publish the two-node fp8 real-NIC cells
+== OLD client (d0fc77a3f264) BLOCKS=16384
+   1024 KiB/block:  10809.7 ms  (17.18 GB, 1.59 GB/s)
+    512 KiB/block:   5131.2 ms  (8.59 GB, 1.67 GB/s)
+  time ratio (2x bytes, same block count) = 2.11x
+== NEW client re-run (interleave check)
+   1024 KiB/block:  10312.1 ms  (17.18 GB, 1.67 GB/s)
+    512 KiB/block:   5073.6 ms  (8.59 GB, 1.69 GB/s)
+  time ratio (2x bytes, same block count) = 2.03x
