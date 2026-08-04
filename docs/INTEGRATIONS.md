@@ -14,6 +14,11 @@ never see it — opaque blocks).
 pip install kvblockd lmcache-kvblockd    # from PyPI once published; until then, pip install ./python/kvblockd ./python/lmcache_kvblockd
 ```
 
+> Linux x86_64 only (verified: resolves `lmcache==0.5.2` from its manylinux
+> wheel). On macOS the `lmcache` dependency has no wheel and its source
+> build drags CUDA-only packages — develop the adapter on a Mac via its
+> unit suite (troubleshooting table below), run the real stack on Linux.
+
 ### Configure
 
 Point LMCache at a running kvblockd daemon. `lmcache.yaml`:
@@ -86,14 +91,15 @@ in either upstream turns the run red before it can reach production.
 
 | LMCache | vLLM (import/instantiate) |
 |---|---|
-| **0.5.1** (pip-installable; the package pins `lmcache>=0.5.1,<0.6`) | 0.25.1, 0.24.0, 0.23.0, 0.22.1 |
+| **0.5.1, 0.5.2** (pip-installable; the package pins `lmcache>=0.5.1,<0.6` — a fresh Linux resolve picks 0.5.2) | 0.25.1, 0.24.0, 0.23.0, 0.22.1 |
 | 0.5.0, 0.4.7 (interface tripwire only, via `--no-deps`) | — |
 
 The `interface-tripwire` workflow imports the adapter against the older
-LMCache releases with `--no-deps` to catch method renames early; only 0.5.1
-satisfies the runtime dependency pin. The e2e (`e2e-cpu.yml`) exercises the
-full stack on `facebook/opt-125m` (CPU) at the pinned
-`bench/e2e/cpu/versions.env` (lmcache 0.5.1, vllm 0.25.1).
+LMCache releases with `--no-deps` to catch method renames early; 0.5.1 and
+0.5.2 satisfy the runtime dependency pin (0.5.2 checked by the CPU e2e
+recipe's version notes). The e2e (`e2e-cpu.yml`) exercises the full stack
+on `facebook/opt-125m` (CPU) at the pinned `bench/e2e/cpu/versions.env`
+(lmcache 0.5.1, vllm 0.25.1).
 
 ### How it behaves
 
@@ -119,6 +125,81 @@ full stack on `facebook/opt-125m` (CPU) at the pinned
 | `connection refused` in logs, serving still works | expected during a daemon restart — the connector re-dials lazily; hits resume once it's back |
 | vLLM won't build on macOS arm64 | known upstream flakiness — the CI gate (ubuntu) is authoritative; on Mac, run the connector unit suite (`pytest python/lmcache_kvblockd/tests`) which exercises every line of the adapter against a real daemon without vLLM |
 
+## vLLM native connector — the path that produced the published TTFT numbers
+
+`KvblockdConnector` is a native vLLM KVConnector-v1: no LMCache in the
+middle, the engine talks straight to the daemon. Every published TTFT
+multiple (the A10G/L40S charts, the two-node real-NIC cells) was measured
+through this connector; the receipts are in [BENCHMARKS.md](BENCHMARKS.md)
+and [CLAIMS.md](CLAIMS.md).
+
+### Install
+
+```bash
+# from a clone (PyPI publication pending):
+git clone https://github.com/rudraymehra/KVStash.git && cd KVStash
+pip install ./python/kvblockd ./python/vllm_kvblockd
+```
+
+### Run
+
+Daemon side — a namespace for the engine. The quickstart installer's
+`namespaces.yaml` already contains an active `demo` tenant at `id: 1`,
+and the daemon refuses duplicate ids at boot — so ADD a second line
+(or replace the demo one), don't copy `id: 1`:
+
+```yaml
+namespaces:
+  - { name: demo, id: 1, token: "demo-token" }   # installer's quickstart tenant
+  - { name: vllm, id: 2, token: YOUR-TOKEN }
+```
+
+Engine side — vLLM 0.25.x, one flag:
+
+```bash
+export PYTHONHASHSEED=0   # REQUIRED on every worker — the connector
+                          # refuses to boot unpinned (key derivation must
+                          # be deterministic across engine restarts)
+vllm serve MODEL \
+  --kv-transfer-config '{
+    "kv_connector": "KvblockdConnector", "kv_role": "kv_both",
+    "kv_connector_module_path": "vllm_kvblockd.connector",
+    "kv_connector_extra_config": {
+      "kvblockd_endpoint": "kvblockd://127.0.0.1:9440",
+      "kvblockd_namespace": "vllm",
+      "kvblockd_token": "YOUR-TOKEN",
+      "kvblockd_streams": 8,
+      "kvblockd_get_fanout": 8}}'
+```
+
+(`streams=8, get_fanout=8` is the measured real-NIC config — the
+published A/B selected it; xxh3 verification defaults ON and measured
+free at 131k, leave it on.)
+
+### Confirm it worked (silence is not success)
+
+1. Engine log at boot: `Creating v1 connector with name: KvblockdConnector`
+   — the same factory line our benchmark rig gates on. No line = vLLM
+   dropped the transfer config and is serving with no connector at all.
+2. First prefill: the daemon's `kvb_bytes_total{dir="in"}` rises
+   (`curl HOST:9442/metrics`).
+3. Restart the engine (not the daemon), replay the same prompt:
+   `kvb_hits_total` rises and TTFT drops — that delta is the product.
+
+### Limits, stated plainly
+
+- **TP=1 only**: the connector refuses multi-GPU at boot (block keys do
+  not carry rank identity yet; refusing beats silently cross-loading KV
+  shards between ranks).
+- **`DeterminismError` at startup** = `PYTHONHASHSEED` unset — export
+  `PYTHONHASHSEED=0` on every worker, same as the LMCache path above.
+- Failure posture is fail-open: a down/slow daemon degrades to cache
+  misses (recompute), never an engine exception.
+- The connector (`KvblockdConnector`) is **GPU-validated**. The separate
+  `KvblockdTierManager` offloading altitude is code-complete but its GPU
+  end-to-end remains deferred, not faked — trigger and pass criteria in
+  `python/vllm_kvblockd/DEFER.md`.
+
 ## Follow-on connectors (status: on `main`, validation-gated)
 
 The strategy is fixed: kvblockd is reached through the connectors people
@@ -130,7 +211,7 @@ its pre-registered gate is green.
 | Connector | Status | Path |
 |---|---|---|
 | LMCache → vLLM | **shipped** (above) | `python/lmcache_kvblockd/` |
-| vLLM native connector | **on `main`** — code-complete, CPU-validated in CI; GPU e2e deferred | `python/vllm_kvblockd/` |
+| vLLM native connector | **GPU-validated** (it produced the published TTFT numbers — section above); the TierManager altitude's GPU e2e stays deferred | `python/vllm_kvblockd/` |
 | NIXL | **beta** (native plugin); zero-code today via the S3-compat endpoint | `adapters/nixl/` + `internal/server/s3compat.go` |
 | SGLang HiCache backend | **on `main`** — CPU-validated; verdict **DEFER** until a GPU run | `python/sglang_kvblockd/` |
 
@@ -138,8 +219,11 @@ Per-connector honesty notes:
 
 - **vLLM native** (`vllm-kvblockd`): a native KVConnector-v1
   (`KvblockdConnector`) plus the `KvblockdTierManager` offloading altitude.
-  The connector runs end-to-end on the vLLM CPU backend in CI
-  (`.github/workflows/vllm-native-cpu.yml`); the tier manager is
+  The connector is **GPU-validated** — every published TTFT cell
+  (A10G, L40S, the two-node real-NIC sessions) was measured through it,
+  receipts in [BENCHMARKS.md](BENCHMARKS.md)/[CLAIMS.md](CLAIMS.md) —
+  and it also runs end-to-end on the vLLM CPU backend in CI
+  (`.github/workflows/vllm-native-cpu.yml`). The tier manager is
   code-complete and unit-tested against a real daemon, but its GPU
   end-to-end is deferred, not faked — the exact revisit trigger and pass
   criteria live in `python/vllm_kvblockd/DEFER.md`. Not on PyPI yet.
