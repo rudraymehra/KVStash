@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "KVStash"
+version = "0.1.0"
+description = "KVStash — brand alias for the kvblockd LLM KV-cache store client. `pip install KVStash` installs the kvblockd Python client; the daemon itself is a single Go binary (see the repo README)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = ["kvblockd>=0.1.0"]
+
+[project.urls]
+Homepage = "https://github.com/rudraymehra/KVStash"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kvstash"]
