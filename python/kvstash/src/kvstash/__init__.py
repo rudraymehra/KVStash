@@ -4,6 +4,6 @@
 daemon is a single Go binary — install it per the repo README.
 """
 
-from kvblockd.client import Client  # noqa: F401
+from kvblockd.client import Client
 
 __all__ = ["Client"]
