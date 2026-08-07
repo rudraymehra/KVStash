@@ -23,6 +23,8 @@ kvbctl get -ns demo -token demo-token demo-key             # → hello
 
 That's a DRAM-only daemon — the recommended first run. NVMe tiering, hugepages, systemd, and real tenants: [docs/deployment-guide.md](docs/deployment-guide.md).
 
+Engine side, it's one more line — `pip install vllm-kvblockd` (or `lmcache-kvblockd` / `sglang-kvblockd`), then one `--kv-transfer-config` flag on your vLLM: [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md). The Python client alone is `pip install kvblockd` (alias: `pip install KVStash`).
+
 ## Measured, not promised
 
 Every headline number below has a ledger entry stating its exact rig,

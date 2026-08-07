@@ -158,6 +158,28 @@ jobs:
       - name: FuzzParseBatch 90s
         run: bash .github/scripts/fuzz-short.sh FuzzParseBatch 90s
 
+  # The published pip path, exactly as a stranger runs it: installs from
+  # the REAL PyPI (no repo paths), imports every package. Catches a yanked
+  # release, a broken dependency pin, or upstream drift before a prospect
+  # does. No token, read-only, runs on the schedule trigger too.
+  pypi-install-path:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pip install from PyPI and import (light packages, full)
+        run: |
+          pip install -q kvblockd vllm-kvblockd KVStash
+          python -c "import kvblockd, vllm_kvblockd, kvstash; from kvblockd.client import Client; print('pypi path OK')"
+      - name: dependency resolution for the heavy adapters (no download of the GPU stack)
+        run: |
+          # lmcache/sglang pull torch-class deps — resolving is the check
+          # that broke for real users (upstream pin drift), installing
+          # gigabytes is not. --dry-run resolves and stops.
+          pip install -q --dry-run lmcache-kvblockd
+          pip install -q --dry-run sglang-kvblockd
+
   python:
     runs-on: ubuntu-24.04
     strategy:

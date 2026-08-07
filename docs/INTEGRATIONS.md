@@ -11,7 +11,7 @@ never see it — opaque blocks).
 ### Install
 
 ```bash
-pip install kvblockd lmcache-kvblockd    # from PyPI once published; until then, pip install ./python/kvblockd ./python/lmcache_kvblockd
+pip install lmcache-kvblockd    # pulls the kvblockd client automatically
 ```
 
 > Linux x86_64 only (verified: resolves `lmcache==0.5.2` from its manylinux
@@ -136,10 +136,11 @@ and [CLAIMS.md](CLAIMS.md).
 ### Install
 
 ```bash
-# from a clone (PyPI publication pending):
-git clone https://github.com/rudraymehra/KVStash.git && cd KVStash
-pip install ./python/kvblockd ./python/vllm_kvblockd
+pip install vllm-kvblockd    # pulls the kvblockd client automatically
 ```
+
+(Installing from a clone still works: `pip install ./python/kvblockd
+./python/vllm_kvblockd`.)
 
 ### Run
 
@@ -226,7 +227,8 @@ Per-connector honesty notes:
   (`.github/workflows/vllm-native-cpu.yml`). The tier manager is
   code-complete and unit-tested against a real daemon, but its GPU
   end-to-end is deferred, not faked — the exact revisit trigger and pass
-  criteria live in `python/vllm_kvblockd/DEFER.md`. Not on PyPI yet.
+  criteria live in `python/vllm_kvblockd/DEFER.md`. On PyPI as
+  `vllm-kvblockd`.
 - **NIXL**: two paths. The zero-code default is the S3-compatibility
   endpoint (`s3compat_addr`, off unless configured) — NIXL's stock `obj`
   plugin (and vLLM's `obj` tier) reach kvblockd via `endpoint_override`
@@ -236,8 +238,9 @@ Per-connector honesty notes:
   `adapters/nixl/README.md`.
 - **SGLang** (`sglang-kvblockd`): a HiCacheStorage **v1** backend,
   CPU-validated (23-test suite against a live daemon, plus the
-  `sglang-cpu` tripwire job in `e2e-cpu.yml`) — **not GPU-validated and
-  not on PyPI**; the pre-registered SHIP gate and its blocker are in
+  `sglang-cpu` tripwire job in `e2e-cpu.yml`) — **not GPU-validated**
+  (on PyPI as `sglang-kvblockd`, published with that caveat stated
+  here); the pre-registered SHIP gate and its blocker are in
   [docs/design/sglang-hicache-v1.1.md](design/sglang-hicache-v1.1.md). The
   HiCache **v2** controller methods are stubbed pending upstream
   stabilization
