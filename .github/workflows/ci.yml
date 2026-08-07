@@ -165,7 +165,7 @@ jobs:
   pypi-install-path:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: pip install from PyPI and import (light packages, full)
@@ -194,7 +194,7 @@ jobs:
         with:
           go-version: "1.26"
           cache: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: install ruff + kvblockd
@@ -221,7 +221,7 @@ jobs:
         with:
           go-version: "1.26"
           cache: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: install torch (CPU) + deps
@@ -251,7 +251,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: install torch (CPU) + pinned lmcache + packages
@@ -278,7 +278,7 @@ jobs:
         with:
           go-version: "1.26"
           cache: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: install torch (CPU) + deps
